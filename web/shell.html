@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Hex Planets</title>
+<style>
+* { margin: 0; padding: 0; }
+html, body { width: 100%; height: 100%; overflow: hidden; background: #0a0a14; }
+canvas {
+    width: 100%;
+    height: 100%;
+    display: block;
+    cursor: crosshair;
+}
+#loading {
+    position: absolute;
+    top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    color: #aaa;
+    font-family: monospace;
+    font-size: 16px;
+}
+</style>
+</head>
+<body>
+<div id="loading">Loading Hex Planets...</div>
+<canvas id="canvas" oncontextmenu="event.preventDefault()"></canvas>
+<script>
+    var Module = {
+        canvas: (function() {
+            var canvas = document.getElementById('canvas');
+            canvas.addEventListener('webglcontextlost', function(e) {
+                alert('WebGL context lost — please reload.');
+                e.preventDefault();
+            }, false);
+            return canvas;
+        })(),
+        onRuntimeInitialized: function() {
+            document.getElementById('loading').style.display = 'none';
+        }
+    };
+</script>
+{{{ SCRIPT }}}
+</body>
+</html>
