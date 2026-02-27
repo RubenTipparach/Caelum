@@ -190,6 +190,14 @@ static void frame(void) {
         printf("[GAME] frame %d, state=%d\n", frame_count, app.state);
         fflush(stdout);
     }
+    // Diagnostic: write frame count to file so we can tell if frames are ticking
+    if (frame_count <= 10 || frame_count % 60 == 0) {
+        FILE* diag = fopen("diag.log", "a");
+        if (diag) {
+            fprintf(diag, "frame %d state=%d\n", frame_count, app.state);
+            fclose(diag);
+        }
+    }
 
     uint64_t now = stm_now();
     float dt = (float)stm_sec(stm_diff(now, app.last_time));
@@ -226,6 +234,7 @@ static void frame(void) {
         sdtx_puts("LMB = break, RMB = place\n");
         sdtx_puts("Space = jump, ESC = unlock\n");
         sdtx_puts("Double-tap Space = jetpack\n");
+        sdtx_puts("Scroll wheel = jetpack speed\n");
         sdtx_puts("Ctrl+P = screenshot\n");
         sdtx_puts("L = toggle LOD debug colors\n");
         sdtx_puts("V = toggle verbose logs\n");
@@ -276,10 +285,22 @@ static void frame(void) {
             // Phase 2: render_init (GPU resources — must be on main thread)
             render_init(&app.renderer, &app.planet, &app.camera);
 
-            // Position camera above the planet surface
-            float surface_r = app.planet.radius + app.planet.sea_level * app.planet.layer_thickness + 10.0f;
-            app.camera.position = (HMM_Vec3){{0.0f, surface_r, 0.0f}};
-            printf("[GAME] Camera at (0, %.0f, 0), LOD loading...\n", surface_r);
+            // Position camera above the actual terrain at spawn point
+            HMM_Vec3 spawn_dir = (HMM_Vec3){{0.0f, 1.0f, 0.0f}};
+            double surface_r = lod_tree_terrain_height(&app.renderer.lod_tree, spawn_dir) + 10.0;
+            app.camera.pos_d[0] = 0.0;
+            app.camera.pos_d[1] = surface_r;
+            app.camera.pos_d[2] = 0.0;
+            app.camera.position = (HMM_Vec3){{0.0f, (float)surface_r, 0.0f}};
+
+            // Set floating origin to spawn position BEFORE any LOD meshes are generated.
+            // Without this, the first frame of gameplay would recenter (802km > 50km threshold)
+            // and destroy all meshes that were just loaded during the loading screen.
+            app.renderer.lod_tree.world_origin[0] = app.camera.pos_d[0];
+            app.renderer.lod_tree.world_origin[1] = app.camera.pos_d[1];
+            app.renderer.lod_tree.world_origin[2] = app.camera.pos_d[2];
+
+            printf("[GAME] Camera at (0, %.0f, 0), origin set, LOD loading...\n", surface_r);
             fflush(stdout);
 
             app.loading_phase = 3;
@@ -288,7 +309,7 @@ static void frame(void) {
         }
         if (app.loading_phase == 3) {
             // Phase 3: pump LOD tree until enough patches are ACTIVE
-            camera_update(&app.camera, &app.planet, dt);
+            camera_update(&app.camera, &app.planet, &app.renderer.lod_tree, dt);
 
             HMM_Mat4 vp = HMM_MulM4(app.camera.proj, app.camera.view);
             lod_tree_update(&app.renderer.lod_tree, app.camera.position, vp);
@@ -299,13 +320,12 @@ static void frame(void) {
             int pending = job_system_pending(app.renderer.lod_tree.jobs);
 
             // Show loading progress
-            int target = LOD_TARGET_LEAVES;
             int display_total = active + pending;
-            if (display_total < target) display_total = target;
+            if (display_total < 100) display_total = 100;
             draw_loading_screen("Building terrain...", active, display_total, total_verts);
 
-            // Transition once we have enough patches or initial set is loaded
-            if ((active >= 20 && pending == 0) || active >= target / 2) {
+            // Transition once we have some patches and no pending jobs
+            if ((active >= 20 && pending == 0) || active >= 50) {
                 printf("[GAME] Terrain ready: %d patches, %d vertices. Starting game.\n",
                     active, total_verts);
                 fflush(stdout);
@@ -316,7 +336,10 @@ static void frame(void) {
     }
 
     // STATE_PLAYING
-    camera_update(&app.camera, &app.planet, dt);
+    camera_update(&app.camera, &app.planet, &app.renderer.lod_tree, dt);
+
+    // Floating origin: recenter if camera has drifted far from current origin
+    lod_tree_update_origin(&app.renderer.lod_tree, app.camera.pos_d);
 
     // Re-upload mesh if planet was modified or player moved far enough
     render_update_mesh(&app.renderer, &app.planet, &app.camera);

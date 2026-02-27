@@ -102,6 +102,9 @@ static bool check_wall_collision(Planet* planet, HMM_Vec3 pos,
 
 void camera_init(Camera* cam) {
     cam->position = (HMM_Vec3){{0.0f, 796050.0f, 0.0f}};
+    cam->pos_d[0] = 0.0;
+    cam->pos_d[1] = 796050.0;
+    cam->pos_d[2] = 0.0;
     cam->yaw = 0.0f;
     cam->pitch = 0.0f;
     cam->speed = WALK_SPEED;
@@ -111,6 +114,9 @@ void camera_init(Camera* cam) {
     cam->key_space = cam->key_shift = false;
 
     cam->local_up = (HMM_Vec3){{0, 1, 0}};
+    cam->prev_local_up = (HMM_Vec3){{0, 1, 0}};
+    cam->tangent_north = (HMM_Vec3){{0, 0, -1}};
+    cam->tangent_initialized = false;
     cam->forward = (HMM_Vec3){{0, 0, -1}};
     cam->right = (HMM_Vec3){{1, 0, 0}};
     cam->up = (HMM_Vec3){{0, 1, 0}};
@@ -120,27 +126,78 @@ void camera_init(Camera* cam) {
     cam->gravity = BASE_GRAVITY;
     cam->on_ground = false;
     cam->jetpack_active = false;
+    cam->jetpack_speed_mult = 1.0f;
     cam->last_space_time = 0;
 
     cam->view = HMM_M4D(1.0f);
     cam->proj = HMM_M4D(1.0f);
 }
 
-void camera_update(Camera* cam, Planet* planet, float dt) {
-    // Local "up" is the radial direction from planet center
-    float pos_len = HMM_LenV3(cam->position);
-    if (pos_len < 0.001f) pos_len = 0.001f;
-    cam->local_up = HMM_NormV3(cam->position);
+void camera_update(Camera* cam, Planet* planet, const LodTree* lod, float dt) {
+    double dd = (double)dt;
 
-    // Build a local reference frame on the sphere's tangent plane.
-    HMM_Vec3 world_ref = (HMM_Vec3){{0, 0, 1}};
-    if (fabsf(HMM_DotV3(cam->local_up, world_ref)) > 0.99f) {
-        world_ref = (HMM_Vec3){{1, 0, 0}};
+    // ---- Sync float position from double (authoritative) ----
+    cam->position = (HMM_Vec3){{(float)cam->pos_d[0], (float)cam->pos_d[1], (float)cam->pos_d[2]}};
+
+    // Local "up" computed from double-precision position (smooth even at 800 km)
+    double pos_len_d = sqrt(cam->pos_d[0]*cam->pos_d[0] +
+                            cam->pos_d[1]*cam->pos_d[1] +
+                            cam->pos_d[2]*cam->pos_d[2]);
+    if (pos_len_d < 0.001) pos_len_d = 0.001;
+    float pos_len = (float)pos_len_d;
+    cam->local_up = (HMM_Vec3){{
+        (float)(cam->pos_d[0] / pos_len_d),
+        (float)(cam->pos_d[1] / pos_len_d),
+        (float)(cam->pos_d[2] / pos_len_d)
+    }};
+
+    // Build a local reference frame on the sphere's tangent plane
+    // using parallel transport to avoid rotation snapping.
+    if (!cam->tangent_initialized) {
+        // First frame: initialize tangent from global reference
+        HMM_Vec3 world_ref = (HMM_Vec3){{0, 0, 1}};
+        if (fabsf(HMM_DotV3(cam->local_up, world_ref)) > 0.99f) {
+            world_ref = (HMM_Vec3){{1, 0, 0}};
+        }
+        cam->tangent_north = HMM_SubV3(world_ref,
+            HMM_MulV3F(cam->local_up, HMM_DotV3(world_ref, cam->local_up)));
+        cam->tangent_north = HMM_NormV3(cam->tangent_north);
+        cam->tangent_initialized = true;
+    } else {
+        // Parallel transport: rotate tangent_north from prev_up to current local_up
+        HMM_Vec3 prev_up = cam->prev_local_up;
+        float cos_a = HMM_DotV3(prev_up, cam->local_up);
+        if (cos_a < 0.999999f) {
+            // Rodrigues rotation around axis = prev_up × local_up
+            HMM_Vec3 axis = HMM_NormV3(HMM_Cross(prev_up, cam->local_up));
+            float angle = acosf(fminf(fmaxf(cos_a, -1.0f), 1.0f));
+            float c = cosf(angle), s = sinf(angle);
+            HMM_Vec3 tn = cam->tangent_north;
+            float dot_ax = HMM_DotV3(axis, tn);
+            HMM_Vec3 cross_ax = HMM_Cross(axis, tn);
+            cam->tangent_north = HMM_AddV3(
+                HMM_AddV3(HMM_MulV3F(tn, c), HMM_MulV3F(cross_ax, s)),
+                HMM_MulV3F(axis, dot_ax * (1.0f - c))
+            );
+        }
+        // Re-orthogonalize against new local_up (remove accumulated drift)
+        cam->tangent_north = HMM_SubV3(cam->tangent_north,
+            HMM_MulV3F(cam->local_up, HMM_DotV3(cam->tangent_north, cam->local_up)));
+        float tn_len = HMM_LenV3(cam->tangent_north);
+        if (tn_len < 0.001f) {
+            // Degenerate: fall back to global reference
+            HMM_Vec3 world_ref = (HMM_Vec3){{0, 0, 1}};
+            if (fabsf(HMM_DotV3(cam->local_up, world_ref)) > 0.99f) {
+                world_ref = (HMM_Vec3){{1, 0, 0}};
+            }
+            cam->tangent_north = HMM_SubV3(world_ref,
+                HMM_MulV3F(cam->local_up, HMM_DotV3(world_ref, cam->local_up)));
+        }
+        cam->tangent_north = HMM_NormV3(cam->tangent_north);
     }
+    cam->prev_local_up = cam->local_up;
 
-    // tangent_north = component of world_ref perpendicular to local_up
-    HMM_Vec3 tangent_north = HMM_SubV3(world_ref, HMM_MulV3F(cam->local_up, HMM_DotV3(world_ref, cam->local_up)));
-    tangent_north = HMM_NormV3(tangent_north);
+    HMM_Vec3 tangent_north = cam->tangent_north;
 
     // tangent_east = local_up cross tangent_north
     HMM_Vec3 tangent_east = HMM_Cross(cam->local_up, tangent_north);
@@ -166,20 +223,17 @@ void camera_update(Camera* cam, Planet* planet, float dt) {
     cam->up = cam->local_up;
 
     // ---- Get current ground info for collision ----
-    float current_ground_r = planet ? planet->radius : pos_len;
-    float cell_radius = 1.0f;
-    if (planet) {
-        int standing_cell = planet_find_cell(planet, cam->position);
-        if (standing_cell >= 0) {
-            current_ground_r = planet_terrain_radius(planet, standing_cell);
-        }
-        cell_radius = estimate_cell_radius(planet);
+    float current_ground_r = pos_len;
+    if (lod) {
+        current_ground_r = (float)lod_tree_terrain_height(lod, cam->position);
+    } else if (planet) {
+        current_ground_r = planet->radius + planet->sea_level * planet->layer_thickness;
     }
 
-    // ---- Movement with wall collision (axis-decomposed) ----
+    // ---- Movement (accumulated in double precision) ----
     float move_speed;
     if (cam->jetpack_active) {
-        move_speed = JETPACK_FLY_SPEED;
+        move_speed = JETPACK_FLY_SPEED * cam->jetpack_speed_mult;
     } else {
         move_speed = cam->key_shift ? SPRINT_SPEED : WALK_SPEED;
     }
@@ -191,7 +245,6 @@ void camera_update(Camera* cam, Planet* planet, float dt) {
     if (cam->key_a) side_input = HMM_AddV3(side_input, flat_right);
     if (cam->key_d) side_input = HMM_SubV3(side_input, flat_right);
 
-    // Normalize each component independently
     float fwd_len = HMM_LenV3(forward_input);
     float side_len = HMM_LenV3(side_input);
     if (fwd_len > 0.001f) forward_input = HMM_NormV3(forward_input);
@@ -201,120 +254,130 @@ void camera_update(Camera* cam, Planet* planet, float dt) {
     float full_len = HMM_LenV3(full_input);
     bool has_input = full_len > 0.001f;
 
-    if (has_input && planet && !cam->jetpack_active) {
-        // Ground movement with wall collision
+    if (has_input) {
+        // Movement direction (float is fine for unit vectors)
         HMM_Vec3 full_dir = HMM_NormV3(full_input);
-        HMM_Vec3 full_move = HMM_MulV3F(full_dir, move_speed * dt);
-        HMM_Vec3 new_pos = HMM_AddV3(cam->position, full_move);
-
-        // Try full movement
-        if (!check_wall_collision(planet, new_pos, current_ground_r, cell_radius)) {
-            cam->position = new_pos;
-        } else {
-            // Blocked: try forward only
-            bool moved = false;
-            if (fwd_len > 0.001f) {
-                HMM_Vec3 fwd_move = HMM_MulV3F(forward_input, move_speed * dt);
-                HMM_Vec3 fwd_pos = HMM_AddV3(cam->position, fwd_move);
-                if (!check_wall_collision(planet, fwd_pos, current_ground_r, cell_radius)) {
-                    cam->position = fwd_pos;
-                    moved = true;
-                }
-            }
-            // Try sideways only
-            if (side_len > 0.001f) {
-                HMM_Vec3 side_move = HMM_MulV3F(side_input, move_speed * dt);
-                HMM_Vec3 side_pos = HMM_AddV3(cam->position, side_move);
-                if (!check_wall_collision(planet, side_pos, current_ground_r, cell_radius)) {
-                    cam->position = side_pos;
-                    moved = true;
-                }
-            }
-            (void)moved;
-        }
-    } else if (has_input) {
-        // Jetpack flight or no planet — move freely (no wall collision)
-        HMM_Vec3 full_dir = HMM_NormV3(full_input);
-        cam->position = HMM_AddV3(cam->position, HMM_MulV3F(full_dir, move_speed * dt));
+        double step = (double)move_speed * dd;
+        cam->pos_d[0] += (double)full_dir.X * step;
+        cam->pos_d[1] += (double)full_dir.Y * step;
+        cam->pos_d[2] += (double)full_dir.Z * step;
     }
 
     // ---- Jetpack / Jump / Gravity ----
     if (cam->jetpack_active) {
+        float sm = cam->jetpack_speed_mult;
         if (cam->key_space) {
-            // Thrust upward
             float radial_vel = HMM_DotV3(cam->velocity, cam->local_up);
-            if (radial_vel < JETPACK_MAX_SPEED) {
+            if (radial_vel < JETPACK_MAX_SPEED * sm) {
                 cam->velocity = HMM_AddV3(cam->velocity,
-                    HMM_MulV3F(cam->local_up, JETPACK_THRUST * dt));
+                    HMM_MulV3F(cam->local_up, JETPACK_THRUST * sm * dt));
             }
         } else {
-            // No thrust: reduced gravity for slow descent
             cam->velocity = HMM_SubV3(cam->velocity,
                 HMM_MulV3F(cam->local_up, cam->gravity * 0.3f * dt));
         }
-        // Air drag
         cam->velocity = HMM_MulV3F(cam->velocity, JETPACK_DRAG);
         cam->on_ground = false;
     } else {
-        // Normal jump
         if (cam->key_space && cam->on_ground) {
             cam->velocity = HMM_MulV3F(cam->local_up, JUMP_FORCE);
             cam->on_ground = false;
         }
-        // Normal gravity when airborne
         if (!cam->on_ground) {
             cam->velocity = HMM_SubV3(cam->velocity, HMM_MulV3F(cam->local_up, cam->gravity * dt));
         }
     }
 
-    // ---- Apply velocity ----
+    // ---- Apply velocity (double precision) ----
     if (HMM_LenV3(cam->velocity) > 0.001f) {
-        HMM_Vec3 vel_move = HMM_MulV3F(cam->velocity, dt);
-        HMM_Vec3 new_pos = HMM_AddV3(cam->position, vel_move);
+        cam->pos_d[0] += (double)cam->velocity.X * dd;
+        cam->pos_d[1] += (double)cam->velocity.Y * dd;
+        cam->pos_d[2] += (double)cam->velocity.Z * dd;
+    }
 
-        if (planet && !cam->jetpack_active &&
-            check_wall_collision(planet, new_pos, current_ground_r, cell_radius)) {
-            // Blocked by wall while airborne — zero horizontal velocity, keep vertical
-            float radial_vel = HMM_DotV3(cam->velocity, cam->local_up);
-            cam->velocity = HMM_MulV3F(cam->local_up, radial_vel);
-            vel_move = HMM_MulV3F(cam->velocity, dt);
-            cam->position = HMM_AddV3(cam->position, vel_move);
+    // ---- Sync float position for collision queries ----
+    cam->position = (HMM_Vec3){{(float)cam->pos_d[0], (float)cam->pos_d[1], (float)cam->pos_d[2]}};
+
+    // ---- Ground collision (all in double to avoid 6.25cm quantization) ----
+    // Smoothed ground-following eliminates pitch bobbing from terrain micro-noise.
+    // The camera smoothly interpolates toward the true ground height instead of
+    // snapping each frame, preventing the ~11cm/frame bumps from detail noise.
+    if (lod) {
+        static double smoothed_ground_r = 0.0;
+        double ground_r = lod_tree_terrain_height(lod, cam->position);
+        double pr = sqrt(cam->pos_d[0]*cam->pos_d[0] +
+                         cam->pos_d[1]*cam->pos_d[1] +
+                         cam->pos_d[2]*cam->pos_d[2]);
+        double feet_r = pr - (double)cam->eye_height;
+        float radial_vel = HMM_DotV3(cam->velocity, cam->local_up);
+
+        // Initialize smoothed height on first frame
+        if (smoothed_ground_r == 0.0) smoothed_ground_r = ground_r;
+
+        // Smooth ground height: fast enough to follow terrain, slow enough to
+        // filter out per-frame noise bumps. ~15Hz cutoff = smooth at 165fps.
+        // Always snap DOWN instantly (never float above a cliff edge).
+        if (ground_r < smoothed_ground_r) {
+            smoothed_ground_r = ground_r;  // Snap down immediately
         } else {
-            cam->position = new_pos;
+            double alpha = 1.0 - exp(-15.0 * dd);
+            smoothed_ground_r += (ground_r - smoothed_ground_r) * alpha;
         }
-    }
 
-    // ---- Ground collision ----
-    if (planet) {
-        int cell = planet_find_cell(planet, cam->position);
-        if (cell >= 0) {
-            float ground_r = planet_terrain_radius(planet, cell);
-            float player_r = HMM_LenV3(cam->position);
-            float feet_r = player_r - cam->eye_height;
-            float radial_vel = HMM_DotV3(cam->velocity, HMM_NormV3(cam->position));
-
-            if (feet_r <= ground_r + GROUND_SNAP_THRESHOLD) {
-                if (radial_vel <= 0.0f) {
-                    // Landing
-                    float target_r = ground_r + cam->eye_height;
-                    cam->position = HMM_MulV3F(HMM_NormV3(cam->position), target_r);
-                    cam->velocity = (HMM_Vec3){{0, 0, 0}};
-                    cam->on_ground = true;
-                    // Auto-deactivate jetpack on landing
-                    if (cam->jetpack_active) {
-                        cam->jetpack_active = false;
-                        LOG(PLAYER, "Jetpack OFF (landed)\n");
-                    }
+        if (feet_r <= smoothed_ground_r + (double)GROUND_SNAP_THRESHOLD) {
+            if (radial_vel <= 0.0f) {
+                double target_r = smoothed_ground_r + (double)cam->eye_height;
+                double scale = target_r / pr;
+                cam->pos_d[0] *= scale;
+                cam->pos_d[1] *= scale;
+                cam->pos_d[2] *= scale;
+                cam->velocity = (HMM_Vec3){{0, 0, 0}};
+                cam->on_ground = true;
+                if (cam->jetpack_active) {
+                    cam->jetpack_active = false;
+                    cam->jetpack_speed_mult = 1.0f;
+                    LOG(PLAYER, "Jetpack OFF (landed)\n");
                 }
-            } else {
-                cam->on_ground = false;
             }
+        } else {
+            cam->on_ground = false;
         }
     }
 
-    // ---- View matrix ----
-    HMM_Vec3 target = HMM_AddV3(cam->position, cam->forward);
-    cam->view = HMM_LookAt_RH(cam->position, target, cam->local_up);
+    // ---- Final sync: double → float for rendering ----
+    cam->position = (HMM_Vec3){{(float)cam->pos_d[0], (float)cam->pos_d[1], (float)cam->pos_d[2]}};
+
+    // ---- View matrix (built directly from basis vectors) ----
+    // AVOID HMM_LookAt_RH(pos, pos+forward, up) — it does normalize(target-eye)
+    // internally, which loses the pitch component of forward due to float
+    // rounding at 800km (e.g., 800000+0.12 rounds to 800000.125 → 4% pitch error).
+    // Instead, build the rotation matrix directly from the already-precise unit vectors.
+    {
+        HMM_Vec3 F = cam->forward;
+        HMM_Vec3 S = HMM_NormV3(HMM_Cross(F, cam->local_up));
+        HMM_Vec3 U = HMM_Cross(S, F);
+
+        cam->view.Elements[0][0] = S.X;
+        cam->view.Elements[0][1] = U.X;
+        cam->view.Elements[0][2] = -F.X;
+        cam->view.Elements[0][3] = 0.0f;
+
+        cam->view.Elements[1][0] = S.Y;
+        cam->view.Elements[1][1] = U.Y;
+        cam->view.Elements[1][2] = -F.Y;
+        cam->view.Elements[1][3] = 0.0f;
+
+        cam->view.Elements[2][0] = S.Z;
+        cam->view.Elements[2][1] = U.Z;
+        cam->view.Elements[2][2] = -F.Z;
+        cam->view.Elements[2][3] = 0.0f;
+
+        // Translation row (stripped by camera-relative rendering, but kept for completeness)
+        cam->view.Elements[3][0] = -HMM_DotV3(S, cam->position);
+        cam->view.Elements[3][1] = -HMM_DotV3(U, cam->position);
+        cam->view.Elements[3][2] = HMM_DotV3(F, cam->position);
+        cam->view.Elements[3][3] = 1.0f;
+    }
 
     // ---- Projection ----
     float aspect = sapp_widthf() / sapp_heightf();
@@ -329,13 +392,10 @@ void camera_update(Camera* cam, Planet* planet, float dt) {
                 pos_len,
                 cam->velocity.X, cam->velocity.Y, cam->velocity.Z,
                 cam->on_ground, cam->jetpack_active);
-            if (planet) {
-                int cell = planet_find_cell(planet, cam->position);
-                if (cell >= 0) {
-                    float gr = planet_terrain_radius(planet, cell);
-                    printf(" cell=%d ground_r=%.3f feet_r=%.3f",
-                        cell, gr, pos_len - cam->eye_height);
-                }
+            if (lod) {
+                double gr = lod_tree_terrain_height(lod, cam->position);
+                printf(" ground_r=%.3f feet_r=%.3f",
+                    gr, (float)(pos_len_d - (double)cam->eye_height));
             }
             printf("\n");
             fflush(stdout);
@@ -365,6 +425,16 @@ void camera_handle_event(Camera* cam, const sapp_event* ev) {
             break;
 
         case SAPP_EVENTTYPE_MOUSE_SCROLL:
+            if (cam->jetpack_active) {
+                // Scroll wheel adjusts jetpack speed multiplier (floor = 1.0)
+                float scroll = ev->scroll_y;
+                if (scroll > 0.0f) {
+                    cam->jetpack_speed_mult *= 1.25f;  // 4 clicks = ~2.4x
+                } else if (scroll < 0.0f) {
+                    cam->jetpack_speed_mult /= 1.25f;
+                    if (cam->jetpack_speed_mult < 1.0f) cam->jetpack_speed_mult = 1.0f;
+                }
+            }
             break;
 
         case SAPP_EVENTTYPE_KEY_DOWN:
@@ -379,6 +449,7 @@ void camera_handle_event(Camera* cam, const sapp_event* ev) {
                     double elapsed_ms = stm_ms(stm_diff(now, cam->last_space_time));
                     if (cam->last_space_time != 0 && elapsed_ms < DOUBLE_TAP_MS) {
                         cam->jetpack_active = !cam->jetpack_active;
+                        if (!cam->jetpack_active) cam->jetpack_speed_mult = 1.0f;
                         LOG(PLAYER, "Jetpack %s\n", cam->jetpack_active ? "ON" : "OFF");
                         cam->last_space_time = 0;  // Reset so held key can't re-toggle
                     } else {

@@ -44,6 +44,7 @@ void render_init(Renderer* r, Planet* planet, const Camera* cam) {
             .write_enabled = true,
         },
         .cull_mode = SG_CULLMODE_BACK,
+        .face_winding = SG_FACEWINDING_CCW,
         .label = "planet-pipeline",
     });
 
@@ -168,11 +169,25 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
     view_rot.Elements[3][2] = 0.0f;
     HMM_Mat4 vp_terrain = HMM_MulM4(cam->proj, view_rot);
 
+    // Double-float camera offset relative to floating origin.
+    // Mesh vertices are stored as (world_pos - origin), so the camera offset
+    // must also be (cam_pos - origin) for correct camera-relative subtraction.
+    double cam_rel_origin[3] = {
+        cam->pos_d[0] - r->lod_tree.world_origin[0],
+        cam->pos_d[1] - r->lod_tree.world_origin[1],
+        cam->pos_d[2] - r->lod_tree.world_origin[2],
+    };
+    float pos_hi_x = (float)cam_rel_origin[0];
+    float pos_hi_y = (float)cam_rel_origin[1];
+    float pos_hi_z = (float)cam_rel_origin[2];
+    float pos_lo_x = (float)(cam_rel_origin[0] - (double)pos_hi_x);
+    float pos_lo_y = (float)(cam_rel_origin[1] - (double)pos_hi_y);
+    float pos_lo_z = (float)(cam_rel_origin[2] - (double)pos_hi_z);
+
     planet_vs_params_t vs_params = {
         .mvp = vp_terrain,
-        .camera_offset = (HMM_Vec4){{
-            cam->position.X, cam->position.Y, cam->position.Z, 0.0f
-        }},
+        .camera_offset = (HMM_Vec4){{pos_hi_x, pos_hi_y, pos_hi_z, 0.0f}},
+        .camera_offset_low = (HMM_Vec4){{pos_lo_x, pos_lo_y, pos_lo_z, 0.0f}},
         .log_depth = (HMM_Vec4){{Fcoef, far_plane, z_bias, 0.0f}},
     };
     planet_fs_params_t fs_params = {
@@ -226,6 +241,15 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
         r->lod_tree.total_vertex_count,
         r->lod_tree.node_count,
         r->lod_tree.node_capacity);
+
+    // Jetpack status
+    if (cam->jetpack_active) {
+        sdtx_color3f(0.3f, 1.0f, 0.5f);
+        sdtx_printf("JETPACK ON  speed: %.0fx\n", cam->jetpack_speed_mult);
+    } else {
+        sdtx_color3f(0.5f, 0.5f, 0.5f);
+        sdtx_puts("JETPACK OFF\n");
+    }
 
     if (r->show_lod_debug) {
         // Per-depth geometry breakdown (shown in LOD debug mode)

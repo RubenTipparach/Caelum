@@ -8,17 +8,15 @@
 #include "job_system.h"
 
 // ---- Configuration ----
-#define LOD_MAX_DEPTH       20      // Max subdivision depth (~1m cells at 796km)
-#define LOD_MAX_NODES       8192    // Max nodes in the tree at any time
+#define LOD_MAX_DEPTH       16      // Depth 16 = ~8m patches, tess=8 → ~1m hex cells
+#define LOD_MAX_NODES       16384   // Node pool (intermediate + leaf nodes)
 #define LOD_ROOT_COUNT      20      // 20 icosahedron faces
 #define LOD_CHILDREN        4       // Aperture-4 subdivision
 #define LOD_VOXEL_DEPTH     16      // Depth at which we switch to voxel mesh
-#define LOD_SPLIT_THRESHOLD 0.5f    // Split if screen_metric > this (patch_size/distance)
-#define LOD_MERGE_THRESHOLD 0.25f   // Merge if screen_metric < this
-#define LOD_MAX_UPLOADS_PER_FRAME 32 // Max GPU uploads per frame
-#define LOD_MAX_SPLITS_PER_FRAME 8  // Max splits per update to prevent stalling
-#define LOD_TARGET_LEAVES   500     // Target number of visible leaf patches
+#define LOD_MAX_UPLOADS_PER_FRAME 64 // Max GPU uploads per frame
+#define LOD_MAX_SPLITS_PER_FRAME 512 // High limit — tree builds fast via force-split
 #define LOD_NUM_WORKERS     4       // Worker threads for mesh generation
+#define LOD_SPLIT_FACTOR    6.0f    // Split when distance < patch_arc * factor (higher = more detail)
 
 // Vertex format for LOD mesh patches (same as existing Vertex)
 typedef struct LodVertex {
@@ -78,6 +76,11 @@ typedef struct LodTree {
     int sea_level;
     int seed;
 
+    // Floating origin (double precision) — all mesh vertex positions are stored
+    // relative to this origin to keep float32 vertex coords near zero.
+    // When camera moves far from origin, recenter and regenerate meshes.
+    double world_origin[3];
+
     // Camera state (updated each frame)
     HMM_Vec3 camera_pos;
 
@@ -130,7 +133,13 @@ void lod_tree_render(LodTree* tree, sg_pipeline pip, HMM_Mat4 vp,
 int lod_tree_find_node(const LodTree* tree, HMM_Vec3 world_pos);
 
 // Get terrain height at a world position (for collision)
-float lod_tree_terrain_height(const LodTree* tree, HMM_Vec3 world_pos);
+// Returns double to avoid float quantization at large radii (6cm steps at 800km)
+double lod_tree_terrain_height(const LodTree* tree, HMM_Vec3 world_pos);
+
+// Check and recenter floating origin if camera has moved far from current origin.
+// Call once per frame with the camera's double-precision position.
+// Returns true if origin was recentered (all meshes will regenerate).
+bool lod_tree_update_origin(LodTree* tree, const double cam_pos_d[3]);
 
 // Get stats
 int lod_tree_active_leaves(const LodTree* tree);

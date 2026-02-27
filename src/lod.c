@@ -30,6 +30,7 @@ typedef struct MeshGenJob {
     float layer_thickness;
     int sea_level;
     int seed;
+    float origin[3];  // Floating origin — subtract from world positions
 
     // Output (written by worker thread)
     LodVertex* vertices;
@@ -40,8 +41,9 @@ typedef struct MeshGenJob {
     volatile int completed;  // 0 = pending, 1 = done
 } MeshGenJob;
 
-// ---- Terrain noise (same config as planet.c) ----
+// ---- Terrain noise ----
 
+// Continental-scale terrain noise
 static fnl_state create_terrain_noise(int seed) {
     fnl_state noise = fnlCreateState();
     noise.noise_type = FNL_NOISE_OPENSIMPLEX2;
@@ -52,11 +54,93 @@ static fnl_state create_terrain_noise(int seed) {
     return noise;
 }
 
-// Sample terrain height at a point on the unit sphere
-// Returns height in layers (same scale as planet.c)
-static int sample_terrain_height(fnl_state* noise, HMM_Vec3 unit_pos, int sea_level) {
-    float n = fnlGetNoise3D(noise,
-        unit_pos.X * 3.0f, unit_pos.Y * 3.0f, unit_pos.Z * 3.0f);
+// Domain warping noise: displaces sample coordinates for more organic shapes
+static fnl_state create_warp_noise(int seed) {
+    fnl_state noise = fnlCreateState();
+    noise.noise_type = FNL_NOISE_OPENSIMPLEX2;
+    noise.fractal_type = FNL_FRACTAL_FBM;
+    noise.octaves = 3;
+    noise.frequency = 4.0f;
+    noise.seed = seed + 1000;
+    return noise;
+}
+
+// Detail noise: high-frequency local variation (ridges, bumps)
+static fnl_state create_detail_noise(int seed) {
+    fnl_state noise = fnlCreateState();
+    noise.noise_type = FNL_NOISE_OPENSIMPLEX2;
+    noise.fractal_type = FNL_FRACTAL_RIDGED;
+    noise.octaves = 3;
+    noise.frequency = 16.0f;
+    noise.seed = seed + 2000;
+    return noise;
+}
+
+// Color variation noise: subtle per-vertex color offsets for visual texture
+static fnl_state create_color_noise(int seed) {
+    fnl_state noise = fnlCreateState();
+    noise.noise_type = FNL_NOISE_OPENSIMPLEX2;
+    noise.fractal_type = FNL_FRACTAL_FBM;
+    noise.octaves = 2;
+    noise.frequency = 40.0f;
+    noise.seed = seed + 3000;
+    return noise;
+}
+
+// ---- Terrain height constants ----
+// For a 796km radius planet, ~8km total relief (~1% of radius, KSP-like exaggeration)
+#define TERRAIN_SEA_LEVEL_M   4000.0f   // Sea level = 4km above planet_radius
+#define TERRAIN_AMPLITUDE_M   8000.0f   // Total relief: 0 to 8km above planet_radius
+#define TERRAIN_MIN_M         500.0f    // Minimum terrain (deep ocean floor)
+
+// Sample terrain noise value at a point on the unit sphere.
+// Returns a combined noise value in roughly [-1, 1] range with domain warping + detail.
+static float sample_terrain_noise(fnl_state* base_noise, fnl_state* warp_noise,
+                                   fnl_state* detail_noise, HMM_Vec3 unit_pos) {
+    float scale = 3.0f;
+    float px = unit_pos.X * scale;
+    float py = unit_pos.Y * scale;
+    float pz = unit_pos.Z * scale;
+
+    // Domain warping: displace coordinates with another noise field
+    float warp_strength = 0.3f;
+    float wx = fnlGetNoise3D(warp_noise, px + 5.2f, py + 1.3f, pz + 3.7f);
+    float wy = fnlGetNoise3D(warp_noise, px + 9.1f, py + 4.8f, pz + 7.2f);
+    float wz = fnlGetNoise3D(warp_noise, px + 2.6f, py + 8.4f, pz + 0.9f);
+    px += wx * warp_strength;
+    py += wy * warp_strength;
+    pz += wz * warp_strength;
+
+    // Base continental noise
+    float n = fnlGetNoise3D(base_noise, px, py, pz);
+
+    // Detail noise: ridged fractal adds local terrain features (mountains, cliffs)
+    float detail = fnlGetNoise3D(detail_noise,
+        unit_pos.X * scale, unit_pos.Y * scale, unit_pos.Z * scale);
+    // Modulate detail by base height: more detail at higher elevations
+    float detail_weight = fmaxf(0.0f, n * 0.5f + 0.5f) * 0.3f;
+    n += detail * detail_weight;
+
+    return n;
+}
+
+// Sample terrain height in METERS above planet_radius.
+// Returns continuous floating-point height for coarse LOD rendering and collision.
+static float sample_terrain_height_m(fnl_state* base_noise, fnl_state* warp_noise,
+                                      fnl_state* detail_noise, HMM_Vec3 unit_pos) {
+    float n = sample_terrain_noise(base_noise, warp_noise, detail_noise, unit_pos);
+    // Map noise [-1,1] to height [TERRAIN_MIN_M, TERRAIN_MIN_M + TERRAIN_AMPLITUDE_M]
+    float height = TERRAIN_MIN_M + (n + 1.0f) * 0.5f * TERRAIN_AMPLITUDE_M;
+    if (height < 0.0f) height = 0.0f;
+    return height;
+}
+
+// Legacy: sample terrain height in discrete layers (for voxel mesh at depth 16).
+// Returns integer layer index compatible with planet.c voxel system.
+static int sample_terrain_height(fnl_state* base_noise, fnl_state* warp_noise,
+                                  fnl_state* detail_noise,
+                                  HMM_Vec3 unit_pos, int sea_level) {
+    float n = sample_terrain_noise(base_noise, warp_noise, detail_noise, unit_pos);
     int height = 8 + (int)((n + 1.0f) * 0.5f * 40.0f);
     if (height < 1) height = 1;
     if (height >= 64) height = 63;
@@ -64,11 +148,44 @@ static int sample_terrain_height(fnl_state* noise, HMM_Vec3 unit_pos, int sea_le
     return height;
 }
 
-// Get terrain color based on height relative to sea level (matches planet.c)
+// Perturb a base color with noise for visual variety
+static HMM_Vec3 perturb_color(HMM_Vec3 base, fnl_state* color_noise, HMM_Vec3 unit_pos) {
+    float cn = fnlGetNoise3D(color_noise,
+        unit_pos.X * 3.0f, unit_pos.Y * 3.0f, unit_pos.Z * 3.0f);
+    float variation = cn * 0.12f;  // +/- 12% brightness variation
+    return (HMM_Vec3){{
+        fminf(1.0f, fmaxf(0.0f, base.X + variation)),
+        fminf(1.0f, fmaxf(0.0f, base.Y + variation * 0.8f)),
+        fminf(1.0f, fmaxf(0.0f, base.Z + variation * 0.6f))
+    }};
+}
+
+// Get terrain color based on height in meters above planet_radius
+static HMM_Vec3 terrain_color_m(float height_m) {
+    float rel = height_m - TERRAIN_SEA_LEVEL_M;
+    if (height_m < TERRAIN_SEA_LEVEL_M) {
+        // Deeper ocean = darker blue
+        float depth_factor = fminf(1.0f, -rel / 2000.0f);
+        return (HMM_Vec3){{0.05f + 0.10f * (1.0f - depth_factor),
+                           0.15f + 0.20f * (1.0f - depth_factor),
+                           0.40f + 0.25f * (1.0f - depth_factor)}};
+    } else if (rel < 200.0f) {
+        return (HMM_Vec3){{0.76f, 0.70f, 0.40f}};  // Sand/beach
+    } else if (rel < 1500.0f) {
+        return (HMM_Vec3){{0.20f, 0.55f, 0.15f}};  // Grass/forest
+    } else if (rel < 3000.0f) {
+        return (HMM_Vec3){{0.45f, 0.42f, 0.38f}};  // Rock/stone
+    } else if (rel < 4500.0f) {
+        return (HMM_Vec3){{0.55f, 0.53f, 0.50f}};  // High stone
+    } else {
+        return (HMM_Vec3){{0.90f, 0.95f, 1.00f}};  // Snow/ice
+    }
+}
+
+// Legacy: get terrain color from layer index (for voxel mesh)
 static HMM_Vec3 terrain_color(int height, int sea_level) {
     int rel = height - sea_level;
     if (height < sea_level) {
-        // Underwater: show water color
         return (HMM_Vec3){{0.15f, 0.35f, 0.65f}};
     } else if (rel <= 1) {
         return (HMM_Vec3){{0.76f, 0.70f, 0.40f}};  // Sand
@@ -205,6 +322,9 @@ void lod_tree_init(LodTree* tree, float planet_radius, float layer_thickness,
     tree->sea_level = sea_level;
     tree->seed = seed;
     tree->camera_pos = (HMM_Vec3){{0, 0, 0}};
+    tree->world_origin[0] = 0.0;
+    tree->world_origin[1] = 0.0;
+    tree->world_origin[2] = 0.0;
     tree->active_leaf_count = 0;
     tree->total_vertex_count = 0;
     tree->stats_frame_counter = 0;
@@ -274,9 +394,19 @@ void lod_tree_destroy(LodTree* tree) {
 // ---- Mesh generation ----
 
 // Helper: emit a triangle into the vertex array
+// Automatically ensures winding matches the given normal direction (CCW when
+// viewed from the normal side), so that SG_FACEWINDING_CCW renders front faces.
 static void lod_emit_tri(LodVertex** verts, int* count, int* cap,
                           HMM_Vec3 p0, HMM_Vec3 p1, HMM_Vec3 p2,
                           HMM_Vec3 normal, HMM_Vec3 color) {
+    // Ensure winding matches normal (CCW from the normal's side = front face)
+    HMM_Vec3 e1 = vec3_sub(p1, p0);
+    HMM_Vec3 e2 = vec3_sub(p2, p0);
+    HMM_Vec3 face_n = vec3_cross(e1, e2);
+    if (vec3_dot(face_n, normal) < 0.0f) {
+        HMM_Vec3 tmp = p1; p1 = p2; p2 = tmp;
+    }
+
     if (*count + 3 > *cap) {
         *cap *= 2;
         *verts = (LodVertex*)realloc(*verts, *cap * sizeof(LodVertex));
@@ -305,12 +435,18 @@ static void generate_coarse_mesh_params(
     float planet_radius, float layer_thickness, int sea_level, int seed,
     LodVertex** out_vertices, int* out_count)
 {
-    // Tessellation resolution depends on depth
+    // Tessellation resolution depends on depth.
+    // Coarse depths (0-3) are fallback-only, kept light.
+    // Mid depths (4-11) are visible at the horizon, need smoother tessellation.
     int tess = 4;
     if (depth >= 4) tess = 6;
     if (depth >= 8) tess = 8;
+    if (depth >= 12) tess = 10;
 
     fnl_state noise = create_terrain_noise(seed);
+    fnl_state warp = create_warp_noise(seed);
+    fnl_state detail = create_detail_noise(seed);
+    fnl_state cnoise = create_color_noise(seed);
 
     int max_verts = tess * tess * 6 * 3;
     *out_vertices = (LodVertex*)malloc(max_verts * sizeof(LodVertex));
@@ -339,16 +475,15 @@ static void generate_coarse_mesh_params(
             );
             p = vec3_normalize(p);
 
-            int h = sample_terrain_height(&noise, p, sea_level);
-            int effective_h = h;
-            if (effective_h < sea_level) effective_h = sea_level;
+            float h_m = sample_terrain_height_m(&noise, &warp, &detail, p);
+            // Clamp to sea level for ocean surface
+            float effective_h_m = fmaxf(h_m, TERRAIN_SEA_LEVEL_M);
 
-            float radius = planet_radius +
-                           (effective_h + 1) * layer_thickness;
+            float radius = planet_radius + effective_h_m;
 
             points[idx] = vec3_scale(p, radius);
-            heights[idx] = (float)h;
-            colors[idx] = terrain_color(h, sea_level);
+            heights[idx] = h_m;
+            colors[idx] = perturb_color(terrain_color_m(h_m), &cnoise, p);
             idx++;
         }
     }
@@ -420,8 +555,11 @@ static void generate_coarse_mesh_params(
     }
 
     // ---- Boundary skirts: hide gaps between patches at different LOD levels ----
-    // Extend each boundary edge downward by a few layers to cover seams
-    float skirt_drop = 3.0f * layer_thickness;
+    // Extend each boundary edge downward to cover seams.
+    // Coarse patches have bigger height mismatches due to terrain smoothing,
+    // so scale skirt proportionally to patch angular size.
+    float patch_world_size = tri->angular_radius * planet_radius;
+    float skirt_drop = fmaxf(3.0f * layer_thickness, patch_world_size * 0.015f);
 
     // Helper macro to emit a skirt wall quad between two boundary vertices
     #define EMIT_SKIRT(ia, ib) do { \
@@ -501,6 +639,9 @@ static void generate_voxel_mesh_params(
     (void)depth;
     int tess = 8;  // Fine tessellation for voxel detail
     fnl_state noise = create_terrain_noise(seed);
+    fnl_state warp = create_warp_noise(seed);
+    fnl_state detail = create_detail_noise(seed);
+    fnl_state cnoise = create_color_noise(seed);
 
     // 1. Generate grid vertices on unit sphere
     int num_pts = (tess + 1) * (tess + 2) / 2;
@@ -526,11 +667,14 @@ static void generate_voxel_mesh_params(
         row_off[r] = row_off[r - 1] + (tess - (r - 1) + 1);
     }
 
-    // 3. Build triangle list with terrain heights at centroids
+    // 3. Build triangle list with terrain heights at centroids (in meters)
+    float step_h = layer_thickness;  // Voxel step height for Minecraft-like look
+    if (step_h < 1.0f) step_h = 2.0f;  // Minimum 2m steps for visible voxels
+
     int num_tris = tess * tess;
     int* tri_v = (int*)malloc(num_tris * 3 * sizeof(int));
-    int* tri_h = (int*)malloc(num_tris * sizeof(int));   // raw terrain height
-    int* tri_eh = (int*)malloc(num_tris * sizeof(int));  // effective height (clamped to sea level)
+    float* tri_h = (float*)malloc(num_tris * sizeof(float));   // raw terrain height (meters)
+    float* tri_eh = (float*)malloc(num_tris * sizeof(float));  // effective height (clamped to sea level, quantized)
 
     int tidx = 0;
     for (int row = 0; row < tess; row++) {
@@ -546,9 +690,11 @@ static void generate_voxel_mesh_params(
             HMM_Vec3 c = vec3_normalize(vec3_scale(
                 vec3_add(vec3_add(unit_pts[i0], unit_pts[i1]), unit_pts[i2]),
                 1.0f / 3.0f));
-            int h = sample_terrain_height(&noise, c, sea_level);
-            tri_h[tidx] = h;
-            tri_eh[tidx] = h < sea_level ? sea_level : h;
+            float h_m = sample_terrain_height_m(&noise, &warp, &detail, c);
+            tri_h[tidx] = h_m;
+            // Quantize to step height for voxel look, clamp to sea level
+            float eff = fmaxf(h_m, TERRAIN_SEA_LEVEL_M);
+            tri_eh[tidx] = floorf(eff / step_h) * step_h;
             tidx++;
 
             // Downward triangle: V(row+1,col), V(row,col+1), V(row+1,col+1)
@@ -563,9 +709,10 @@ static void generate_voxel_mesh_params(
                 c = vec3_normalize(vec3_scale(
                     vec3_add(vec3_add(unit_pts[j0], unit_pts[j1]), unit_pts[j2]),
                     1.0f / 3.0f));
-                h = sample_terrain_height(&noise, c, sea_level);
-                tri_h[tidx] = h;
-                tri_eh[tidx] = h < sea_level ? sea_level : h;
+                h_m = sample_terrain_height_m(&noise, &warp, &detail, c);
+                tri_h[tidx] = h_m;
+                eff = fmaxf(h_m, TERRAIN_SEA_LEVEL_M);
+                tri_eh[tidx] = floorf(eff / step_h) * step_h;
                 tidx++;
             }
         }
@@ -593,10 +740,10 @@ static void generate_voxel_mesh_params(
     *out_count = 0;
     int cap = max_verts;
 
-    // 6. Render top faces (each triangle at its discrete height)
+    // 6. Render top faces (each triangle at its quantized height)
     for (int t = 0; t < tidx; t++) {
-        int eh = tri_eh[t];
-        float r_top = planet_radius + (eh + 1) * layer_thickness;
+        float eh = tri_eh[t];
+        float r_top = planet_radius + eh + step_h;
 
         HMM_Vec3 p0 = vec3_scale(unit_pts[tri_v[t * 3 + 0]], r_top);
         HMM_Vec3 p1 = vec3_scale(unit_pts[tri_v[t * 3 + 1]], r_top);
@@ -613,8 +760,11 @@ static void generate_voxel_mesh_params(
             HMM_Vec3 tmp = p1; p1 = p2; p2 = tmp;
         }
 
-        VoxelType vt = compute_voxel_type(eh, tri_h[t], sea_level);
-        HMM_Vec3 color = voxel_type_color(vt);
+        HMM_Vec3 tri_center = vec3_normalize(vec3_scale(
+            vec3_add(vec3_add(unit_pts[tri_v[t * 3 + 0]],
+                              unit_pts[tri_v[t * 3 + 1]]),
+                     unit_pts[tri_v[t * 3 + 2]]), 1.0f / 3.0f));
+        HMM_Vec3 color = perturb_color(terrain_color_m(tri_h[t]), &cnoise, tri_center);
 
         lod_emit_tri(out_vertices, out_count, &cap, p0, p1, p2, normal, color);
     }
@@ -628,12 +778,9 @@ static void generate_voxel_mesh_params(
         if (e->count == 1) {
             // Boundary edge: render skirt extending downward
             int t = e->tri[0];
-            int eh = tri_eh[t];
-            int th = tri_h[t];
-            int skirt_bottom = eh - 3;
-            if (skirt_bottom < 0) skirt_bottom = 0;
+            float eh = tri_eh[t];
+            float skirt_drop_m = step_h * 3.0f;
 
-            // Normal points outward from the patch (away from triangle centroid)
             HMM_Vec3 tri_c = vec3_normalize(vec3_scale(
                 vec3_add(vec3_add(
                     unit_pts[tri_v[t * 3 + 0]],
@@ -642,64 +789,58 @@ static void generate_voxel_mesh_params(
             HMM_Vec3 edge_mid = vec3_normalize(vec3_scale(vec3_add(ua, ub), 0.5f));
             HMM_Vec3 outward = vec3_normalize(vec3_sub(edge_mid, tri_c));
 
-            for (int layer = skirt_bottom; layer <= eh; layer++) {
-                float r_bot = planet_radius + layer * layer_thickness;
-                float r_top = planet_radius + (layer + 1) * layer_thickness;
+            float r_top = planet_radius + eh + step_h;
+            float r_bot = planet_radius + eh - skirt_drop_m;
+            HMM_Vec3 color = perturb_color(terrain_color_m(tri_h[t]), &cnoise, edge_mid);
 
-                HMM_Vec3 bl = vec3_scale(ua, r_bot);
-                HMM_Vec3 br = vec3_scale(ub, r_bot);
-                HMM_Vec3 tl = vec3_scale(ua, r_top);
-                HMM_Vec3 tr = vec3_scale(ub, r_top);
+            HMM_Vec3 bl = vec3_scale(ua, r_bot);
+            HMM_Vec3 br = vec3_scale(ub, r_bot);
+            HMM_Vec3 tl = vec3_scale(ua, r_top);
+            HMM_Vec3 tr = vec3_scale(ub, r_top);
 
-                VoxelType vt = compute_voxel_type(layer, th, sea_level);
-                HMM_Vec3 color = voxel_type_color(vt);
-
-                lod_emit_tri(out_vertices, out_count, &cap, bl, tr, br, outward, color);
-                lod_emit_tri(out_vertices, out_count, &cap, bl, tl, tr, outward, color);
-            }
+            lod_emit_tri(out_vertices, out_count, &cap, bl, tr, br, outward, color);
+            lod_emit_tri(out_vertices, out_count, &cap, bl, tl, tr, outward, color);
         } else {
             // Interior edge: render wall if heights differ
             int t0 = e->tri[0];
             int t1 = e->tri[1];
-            int h0 = tri_eh[t0];
-            int h1 = tri_eh[t1];
+            float h0 = tri_eh[t0];
+            float h1 = tri_eh[t1];
 
-            if (h0 == h1) continue;  // Same height, no wall needed
+            if (fabsf(h0 - h1) < 0.01f) continue;  // Same height, no wall needed
 
             int tall = h0 > h1 ? t0 : t1;
-            int shor = h0 > h1 ? t1 : t0;
-            int high = h0 > h1 ? h0 : h1;
-            int low = h0 > h1 ? h1 : h0;
-            int tall_th = h0 > h1 ? tri_h[t0] : tri_h[t1];
+            float high = h0 > h1 ? h0 : h1;
+            float low = h0 > h1 ? h1 : h0;
 
-            // Normal from tall toward short (faces the exposed cliff)
             HMM_Vec3 tall_c = vec3_normalize(vec3_scale(
                 vec3_add(vec3_add(
                     unit_pts[tri_v[tall * 3 + 0]],
                     unit_pts[tri_v[tall * 3 + 1]]),
                     unit_pts[tri_v[tall * 3 + 2]]), 1.0f / 3.0f));
+            int shor = h0 > h1 ? t1 : t0;
             HMM_Vec3 short_c = vec3_normalize(vec3_scale(
                 vec3_add(vec3_add(
                     unit_pts[tri_v[shor * 3 + 0]],
                     unit_pts[tri_v[shor * 3 + 1]]),
                     unit_pts[tri_v[shor * 3 + 2]]), 1.0f / 3.0f));
             HMM_Vec3 wall_normal = vec3_normalize(vec3_sub(short_c, tall_c));
+            HMM_Vec3 wall_mid = vec3_normalize(vec3_scale(vec3_add(ua, ub), 0.5f));
 
-            for (int layer = low + 1; layer <= high; layer++) {
-                float r_bot = planet_radius + layer * layer_thickness;
-                float r_top = planet_radius + (layer + 1) * layer_thickness;
+            // Single wall quad from low to high
+            float r_bot = planet_radius + low + step_h;
+            float r_top = planet_radius + high + step_h;
 
-                HMM_Vec3 bl = vec3_scale(ua, r_bot);
-                HMM_Vec3 br = vec3_scale(ub, r_bot);
-                HMM_Vec3 tl = vec3_scale(ua, r_top);
-                HMM_Vec3 tr = vec3_scale(ub, r_top);
+            HMM_Vec3 bl = vec3_scale(ua, r_bot);
+            HMM_Vec3 br = vec3_scale(ub, r_bot);
+            HMM_Vec3 tl = vec3_scale(ua, r_top);
+            HMM_Vec3 tr = vec3_scale(ub, r_top);
 
-                VoxelType vt = compute_voxel_type(layer, tall_th, sea_level);
-                HMM_Vec3 color = voxel_type_color(vt);
+            float wall_h = (high + low) * 0.5f;
+            HMM_Vec3 color = perturb_color(terrain_color_m(wall_h), &cnoise, wall_mid);
 
-                lod_emit_tri(out_vertices, out_count, &cap, bl, tr, br, wall_normal, color);
-                lod_emit_tri(out_vertices, out_count, &cap, bl, tl, tr, wall_normal, color);
-            }
+            lod_emit_tri(out_vertices, out_count, &cap, bl, tr, br, wall_normal, color);
+            lod_emit_tri(out_vertices, out_count, &cap, bl, tl, tr, wall_normal, color);
         }
     }
 
@@ -710,6 +851,17 @@ static void generate_voxel_mesh_params(
     free(tri_h);
     free(tri_eh);
     free(edges);
+}
+
+// Apply floating origin offset to all vertex positions in a mesh.
+// Called after mesh generation (normals/winding already computed from world coords).
+// Vertex positions are translated so they're relative to origin, keeping float32 precise.
+static void apply_origin_offset(LodVertex* verts, int count, const float origin[3]) {
+    for (int i = 0; i < count; i++) {
+        verts[i].pos[0] -= origin[0];
+        verts[i].pos[1] -= origin[1];
+        verts[i].pos[2] -= origin[2];
+    }
 }
 
 // Worker thread callback for async mesh generation
@@ -728,6 +880,9 @@ static void mesh_gen_worker(void* data) {
             &job->vertices, &job->vertex_count);
     }
 
+    // Apply floating origin: shift vertex positions so they're near camera
+    apply_origin_offset(job->vertices, job->vertex_count, job->origin);
+
     // Signal completion (volatile write - safe on x86 with store ordering)
     job->completed = 1;
 }
@@ -745,6 +900,10 @@ static void generate_node_mesh(LodTree* tree, LodNode* node) {
             tree->planet_radius, tree->layer_thickness, tree->sea_level, tree->seed,
             &node->cpu_vertices, &node->cpu_vertex_count);
     }
+    float origin[3] = {(float)tree->world_origin[0],
+                       (float)tree->world_origin[1],
+                       (float)tree->world_origin[2]};
+    apply_origin_offset(node->cpu_vertices, node->cpu_vertex_count, origin);
     node->state = LOD_READY;
 }
 
@@ -759,6 +918,9 @@ static void submit_mesh_job(LodTree* tree, int node_idx) {
     job->layer_thickness = tree->layer_thickness;
     job->sea_level = tree->sea_level;
     job->seed = tree->seed;
+    job->origin[0] = (float)tree->world_origin[0];
+    job->origin[1] = (float)tree->world_origin[1];
+    job->origin[2] = (float)tree->world_origin[2];
     job->node_index = node_idx;
     job->vertices = NULL;
     job->vertex_count = 0;
@@ -789,6 +951,23 @@ static void process_completed_jobs(LodTree* tree) {
 
         MeshGenJob* job = (MeshGenJob*)node->pending_job;
         if (!job->completed) continue;
+
+        // Check if job's origin matches current tree origin (may be stale after recenter)
+        float cur_origin[3] = {(float)tree->world_origin[0],
+                               (float)tree->world_origin[1],
+                               (float)tree->world_origin[2]};
+        bool stale = (job->origin[0] != cur_origin[0] ||
+                      job->origin[1] != cur_origin[1] ||
+                      job->origin[2] != cur_origin[2]);
+
+        if (stale) {
+            // Discard stale mesh and reset node for regeneration
+            if (job->vertices) free(job->vertices);
+            free(job);
+            node->pending_job = NULL;
+            node->state = LOD_UNLOADED;
+            continue;
+        }
 
         // Transfer mesh data from job to node
         node->cpu_vertices = job->vertices;
@@ -888,16 +1067,10 @@ static void merge_node(LodTree* tree, int node_idx) {
     node->is_leaf = true;
 }
 
-// ---- Screen-space metric ----
+// ---- Distance-based LOD decision ----
 
-// Compute how large this node appears on screen.
-// Uses distance to NEAREST EDGE of the patch, not center.
-// This is critical: when the camera is inside a patch (standing on it),
-// the center may be hundreds of km away, but the patch extends beneath us.
-static float compute_screen_metric(const LodTree* tree, const LodNode* node) {
-    float patch_size = node->tri.angular_radius * tree->planet_radius;
-
-    // Angular distance from camera direction to patch center on the unit sphere
+// Returns the world-space distance from the camera to the nearest edge of a patch.
+static float patch_distance(const LodTree* tree, const LodNode* node) {
     float cam_r = sqrtf(vec3_dot(tree->camera_pos, tree->camera_pos));
     if (cam_r < 1.0f) cam_r = 1.0f;
     HMM_Vec3 cam_dir = vec3_scale(tree->camera_pos, 1.0f / cam_r);
@@ -905,90 +1078,103 @@ static float compute_screen_metric(const LodTree* tree, const LodNode* node) {
     if (cos_angle > 1.0f) cos_angle = 1.0f;
     if (cos_angle < -1.0f) cos_angle = -1.0f;
     float angle_to_center = acosf(cos_angle);
-
-    // Distance to nearest edge of the patch (0 if camera is above the patch)
     float edge_angle = angle_to_center - node->tri.angular_radius;
     if (edge_angle < 0.0f) edge_angle = 0.0f;
-
-    // Camera altitude above the planet surface
-    float altitude = cam_r - tree->planet_radius;
-    if (altitude < 1.0f) altitude = 1.0f;
-
-    // 3D distance to nearest patch edge: Pythagorean with surface arc + altitude
-    float surface_dist = edge_angle * tree->planet_radius;
-    float dist = sqrtf(surface_dist * surface_dist + altitude * altitude);
-
-    return patch_size / dist;
+    return edge_angle * tree->planet_radius;
 }
 
-// ---- Update (split/merge based on camera) ----
+// Check if a patch should be split: split when camera is close relative to patch size.
+// Each depth level halves the angular radius, so the patch arc length halves.
+static bool should_split(const LodTree* tree, const LodNode* node) {
+    if (node->depth >= LOD_MAX_DEPTH) return false;
+    float dist = patch_distance(tree, node);
+    float patch_arc = node->tri.angular_radius * tree->planet_radius;
+    return dist < patch_arc * LOD_SPLIT_FACTOR;
+}
 
-// Recursive traversal: decide split/merge for each node
+// Check if a patch's children should be merged back.
+static bool should_merge(const LodTree* tree, const LodNode* node) {
+    float dist = patch_distance(tree, node);
+    float patch_arc = node->tri.angular_radius * tree->planet_radius;
+    // Merge hysteresis: require 2x the split distance before merging
+    return dist > patch_arc * LOD_SPLIT_FACTOR * 2.0f;
+}
+
+// Back-hemisphere culling: skip patches entirely on the far side of the planet.
+static bool patch_on_back_hemisphere(const LodTree* tree, const LodNode* node) {
+    float cam_r = sqrtf(vec3_dot(tree->camera_pos, tree->camera_pos));
+    if (cam_r < 1.0f) return false;
+    HMM_Vec3 cam_dir = vec3_scale(tree->camera_pos, 1.0f / cam_r);
+    // Horizon angle from camera
+    float horizon_angle = acosf(fminf(1.0f, tree->planet_radius / cam_r));
+    float cos_angle = vec3_dot(cam_dir, node->tri.center);
+    if (cos_angle > 1.0f) cos_angle = 1.0f;
+    if (cos_angle < -1.0f) cos_angle = -1.0f;
+    float angle_to_center = acosf(cos_angle);
+    // Patch edge can be closer than center
+    float nearest_angle = angle_to_center - node->tri.angular_radius;
+    // Include some margin past the horizon (for tall terrain + skirts)
+    return nearest_angle > ((float)M_PI / 2.0f + horizon_angle + 0.1f);
+}
+
+// ---- Update: distance-based split/merge, mesh at all leaf levels ----
+
 static void update_node(LodTree* tree, int node_idx) {
     LodNode* node = &tree->nodes[node_idx];
-    float metric = compute_screen_metric(tree, node);
+
+    // Skip patches completely behind the planet
+    if (patch_on_back_hemisphere(tree, node)) {
+        if (!node->is_leaf) {
+            merge_node(tree, node_idx);
+        }
+        return;
+    }
 
     if (node->is_leaf) {
-        // Submit async mesh generation if needed
-        if (node->state == LOD_UNLOADED) {
-            if (tree->jobs) {
-                submit_mesh_job(tree, node_idx);
-            } else {
-                // Fallback: synchronous generation
-                generate_node_mesh(tree, node);
-            }
-        }
+        if (should_split(tree, node)) {
+            // For depths >= 4, require a renderable mesh before splitting.
+            // This guarantees parent-as-fallback: while children load,
+            // the parent's mesh fills in seamlessly (no popping).
+            // Depths 0-3 are too coarse to be individually visible, so they
+            // cascade-split instantly to build the tree skeleton quickly.
+            bool need_mesh_first = (node->depth >= 4);
 
-        // Only split nodes with GPU buffers (ensures parent can be fallback)
-        if (node->state == LOD_ACTIVE) {
-            if (metric > LOD_SPLIT_THRESHOLD && node->depth < LOD_MAX_DEPTH) {
-                if (tree->active_leaf_count < LOD_TARGET_LEAVES * 2 &&
-                    tree->splits_this_frame < LOD_MAX_SPLITS_PER_FRAME) {
-                    split_node(tree, node_idx);
-                    tree->splits_this_frame++;
-                    // Recurse into new children
-                    // Must re-fetch node pointer EACH iteration — recursive update_node
-                    // may trigger split_node → allocate_node → realloc, invalidating pointers.
-                    if (!tree->nodes[node_idx].is_leaf) {
-                        for (int i = 0; i < LOD_CHILDREN; i++) {
-                            int ci = tree->nodes[node_idx].children[i];
-                            if (ci >= 0) {
-                                update_node(tree, ci);
-                            }
-                        }
+            if (need_mesh_first) {
+                if (node->state == LOD_UNLOADED) {
+                    if (tree->jobs) {
+                        submit_mesh_job(tree, node_idx);
+                    } else {
+                        generate_node_mesh(tree, node);
                     }
-                    node = &tree->nodes[node_idx];
+                    return;  // Wait for mesh before splitting
+                }
+                if (node->state == LOD_GENERATING || node->state == LOD_READY) {
+                    return;  // Still loading/uploading, wait
                 }
             }
-        }
-    } else {
-        // Internal node: check if we should merge children
-        bool all_children_want_merge = true;
-        for (int i = 0; i < LOD_CHILDREN; i++) {
-            int child_idx = node->children[i];
-            if (child_idx < 0) continue;
-
-            LodNode* child = &tree->nodes[child_idx];
-            if (!child->is_leaf) {
-                all_children_want_merge = false;
-                break;
+            // Split (immediately for coarse depths, after mesh ready for fine)
+            if (tree->splits_this_frame < LOD_MAX_SPLITS_PER_FRAME) {
+                // Generate fallback mesh for coarse nodes before splitting
+                // (start job but don't wait — best effort fallback)
+                if (!need_mesh_first && node->state == LOD_UNLOADED) {
+                    if (tree->jobs) {
+                        submit_mesh_job(tree, node_idx);
+                    }
+                }
+                split_node(tree, node_idx);
+                tree->splits_this_frame++;
+                // Recurse into new children immediately
+                if (!tree->nodes[node_idx].is_leaf) {
+                    for (int i = 0; i < LOD_CHILDREN; i++) {
+                        int ci = tree->nodes[node_idx].children[i];
+                        if (ci >= 0) {
+                            update_node(tree, ci);
+                        }
+                    }
+                }
             }
-            // Don't merge if any child is still generating
-            if (child->state == LOD_GENERATING) {
-                all_children_want_merge = false;
-                break;
-            }
-            float child_metric = compute_screen_metric(tree, child);
-            if (child_metric > LOD_MERGE_THRESHOLD) {
-                all_children_want_merge = false;
-                break;
-            }
-        }
-
-        if (all_children_want_merge && metric < LOD_MERGE_THRESHOLD) {
-            merge_node(tree, node_idx);
-            // Parent is now a leaf; if it still has a valid mesh, use it
-            node = &tree->nodes[node_idx];
+        } else {
+            // This leaf is at the right detail level — generate mesh if needed
             if (node->state == LOD_UNLOADED) {
                 if (tree->jobs) {
                     submit_mesh_job(tree, node_idx);
@@ -996,9 +1182,23 @@ static void update_node(LodTree* tree, int node_idx) {
                     generate_node_mesh(tree, node);
                 }
             }
+        }
+    } else {
+        // Internal node
+        if (should_merge(tree, node)) {
+            // Too far for this detail level: merge children
+            merge_node(tree, node_idx);
+            // After merge, this is a leaf — generate its mesh
+            node = &tree->nodes[node_idx];
+            if (node->is_leaf && node->state == LOD_UNLOADED) {
+                if (tree->jobs) {
+                    submit_mesh_job(tree, node_idx);
+                } else {
+                    generate_node_mesh(tree, node);
+                }
+            }
         } else {
-            // Recurse into children
-            // Must re-fetch via tree->nodes[] each iteration — recursive calls may realloc.
+            // Keep children — recurse
             for (int i = 0; i < LOD_CHILDREN; i++) {
                 int ci = tree->nodes[node_idx].children[i];
                 if (ci >= 0) {
@@ -1010,9 +1210,8 @@ static void update_node(LodTree* tree, int node_idx) {
 }
 
 void lod_tree_update(LodTree* tree, HMM_Vec3 camera_pos, HMM_Mat4 view_proj) {
-    (void)view_proj;  // May use for frustum culling later
+    (void)view_proj;
     tree->camera_pos = camera_pos;
-    tree->active_leaf_count = 0;
     tree->splits_this_frame = 0;
 
     // Process completed async jobs first (transfers mesh data to nodes)
@@ -1127,16 +1326,15 @@ void lod_tree_upload_meshes(LodTree* tree) {
 
 // ---- Rendering ----
 
-// Recursive render: traverses the tree from each node downward.
-// An internal node renders itself as fallback if any child is not yet ACTIVE,
-// preventing temporal popping (parent stays visible until all children are ready).
+// Recursive render: draws ALL active leaf nodes at their respective LOD levels.
+// Internal nodes with active meshes are used as fallback while children load.
 static void render_node(const LodTree* tree, int node_idx,
                          sg_bindings* bind, int* total_verts,
                          LodPreDrawFunc pre_draw, void* user_data) {
     const LodNode* node = &tree->nodes[node_idx];
 
     if (node->is_leaf) {
-        // Leaf: render if active
+        // Render this leaf if it has an active GPU mesh
         if (node->state == LOD_ACTIVE && node->gpu_vertex_count > 0 &&
             node->gpu_buffer.id != SG_INVALID_ID) {
             if (pre_draw) pre_draw(node->depth, user_data);
@@ -1148,18 +1346,25 @@ static void render_node(const LodTree* tree, int node_idx,
         return;
     }
 
-    // Internal node: check if all children have ACTIVE meshes
-    bool all_children_active = true;
+    // Internal node: check if all children have renderable meshes.
+    // If any child is still loading, render this node's mesh as fallback.
+    bool all_children_ready = true;
     for (int i = 0; i < LOD_CHILDREN; i++) {
         int ci = node->children[i];
-        if (ci < 0 || tree->nodes[ci].state != LOD_ACTIVE) {
-            all_children_active = false;
-            break;
+        if (ci < 0) { all_children_ready = false; break; }
+        const LodNode* child = &tree->nodes[ci];
+        if (child->is_leaf) {
+            if (child->state != LOD_ACTIVE || child->gpu_vertex_count == 0 ||
+                child->gpu_buffer.id == SG_INVALID_ID) {
+                all_children_ready = false;
+                break;
+            }
         }
+        // If child is an internal node, it will handle its own rendering
     }
 
-    if (all_children_active) {
-        // All children ready: recurse into them (don't render parent)
+    if (all_children_ready) {
+        // All children ready — recurse into them for finer detail
         for (int i = 0; i < LOD_CHILDREN; i++) {
             if (node->children[i] >= 0) {
                 render_node(tree, node->children[i], bind, total_verts,
@@ -1167,8 +1372,7 @@ static void render_node(const LodTree* tree, int node_idx,
             }
         }
     } else {
-        // Not all children ready: render this node as fallback
-        // (parent's mesh covers all children's regions until they're ready)
+        // Fallback: render this node's mesh if available (parent-as-fallback)
         if (node->state == LOD_ACTIVE && node->gpu_vertex_count > 0 &&
             node->gpu_buffer.id != SG_INVALID_ID) {
             if (pre_draw) pre_draw(node->depth, user_data);
@@ -1176,6 +1380,14 @@ static void render_node(const LodTree* tree, int node_idx,
             sg_apply_bindings(bind);
             sg_draw(0, node->gpu_vertex_count, 1);
             *total_verts += node->gpu_vertex_count;
+        } else {
+            // No fallback mesh — still recurse and render whatever children have
+            for (int i = 0; i < LOD_CHILDREN; i++) {
+                if (node->children[i] >= 0) {
+                    render_node(tree, node->children[i], bind, total_verts,
+                               pre_draw, user_data);
+                }
+            }
         }
     }
 }
@@ -1255,13 +1467,76 @@ int lod_tree_find_node(const LodTree* tree, HMM_Vec3 world_pos) {
     return find_node_recursive(tree, best_root, unit);
 }
 
-float lod_tree_terrain_height(const LodTree* tree, HMM_Vec3 world_pos) {
+// ---- Floating origin recentering ----
+
+#define ORIGIN_RECENTER_THRESHOLD 50000.0  // 50km — recenter when camera drifts this far
+
+bool lod_tree_update_origin(LodTree* tree, const double cam_pos_d[3]) {
+    double dx = cam_pos_d[0] - tree->world_origin[0];
+    double dy = cam_pos_d[1] - tree->world_origin[1];
+    double dz = cam_pos_d[2] - tree->world_origin[2];
+    double dist_sq = dx*dx + dy*dy + dz*dz;
+
+    if (dist_sq < ORIGIN_RECENTER_THRESHOLD * ORIGIN_RECENTER_THRESHOLD) {
+        return false;  // Close enough, no recenter needed
+    }
+
+    // Recenter origin to camera position
+    double new_origin[3] = {cam_pos_d[0], cam_pos_d[1], cam_pos_d[2]};
+
+    LOG(GAME, "Floating origin recenter: (%.0f,%.0f,%.0f) -> (%.0f,%.0f,%.0f)\n",
+        tree->world_origin[0], tree->world_origin[1], tree->world_origin[2],
+        new_origin[0], new_origin[1], new_origin[2]);
+
+    tree->world_origin[0] = new_origin[0];
+    tree->world_origin[1] = new_origin[1];
+    tree->world_origin[2] = new_origin[2];
+
+    // Invalidate all node meshes — they need regeneration with new origin.
+    // The LOD system will naturally rebuild everything within a few frames.
+    for (int i = 0; i < tree->node_count; i++) {
+        LodNode* node = &tree->nodes[i];
+
+        // Cancel pending jobs
+        if (node->pending_job) {
+            MeshGenJob* job = (MeshGenJob*)node->pending_job;
+            // Wait for completion (can't free while worker is using it)
+            // The job will complete with old origin, but we'll re-submit
+            // Just mark it — process_completed_jobs will pick it up
+        }
+
+        // Free CPU mesh data
+        if (node->cpu_vertices) {
+            free(node->cpu_vertices);
+            node->cpu_vertices = NULL;
+            node->cpu_vertex_count = 0;
+        }
+
+        // Destroy GPU buffer
+        if (node->gpu_buffer.id != SG_INVALID_ID) {
+            sg_destroy_buffer(node->gpu_buffer);
+            node->gpu_buffer.id = SG_INVALID_ID;
+            node->gpu_vertex_count = 0;
+        }
+
+        // Only reset state for non-generating nodes (let pending jobs finish)
+        if (node->state != LOD_GENERATING) {
+            node->state = LOD_UNLOADED;
+        }
+    }
+
+    return true;
+}
+
+double lod_tree_terrain_height(const LodTree* tree, HMM_Vec3 world_pos) {
     HMM_Vec3 unit = vec3_normalize(world_pos);
     fnl_state noise = create_terrain_noise(tree->seed);
-    int h = sample_terrain_height(&noise, unit, tree->sea_level);
-    int effective_h = h;
-    if (effective_h < tree->sea_level) effective_h = tree->sea_level;
-    return tree->planet_radius + (effective_h + 1) * tree->layer_thickness;
+    fnl_state warp = create_warp_noise(tree->seed);
+    fnl_state detail = create_detail_noise(tree->seed);
+    float h_m = sample_terrain_height_m(&noise, &warp, &detail, unit);
+    float effective_h_m = fmaxf(h_m, TERRAIN_SEA_LEVEL_M);
+    // Add in double to avoid float quantization (6.25cm steps at 800km)
+    return (double)tree->planet_radius + (double)effective_h_m;
 }
 
 int lod_tree_active_leaves(const LodTree* tree) {
