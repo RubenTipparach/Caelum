@@ -39,7 +39,7 @@ typedef struct Camera {
     uint64_t last_space_time;
 
     // Movement keys held
-    bool key_w, key_s, key_a, key_d, key_space, key_shift;
+    bool key_w, key_s, key_a, key_d, key_space, key_shift, key_ctrl;
 } Camera;
 
 void camera_init(Camera* cam);
