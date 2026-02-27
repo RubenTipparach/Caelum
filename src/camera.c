@@ -111,7 +111,7 @@ void camera_init(Camera* cam) {
     cam->sensitivity = 0.003f;
     cam->mouse_locked = false;
     cam->key_w = cam->key_s = cam->key_a = cam->key_d = false;
-    cam->key_space = cam->key_shift = false;
+    cam->key_space = cam->key_shift = cam->key_ctrl = false;
 
     cam->local_up = (HMM_Vec3){{0, 1, 0}};
     cam->prev_local_up = (HMM_Vec3){{0, 1, 0}};
@@ -267,9 +267,17 @@ void camera_update(Camera* cam, Planet* planet, const LodTree* lod, float dt) {
     if (cam->jetpack_active) {
         float sm = cam->jetpack_speed_mult;
         if (cam->key_space) {
+            // Thrust up
             float radial_vel = HMM_DotV3(cam->velocity, cam->local_up);
             if (radial_vel < JETPACK_MAX_SPEED * sm) {
                 cam->velocity = HMM_AddV3(cam->velocity,
+                    HMM_MulV3F(cam->local_up, JETPACK_THRUST * sm * dt));
+            }
+        } else if (cam->key_ctrl) {
+            // Thrust down
+            float radial_vel = HMM_DotV3(cam->velocity, cam->local_up);
+            if (radial_vel > -JETPACK_MAX_SPEED * sm) {
+                cam->velocity = HMM_SubV3(cam->velocity,
                     HMM_MulV3F(cam->local_up, JETPACK_THRUST * sm * dt));
             }
         } else {
@@ -459,6 +467,7 @@ void camera_handle_event(Camera* cam, const sapp_event* ev) {
                 cam->key_space = true;
             }
             if (ev->key_code == SAPP_KEYCODE_LEFT_SHIFT) cam->key_shift = true;
+            if (ev->key_code == SAPP_KEYCODE_LEFT_CONTROL) cam->key_ctrl = true;
             if (ev->key_code == SAPP_KEYCODE_ESCAPE) {
                 cam->mouse_locked = false;
                 sapp_lock_mouse(false);
@@ -472,6 +481,7 @@ void camera_handle_event(Camera* cam, const sapp_event* ev) {
             if (ev->key_code == SAPP_KEYCODE_D) cam->key_d = false;
             if (ev->key_code == SAPP_KEYCODE_SPACE) cam->key_space = false;
             if (ev->key_code == SAPP_KEYCODE_LEFT_SHIFT) cam->key_shift = false;
+            if (ev->key_code == SAPP_KEYCODE_LEFT_CONTROL) cam->key_ctrl = false;
             break;
 
         default:

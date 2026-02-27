@@ -190,14 +190,6 @@ static void frame(void) {
         printf("[GAME] frame %d, state=%d\n", frame_count, app.state);
         fflush(stdout);
     }
-    // Diagnostic: write frame count to file so we can tell if frames are ticking
-    if (frame_count <= 10 || frame_count % 60 == 0) {
-        FILE* diag = fopen("diag.log", "a");
-        if (diag) {
-            fprintf(diag, "frame %d state=%d\n", frame_count, app.state);
-            fclose(diag);
-        }
-    }
 
     uint64_t now = stm_now();
     float dt = (float)stm_sec(stm_diff(now, app.last_time));
@@ -235,7 +227,8 @@ static void frame(void) {
         sdtx_puts("Space = jump, ESC = unlock\n");
         sdtx_puts("Double-tap Space = jetpack\n");
         sdtx_puts("Scroll wheel = jetpack speed\n");
-        sdtx_puts("Ctrl+P = screenshot\n");
+        sdtx_puts("Ctrl = jetpack descend\n");
+        sdtx_puts("Alt+P = screenshot\n");
         sdtx_puts("L = toggle LOD debug colors\n");
         sdtx_puts("V = toggle verbose logs\n");
 
@@ -371,9 +364,9 @@ static void event(const sapp_event* ev) {
     }
 
     // STATE_PLAYING
-    // Screenshot with Ctrl+P
+    // Screenshot with Alt+P
     if (ev->type == SAPP_EVENTTYPE_KEY_DOWN &&
-        ev->key_code == SAPP_KEYCODE_P && (ev->modifiers & SAPP_MODIFIER_CTRL)) {
+        ev->key_code == SAPP_KEYCODE_P && (ev->modifiers & SAPP_MODIFIER_ALT)) {
         app.screenshot_requested = true;
         return;
     }
