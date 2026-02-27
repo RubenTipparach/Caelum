@@ -3,6 +3,8 @@
 
 # Build output
 build/
+build-web/
+dist/
 out/
 bin/
 obj/
@@ -27,8 +29,12 @@ node_modules/
 *.so
 *.dylib
 *.dll
-*.exe
+
+# Tools (downloaded binaries, not committed)
+tools/
 
 # Logs
 *.log
 .claude/
+debug-screenshots/
+screenshots/
