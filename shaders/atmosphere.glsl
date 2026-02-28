@@ -2,13 +2,14 @@
 // Ported from tenebris atmosphere.frag to sokol-shdc format.
 // Renders as fullscreen pass with additive blending on top of sky.
 
-@ctype mat4 HMM_Mat4
 @ctype vec4 HMM_Vec4
 
 @vs atmosphere_vs
 layout(binding=0) uniform atmosphere_vs_params {
-    mat4 inv_vp;
-    vec4 camera_pos;
+    vec4 cam_right;    // xyz = right vector, w = tan(fov/2)
+    vec4 cam_up;       // xyz = up vector,    w = aspect ratio
+    vec4 cam_forward;  // xyz = forward vector
+    vec4 camera_pos;   // xyz = camera world position (for ray-sphere intersection)
 };
 
 layout(location=0) in vec2 a_pos;
@@ -18,8 +19,13 @@ out vec3 v_camera_pos;
 
 void main() {
     gl_Position = vec4(a_pos, 0.0, 1.0);
-    vec4 far_pt = inv_vp * vec4(a_pos, 1.0, 1.0);
-    view_dir = far_pt.xyz / far_pt.w - camera_pos.xyz;
+
+    // Reconstruct view direction from camera basis vectors.
+    float tan_half_fov = cam_right.w;
+    float aspect = cam_up.w;
+    view_dir = cam_forward.xyz
+             + cam_right.xyz * (a_pos.x * tan_half_fov * aspect)
+             + cam_up.xyz    * (a_pos.y * tan_half_fov);
     v_camera_pos = camera_pos.xyz;
 }
 @end
@@ -45,7 +51,7 @@ out vec4 frag_color;
 const vec3 wavelengthsInv4 = vec3(5.602, 9.473, 19.644);
 
 // Scale height: determines how quickly density falls off with altitude
-// 0.25 = average density at 25% of atmosphere thickness
+// 0.25 = density concentrated in lower quarter of atmosphere shell
 const float scaleHeight = 0.25;
 
 // Simple hash for dithering to reduce banding artifacts
@@ -82,15 +88,18 @@ float getDensity(float altitude) {
 }
 
 // Optical depth along a ray segment (sun ray toward atmosphere edge)
+// Returns depth in normalized units (divided by atmosThickness) for scale-independence
 float computeOpticalDepth(vec3 rayOrigin, vec3 rayDir, float rayLength,
                           float pRadius, float aRadius) {
+    float atmosThickness = aRadius - pRadius;
     float stepSize = rayLength / float(NUM_LIGHT_SAMPLES);
+    float normalizedStep = stepSize / atmosThickness;
     float depth = 0.0;
     for (int i = 0; i < NUM_LIGHT_SAMPLES; i++) {
         vec3 samplePos = rayOrigin + rayDir * (stepSize * (float(i) + 0.5));
-        float altitude = (length(samplePos) - pRadius) / (aRadius - pRadius);
+        float altitude = (length(samplePos) - pRadius) / atmosThickness;
         altitude = clamp(altitude, 0.0, 1.0);
-        depth += getDensity(altitude) * stepSize;
+        depth += getDensity(altitude) * normalizedStep;
     }
     return depth;
 }
@@ -130,6 +139,10 @@ void main() {
 
     float rayLength = rayEnd - rayStart;
     float stepSize = rayLength / float(NUM_SAMPLES);
+    float atmosThickness = aRadius - pRadius;
+    // Normalize step by atmosphere thickness for scale-independent scattering.
+    // Without this, world-unit step sizes (tens of km) cause optical depth to explode.
+    float normalizedStep = stepSize / atmosThickness;
 
     // Dither offset to reduce banding (varies per pixel)
     float dither = hash(gl_FragCoord.xy) * 0.5;
@@ -141,7 +154,7 @@ void main() {
     float optDepthM = 0.0;
 
     for (int i = 0; i < NUM_SAMPLES; i++) {
-        // Sample point along view ray
+        // Sample point along view ray (still in world space for position)
         vec3 samplePos = rayOrigin + rayDir * (rayStart + stepSize * (float(i) + dither));
         float height = length(samplePos);
 
@@ -149,14 +162,14 @@ void main() {
         if (height < pRadius) continue;
 
         // Normalized altitude (0 at surface, 1 at atmosphere edge)
-        float altitude = (height - pRadius) / (aRadius - pRadius);
+        float altitude = (height - pRadius) / atmosThickness;
         altitude = clamp(altitude, 0.0, 1.0);
 
         // Local atmospheric density
         float localDensity = getDensity(altitude);
 
-        // Accumulate optical depth from camera to this point
-        float segmentDepth = localDensity * stepSize;
+        // Accumulate optical depth (normalized units)
+        float segmentDepth = localDensity * normalizedStep;
         optDepthR += segmentDepth;
         optDepthM += segmentDepth;
 
@@ -177,9 +190,9 @@ void main() {
         vec3 tauM = vec3(mieScale * (optDepthM + sunOptDepth));
         vec3 attenuation = exp(-(tauR + tauM));
 
-        // Accumulate scattered light
-        rayleighSum += localDensity * attenuation * stepSize;
-        mieSum += localDensity * attenuation * stepSize;
+        // Accumulate scattered light (normalized units)
+        rayleighSum += localDensity * attenuation * normalizedStep;
+        mieSum += localDensity * attenuation * normalizedStep;
     }
 
     // Apply scattering coefficients

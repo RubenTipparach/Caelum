@@ -28,9 +28,11 @@ static void lod_debug_pre_draw(int depth, void* user_data) {
 
 void render_init(Renderer* r, Planet* planet, const Camera* cam) {
     // ---- Planet pipeline ----
+    printf("[RENDER] render_init: creating planet shader...\n"); fflush(stdout);
     r->show_lod_debug = false;
 
     sg_shader planet_shd = sg_make_shader(planet_shader_desc(sg_query_backend()));
+    printf("[RENDER] render_init: creating planet pipeline...\n"); fflush(stdout);
     r->pip = sg_make_pipeline(&(sg_pipeline_desc){
         .shader = planet_shd,
         .layout = {
@@ -50,6 +52,7 @@ void render_init(Renderer* r, Planet* planet, const Camera* cam) {
     });
 
     // ---- Sky pipeline (fullscreen triangle) ----
+    printf("[RENDER] render_init: creating sky vertex buffer...\n"); fflush(stdout);
     float sky_verts[] = {
         -1.0f, -1.0f,
          3.0f, -1.0f,
@@ -60,7 +63,9 @@ void render_init(Renderer* r, Planet* planet, const Camera* cam) {
         .label = "sky-vertices",
     });
 
+    printf("[RENDER] render_init: creating sky shader...\n"); fflush(stdout);
     sg_shader sky_shd = sg_make_shader(sky_shader_desc(sg_query_backend()));
+    printf("[RENDER] render_init: creating sky pipeline...\n"); fflush(stdout);
     r->sky_pip = sg_make_pipeline(&(sg_pipeline_desc){
         .shader = sky_shd,
         .layout = {
@@ -77,17 +82,22 @@ void render_init(Renderer* r, Planet* planet, const Camera* cam) {
     });
 
     // ---- Atmosphere ----
+    printf("[RENDER] render_init: creating atmosphere...\n"); fflush(stdout);
     float surface_r = planet->radius + planet->sea_level * planet->layer_thickness;
     AtmosphereConfig atmos_config = atmosphere_default_config(surface_r);
     atmosphere_init(&r->atmosphere, atmos_config);
 
     // ---- LOD tree ----
+    printf("[RENDER] render_init: creating LOD tree...\n"); fflush(stdout);
     lod_tree_init(&r->lod_tree, planet->radius, planet->layer_thickness,
                   planet->sea_level, 42);
+    printf("[RENDER] render_init: LOD tree done\n"); fflush(stdout);
 
     // ---- Hex terrain (close-range voxel grid) ----
+    printf("[RENDER] render_init: creating hex terrain...\n"); fflush(stdout);
     hex_terrain_init(&r->hex_terrain, planet->radius, planet->layer_thickness,
                      planet->sea_level, 42, r->lod_tree.jobs);
+    printf("[RENDER] render_init: hex terrain done\n"); fflush(stdout);
 
     // No LOD suppression — hex terrain sits slightly above LOD (ceilf + surface bias)
     // so the z-buffer naturally occludes LOD where hex exists. This prevents black
@@ -159,7 +169,21 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
 
     // Compute matrices
     HMM_Mat4 vp = HMM_MulM4(cam->proj, cam->view);
-    HMM_Mat4 inv_vp = HMM_InvGeneralM4(vp);
+
+    // Rotation-only VP for camera-relative terrain rendering
+    HMM_Mat4 view_rot = cam->view;
+    view_rot.Elements[3][0] = 0.0f;
+    view_rot.Elements[3][1] = 0.0f;
+    view_rot.Elements[3][2] = 0.0f;
+    HMM_Mat4 vp_rot = HMM_MulM4(cam->proj, view_rot);
+
+    // Extract camera basis vectors from view matrix (column-major: Elements[col][row])
+    // These are the S, U, F vectors used to build the view matrix in camera.c
+    HMM_Vec3 cam_S = {{ cam->view.Elements[0][0], cam->view.Elements[1][0], cam->view.Elements[2][0] }};
+    HMM_Vec3 cam_U = {{ cam->view.Elements[0][1], cam->view.Elements[1][1], cam->view.Elements[2][1] }};
+    HMM_Vec3 cam_F = {{ -cam->view.Elements[0][2], -cam->view.Elements[1][2], -cam->view.Elements[2][2] }};
+    float tan_half_fov = tanf(HMM_ToRad(70.0f) * 0.5f);
+    float aspect = sapp_widthf() / sapp_heightf();
 
     // Begin render pass
     sg_begin_pass(&(sg_pass){
@@ -169,19 +193,25 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
 
     // ---- 1. Draw sky (fullscreen, no depth) ----
     sky_vs_params_t sky_vs = {
-        .inv_vp = inv_vp,
-        .camera_pos = (HMM_Vec4){{
-            cam->position.X, cam->position.Y, cam->position.Z, 0.0f
+        .cam_right   = (HMM_Vec4){{ cam_S.X, cam_S.Y, cam_S.Z, tan_half_fov }},
+        .cam_up      = (HMM_Vec4){{ cam_U.X, cam_U.Y, cam_U.Z, aspect }},
+        .cam_forward = (HMM_Vec4){{ cam_F.X, cam_F.Y, cam_F.Z, 0.0f }},
+    };
+    sky_fs_params_t sky_fs = {
+        .sun_direction = (HMM_Vec4){{
+            r->sun_direction.X, r->sun_direction.Y, r->sun_direction.Z, 0.0f
         }},
     };
     sg_apply_pipeline(r->sky_pip);
     sg_apply_bindings(&r->sky_bind);
     sg_apply_uniforms(UB_sky_vs_params, &SG_RANGE(sky_vs));
+    sg_apply_uniforms(UB_sky_fs_params, &SG_RANGE(sky_fs));
     sg_draw(0, 3, 1);
 
     // ---- 2. Draw atmosphere (fullscreen, additive blend on top of sky) ----
     atmosphere_render(&r->atmosphere, &r->sky_bind,
-                      cam->position, r->sun_direction, inv_vp);
+                      cam->position, r->sun_direction,
+                      cam_S, cam_U, cam_F, tan_half_fov, aspect);
 
     // ---- 3. Draw planet terrain ----
     // Log depth: backend-aware Fcoef and z_bias
@@ -198,12 +228,8 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
         z_bias = 0.0f;
     }
 
-    // Camera-relative rendering: rotation-only view matrix for precision at large distances
-    HMM_Mat4 view_rot = cam->view;
-    view_rot.Elements[3][0] = 0.0f;
-    view_rot.Elements[3][1] = 0.0f;
-    view_rot.Elements[3][2] = 0.0f;
-    HMM_Mat4 vp_terrain = HMM_MulM4(cam->proj, view_rot);
+    // Camera-relative rendering: reuse rotation-only VP (computed earlier for sky/atmosphere)
+    HMM_Mat4 vp_terrain = vp_rot;
 
     // Double-float camera offset relative to floating origin.
     // Mesh vertices are stored as (world_pos - origin), so the camera offset
@@ -239,11 +265,11 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
             cam->position.Z,
             0.0f
         }},
-        .fog_params = (HMM_Vec4){{
-            0.00005f, // fog_density (scaled for 796km planet)
-            50000.0f, // fog_max_distance (50km)
-            0.5f,     // inscatter_strength
-            0.0f
+        .atmos_params = (HMM_Vec4){{
+            r->atmosphere.config.planet_radius,
+            r->atmosphere.config.atmosphere_radius,
+            r->atmosphere.config.rayleigh_scale,
+            r->atmosphere.config.sun_intensity,
         }},
         .lod_debug = (HMM_Vec4){{0.0f, 0.0f, 0.0f, 0.0f}},
     };

@@ -5,11 +5,11 @@
 AtmosphereConfig atmosphere_default_config(float effective_surface_radius) {
     return (AtmosphereConfig){
         .planet_radius = effective_surface_radius,
-        .atmosphere_radius = effective_surface_radius * 1.3f,
-        .rayleigh_scale = 0.015f,
-        .mie_scale = 0.01f,
+        .atmosphere_radius = effective_surface_radius + 50000.0f,  // 50km atmosphere
+        .rayleigh_scale = 0.015f,    // Tenebris default (scale-independent with normalized steps)
+        .mie_scale = 0.01f,          // Tenebris default
         .mie_g = 0.85f,
-        .sun_intensity = 5.0f,
+        .sun_intensity = 5.0f,       // Tenebris default
     };
 }
 
@@ -49,12 +49,14 @@ void atmosphere_init(Atmosphere* atmos, AtmosphereConfig config) {
 }
 
 void atmosphere_render(const Atmosphere* atmos, const sg_bindings* fullscreen_bind,
-                       HMM_Vec3 camera_pos, HMM_Vec3 sun_dir, HMM_Mat4 inv_vp) {
+                       HMM_Vec3 camera_pos, HMM_Vec3 sun_dir,
+                       HMM_Vec3 cam_right, HMM_Vec3 cam_up, HMM_Vec3 cam_forward,
+                       float tan_half_fov, float aspect) {
     atmosphere_vs_params_t vs = {
-        .inv_vp = inv_vp,
-        .camera_pos = (HMM_Vec4){{
-            camera_pos.X, camera_pos.Y, camera_pos.Z, 0.0f
-        }},
+        .cam_right   = (HMM_Vec4){{ cam_right.X, cam_right.Y, cam_right.Z, tan_half_fov }},
+        .cam_up      = (HMM_Vec4){{ cam_up.X, cam_up.Y, cam_up.Z, aspect }},
+        .cam_forward = (HMM_Vec4){{ cam_forward.X, cam_forward.Y, cam_forward.Z, 0.0f }},
+        .camera_pos  = (HMM_Vec4){{ camera_pos.X, camera_pos.Y, camera_pos.Z, 0.0f }},
     };
     atmosphere_fs_params_t fs = {
         .sun_direction = (HMM_Vec4){{

@@ -195,6 +195,10 @@ static void frame(void) {
     if (dt > 0.1f) dt = 0.1f;
 
     if (app.state == STATE_MENU) {
+        if (frame_count % 120 == 0) {
+            printf("[MENU] frame %d alive\n", frame_count);
+            fflush(stdout);
+        }
         // Clear screen
         sg_begin_pass(&(sg_pass){
             .action = {
@@ -365,6 +369,10 @@ static void frame(void) {
 }
 
 static void event(const sapp_event* ev) {
+    if (ev->type == SAPP_EVENTTYPE_KEY_DOWN) {
+        printf("[EVENT] key_down: code=%d state=%d\n", ev->key_code, app.state);
+        fflush(stdout);
+    }
     if (app.state == STATE_MENU) {
         if (ev->type == SAPP_EVENTTYPE_KEY_DOWN) {
             if (ev->key_code == SAPP_KEYCODE_1) {
