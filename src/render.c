@@ -89,7 +89,9 @@ void render_init(Renderer* r, Planet* planet, const Camera* cam) {
     hex_terrain_init(&r->hex_terrain, planet->radius, planet->layer_thickness,
                      planet->sea_level, 42, r->lod_tree.jobs);
 
-    // Suppress range is updated dynamically each frame in render_update_mesh()
+    // No LOD suppression — hex terrain sits slightly above LOD (ceilf + surface bias)
+    // so the z-buffer naturally occludes LOD where hex exists. This prevents black
+    // holes during chunk generation and ensures seamless border transitions.
     r->lod_tree.suppress_range = 0.0f;
 
     r->pass_action = (sg_pass_action){
@@ -134,24 +136,18 @@ void render_update_mesh(Renderer* r, Planet* planet, const Camera* cam) {
         uint64_t t4 = stm_now();
         hex_update_ms = stm_ms(stm_diff(t3, t2));
         hex_upload_ms = stm_ms(stm_diff(t4, t3));
-
-        // Dynamic LOD suppress: only suppress when hex terrain has enough coverage
-        r->lod_tree.suppress_range = hex_terrain_effective_range(&r->hex_terrain) * HEX_SUPPRESS_FACTOR;
     }
-    uint64_t t_end = stm_now();
 
-    double total_ms = stm_ms(stm_diff(t_end, t0));
-    if (total_ms > 16.0) {
-        printf("[RENDER] SLOW update: %.1fms (lod_update=%.1f, lod_upload=%.1f, hex_update=%.1f, hex_upload=%.1f)\n",
-            total_ms,
-            stm_ms(stm_diff(t1, t0)),
-            stm_ms(stm_diff(t2, t1)),
-            hex_update_ms, hex_upload_ms);
-        fflush(stdout);
-    }
+    // Accumulate profiler timings
+    r->profile.accum_lod_update_ms += (float)stm_ms(stm_diff(t1, t0));
+    r->profile.accum_lod_upload_ms += (float)stm_ms(stm_diff(t2, t1));
+    r->profile.accum_hex_update_ms += (float)hex_update_ms;
+    r->profile.accum_hex_upload_ms += (float)hex_upload_ms;
 }
 
 void render_frame(Renderer* r, const Camera* cam, float dt) {
+    uint64_t render_start = stm_now();
+
     // FPS counter update (every 0.5 seconds)
     r->fps_accumulator += dt;
     r->fps_frame_count++;
@@ -273,24 +269,55 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
     // Uses same pipeline and uniforms as LOD terrain
     hex_terrain_render(&r->hex_terrain, r->pip);
 
+    // ---- Profiler timing ----
+    uint64_t render_end = stm_now();
+    r->profile.accum_render_ms += (float)stm_ms(stm_diff(render_end, render_start));
+
+    r->profile.accum_frames++;
+    r->profile.accum_time += dt;
+    if (r->profile.accum_time >= 0.5f && r->profile.accum_frames > 0) {
+        float n = (float)r->profile.accum_frames;
+        r->profile.lod_update_ms = r->profile.accum_lod_update_ms / n;
+        r->profile.lod_upload_ms = r->profile.accum_lod_upload_ms / n;
+        r->profile.hex_update_ms = r->profile.accum_hex_update_ms / n;
+        r->profile.hex_upload_ms = r->profile.accum_hex_upload_ms / n;
+        r->profile.camera_ms = r->profile.accum_camera_ms / n;
+        r->profile.render_ms = r->profile.accum_render_ms / n;
+        r->profile.frame_total_ms = r->profile.camera_ms +
+            r->profile.lod_update_ms + r->profile.lod_upload_ms +
+            r->profile.hex_update_ms + r->profile.hex_upload_ms +
+            r->profile.render_ms;
+
+        // Snapshot resource counts
+        r->profile.lod_patches = lod_tree_active_leaves(&r->lod_tree);
+        r->profile.lod_gpu_verts = r->lod_tree.total_vertex_count;
+        r->profile.lod_nodes = r->lod_tree.node_count;
+        r->profile.hex_chunks_active = r->hex_terrain.active_count;
+        r->profile.hex_chunks_meshed = r->hex_terrain.chunks_rendered;
+        r->profile.hex_gpu_verts = r->hex_terrain.total_vertex_count;
+        r->profile.total_triangles = (r->profile.lod_gpu_verts + r->profile.hex_gpu_verts) / 3;
+        r->profile.draw_calls = r->profile.lod_patches + r->profile.hex_chunks_meshed + 2; // +sky+atmos
+        r->profile.job_pending = job_system_pending(r->lod_tree.jobs);
+
+        // Reset accumulators
+        r->profile.accum_time = 0;
+        r->profile.accum_frames = 0;
+        r->profile.accum_lod_update_ms = 0;
+        r->profile.accum_lod_upload_ms = 0;
+        r->profile.accum_hex_update_ms = 0;
+        r->profile.accum_hex_upload_ms = 0;
+        r->profile.accum_camera_ms = 0;
+        r->profile.accum_render_ms = 0;
+        r->profile.accum_frame_ms = 0;
+    }
+
     // ---- 4. HUD overlay ----
     sdtx_canvas(sapp_widthf() * 0.5f, sapp_heightf() * 0.5f);
     sdtx_origin(0.5f, 0.5f);
     sdtx_font(0);
 
     sdtx_color3f(1.0f, 1.0f, 0.0f);
-    sdtx_printf("FPS: %.0f  patches: %d  verts: %d  nodes: %d/%d\n",
-        r->display_fps,
-        lod_tree_active_leaves(&r->lod_tree),
-        r->lod_tree.total_vertex_count,
-        r->lod_tree.node_count,
-        r->lod_tree.node_capacity);
-
-    // Hex terrain stats
-    sdtx_color3f(0.5f, 1.0f, 0.5f);
-    sdtx_printf("hex: %d chunks  %dk verts\n",
-        r->hex_terrain.chunks_rendered,
-        r->hex_terrain.total_vertex_count / 1000);
+    sdtx_printf("FPS: %.0f\n", r->display_fps);
 
     // Player position + altitude
     {
@@ -302,7 +329,6 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
         sdtx_printf("alt: %.0fm  r: %.0fkm\n", altitude, cam_r / 1000.0f);
     }
 
-
     // Jetpack status
     if (cam->jetpack_active) {
         sdtx_color3f(0.3f, 1.0f, 0.5f);
@@ -312,7 +338,68 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
         sdtx_puts("JETPACK OFF\n");
     }
 
+    // ---- F3 Profiler overlay ----
+    if (r->show_profiler) {
+        ProfileStats* p = &r->profile;
+        float total = p->frame_total_ms;
+        if (total < 0.01f) total = 0.01f;
+
+        sdtx_puts("\n");
+        sdtx_color3f(1.0f, 0.8f, 0.3f);
+        sdtx_puts("=== PROFILER (F3) ===\n");
+
+        // Global coordinates (double precision)
+        sdtx_color3f(0.9f, 0.7f, 1.0f);
+        sdtx_printf("Global: %.1f, %.1f, %.1f\n",
+            cam->pos_d[0], cam->pos_d[1], cam->pos_d[2]);
+
+        // Local coordinates (relative to floating origin)
+        double lx = cam->pos_d[0] - r->lod_tree.world_origin[0];
+        double ly = cam->pos_d[1] - r->lod_tree.world_origin[1];
+        double lz = cam->pos_d[2] - r->lod_tree.world_origin[2];
+        sdtx_printf("Local:  %.3f, %.3f, %.3f\n", lx, ly, lz);
+        sdtx_printf("Origin: %.1f, %.1f, %.1f\n",
+            r->lod_tree.world_origin[0],
+            r->lod_tree.world_origin[1],
+            r->lod_tree.world_origin[2]);
+
+        // Frame timing breakdown
+        sdtx_color3f(0.9f, 0.9f, 0.9f);
+        sdtx_printf("Frame:       %5.2f ms\n", total);
+        sdtx_color3f(0.7f, 0.9f, 0.7f);
+        sdtx_printf("  Camera:    %5.2f ms  %4.1f%%\n", p->camera_ms, p->camera_ms / total * 100.0f);
+        sdtx_printf("  LOD upd:   %5.2f ms  %4.1f%%\n", p->lod_update_ms, p->lod_update_ms / total * 100.0f);
+        sdtx_printf("  LOD upl:   %5.2f ms  %4.1f%%\n", p->lod_upload_ms, p->lod_upload_ms / total * 100.0f);
+        sdtx_printf("  Hex upd:   %5.2f ms  %4.1f%%\n", p->hex_update_ms, p->hex_update_ms / total * 100.0f);
+        sdtx_printf("  Hex upl:   %5.2f ms  %4.1f%%\n", p->hex_upload_ms, p->hex_upload_ms / total * 100.0f);
+        sdtx_printf("  Render:    %5.2f ms  %4.1f%%\n", p->render_ms, p->render_ms / total * 100.0f);
+
+        // Draw calls and triangles
+        sdtx_puts("\n");
+        sdtx_color3f(0.8f, 0.8f, 1.0f);
+        sdtx_printf("Draw calls:  %d\n", p->draw_calls);
+        sdtx_printf("Triangles:   %dk\n", p->total_triangles / 1000);
+
+        // Memory / resource breakdown
+        sdtx_puts("\n");
+        sdtx_color3f(0.6f, 1.0f, 0.8f);
+        sdtx_printf("LOD patches: %d  verts: %dk  nodes: %d/%d\n",
+            p->lod_patches, p->lod_gpu_verts / 1000,
+            p->lod_nodes, r->lod_tree.node_capacity);
+        sdtx_printf("Hex chunks:  %d/%d  verts: %dk\n",
+            p->hex_chunks_meshed, p->hex_chunks_active,
+            p->hex_gpu_verts / 1000);
+        sdtx_printf("Jobs pending: %d\n", p->job_pending);
+
+        // Estimated GPU memory (vertex buffers only)
+        int lod_vb_mb = (p->lod_gpu_verts * (int)sizeof(LodVertex)) / (1024 * 1024);
+        int hex_vb_mb = (p->hex_gpu_verts * (int)sizeof(LodVertex)) / (1024 * 1024);
+        sdtx_printf("GPU vbuf:    %dMB lod + %dMB hex = %dMB\n",
+            lod_vb_mb, hex_vb_mb, lod_vb_mb + hex_vb_mb);
+    }
+
     if (r->show_lod_debug) {
+        sdtx_puts("\n");
         // Per-depth geometry breakdown (shown in LOD debug mode)
         sdtx_color3f(0.5f, 0.8f, 0.8f);
         sdtx_puts("Depth  Patches    Verts   MinDist   MaxDist\n");

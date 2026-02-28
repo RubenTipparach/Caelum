@@ -484,6 +484,36 @@ static void hex_mesh_worker(void* data) {
     generate_chunk_mesh(job);
 }
 
+// ---- Orphaned job cleanup ----
+// When a chunk is freed while its mesh job is still running on a worker thread,
+// we can't free the job (the worker is writing to it). Instead we move it to
+// this orphan list and sweep it each frame until the worker finishes.
+#define HEX_MAX_ORPHANS 128
+static void* s_orphaned_jobs[HEX_MAX_ORPHANS];
+static int s_orphan_count = 0;
+
+static void orphan_job(void* job) {
+    if (s_orphan_count < HEX_MAX_ORPHANS) {
+        s_orphaned_jobs[s_orphan_count++] = job;
+    }
+    // If list full, leak (extremely rare — would need 128 chunks freed
+    // simultaneously while all workers are busy)
+}
+
+static void sweep_orphans(void) {
+    int write = 0;
+    for (int i = 0; i < s_orphan_count; i++) {
+        HexMeshJob* job = (HexMeshJob*)s_orphaned_jobs[i];
+        if (job->completed) {
+            if (job->vertices) free(job->vertices);
+            free(job);
+        } else {
+            s_orphaned_jobs[write++] = s_orphaned_jobs[i];
+        }
+    }
+    s_orphan_count = write;
+}
+
 // ---- Chunk management ----
 
 static int find_chunk(HexTerrain* ht, int cx, int cz) {
@@ -517,14 +547,13 @@ static void free_chunk(HexChunk* chunk) {
 
     if (chunk->pending_job) {
         HexMeshJob* job = (HexMeshJob*)chunk->pending_job;
-        // If still running, we can't free the job memory.
-        // Mark chunk inactive; the job will be cleaned up when it completes.
         if (job->completed) {
             if (job->vertices) free(job->vertices);
             free(job);
+        } else {
+            // Worker still running — move to orphan list for deferred cleanup
+            orphan_job(job);
         }
-        // If not completed, leak the job (it'll finish and the memory will be orphaned).
-        // In practice, chunk deactivation happens when walking away, and jobs complete quickly.
         chunk->pending_job = NULL;
     }
 
@@ -557,11 +586,24 @@ void hex_terrain_init(HexTerrain* ht, float planet_radius, float layer_thickness
 }
 
 void hex_terrain_destroy(HexTerrain* ht) {
+    // Wait for all in-flight jobs to complete before freeing
     for (int i = 0; i < HEX_MAX_CHUNKS; i++) {
+        if (ht->chunks[i].pending_job) {
+            HexMeshJob* job = (HexMeshJob*)ht->chunks[i].pending_job;
+            while (!job->completed) { /* spin-wait — jobs complete in <100ms */ }
+        }
         if (ht->chunks[i].active) {
             free_chunk(&ht->chunks[i]);
         }
     }
+    // Flush any remaining orphans (all should be completed by now)
+    for (int i = 0; i < s_orphan_count; i++) {
+        HexMeshJob* job = (HexMeshJob*)s_orphaned_jobs[i];
+        while (!job->completed) { /* spin-wait */ }
+        if (job->vertices) free(job->vertices);
+        free(job);
+    }
+    s_orphan_count = 0;
 }
 
 // Threshold for re-anchoring the tangent frame (in meters).
@@ -572,10 +614,33 @@ void hex_terrain_destroy(HexTerrain* ht) {
 
 void hex_terrain_update(HexTerrain* ht, HMM_Vec3 camera_pos,
                         const double world_origin[3]) {
+    // Clean up any orphaned jobs from previous frames
+    sweep_orphans();
+
     ht->camera_pos = camera_pos;
     ht->world_origin[0] = world_origin[0];
     ht->world_origin[1] = world_origin[1];
     ht->world_origin[2] = world_origin[2];
+
+    // Disable hex terrain when camera is high above the actual ground
+    float cam_r = sqrtf(vec3_dot(camera_pos, camera_pos));
+    HMM_Vec3 cam_dir = vec3_scale(camera_pos, 1.0f / fmaxf(cam_r, 1.0f));
+    fnl_state _n = ht_create_terrain_noise(ht->seed);
+    fnl_state _w = ht_create_warp_noise(ht->seed);
+    fnl_state _d = ht_create_detail_noise(ht->seed);
+    float ground_h = ht_sample_height_m(&_n, &_w, &_d, cam_dir);
+    float ground_r = ht->planet_radius + fmaxf(ground_h, TERRAIN_SEA_LEVEL_M);
+    float altitude = cam_r - ground_r;
+    if (altitude > HEX_MAX_DRAW_ALT) {
+        for (int i = 0; i < HEX_MAX_CHUNKS; i++) {
+            if (ht->chunks[i].active) {
+                free_chunk(&ht->chunks[i]);
+            }
+        }
+        ht->frame_valid = false;  // Force reanchor when we descend
+        ht->active_count = 0;
+        return;
+    }
 
     // Check if tangent frame needs re-anchoring
     bool reanchor = false;

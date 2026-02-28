@@ -345,25 +345,16 @@ static void frame(void) {
         camera_update(&app.camera, &app.planet, &app.renderer.lod_tree, dt);
         uint64_t t_cam = stm_now();
 
+        // Feed camera timing into profiler
+        app.renderer.profile.accum_camera_ms += (float)stm_ms(stm_diff(t_cam, t_frame_start));
+
         // Floating origin: recenter if camera has drifted far from current origin
         lod_tree_update_origin(&app.renderer.lod_tree, app.camera.pos_d);
 
         // Re-upload mesh if planet was modified or player moved far enough
         render_update_mesh(&app.renderer, &app.planet, &app.camera);
-        uint64_t t_update = stm_now();
 
         render_frame(&app.renderer, &app.camera, dt);
-        uint64_t t_render = stm_now();
-
-        double frame_ms = stm_ms(stm_diff(t_render, t_frame_start));
-        if (frame_ms > 33.0) {
-            printf("[GAME] SLOW frame: %.1fms (cam=%.1f, update=%.1f, render=%.1f)\n",
-                frame_ms,
-                stm_ms(stm_diff(t_cam, t_frame_start)),
-                stm_ms(stm_diff(t_update, t_cam)),
-                stm_ms(stm_diff(t_render, t_update)));
-            fflush(stdout);
-        }
     }
 
     // Screenshot: capture after render_frame (which calls sg_commit)
@@ -411,6 +402,12 @@ static void event(const sapp_event* ev) {
     if (ev->type == SAPP_EVENTTYPE_KEY_DOWN && ev->key_code == SAPP_KEYCODE_V) {
         log_verbose = !log_verbose;
         LOG(GAME, "Verbose logging: %s\n", log_verbose ? "ON" : "OFF");
+        return;
+    }
+
+    // Toggle profiler overlay with F3
+    if (ev->type == SAPP_EVENTTYPE_KEY_DOWN && ev->key_code == SAPP_KEYCODE_F3) {
+        app.renderer.show_profiler = !app.renderer.show_profiler;
         return;
     }
 
