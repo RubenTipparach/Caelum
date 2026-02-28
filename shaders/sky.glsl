@@ -1,14 +1,14 @@
 // sky.glsl — Fullscreen sky shader with Voronoi starfield + nebula
 // Adapted from tenebris skybox.frag for sokol-shdc
 
-@ctype mat4 HMM_Mat4
 @ctype vec4 HMM_Vec4
 
 @vs sky_vs
 
 layout(binding=0) uniform sky_vs_params {
-    mat4 inv_vp;
-    vec4 camera_pos;  // xyz = camera world position
+    vec4 cam_right;    // xyz = right vector, w = tan(fov/2)
+    vec4 cam_up;       // xyz = up vector,    w = aspect ratio
+    vec4 cam_forward;  // xyz = forward vector
 };
 
 layout(location=0) in vec2 a_pos;
@@ -18,16 +18,32 @@ out vec3 view_dir;
 void main() {
     gl_Position = vec4(a_pos, 0.0, 1.0);
 
-    // Reconstruct world-space view direction from clip coordinates
-    vec4 far_pt = inv_vp * vec4(a_pos, 1.0, 1.0);
-    view_dir = far_pt.xyz / far_pt.w - camera_pos.xyz;
+    // Reconstruct view direction from camera basis vectors.
+    // No matrix inverse needed — avoids precision issues with inv(proj) on D3D11.
+    float tan_half_fov = cam_right.w;
+    float aspect = cam_up.w;
+    view_dir = cam_forward.xyz
+             + cam_right.xyz * (a_pos.x * tan_half_fov * aspect)
+             + cam_up.xyz    * (a_pos.y * tan_half_fov);
 }
 @end
 
 @fs sky_fs
 
+layout(binding=1) uniform sky_fs_params {
+    vec4 sun_direction;     // xyz = normalized sun direction
+};
+
 in vec3 view_dir;
 out vec4 frag_color;
+
+// ---- Sun parameters (from tenebris Starfield.fs) ----
+const float SunSize = 0.02;
+const float SunGlowSize = 0.1;
+const vec3 SunCoreColor = vec3(1.0, 1.0, 1.0);
+const vec3 SunGlowColor = vec3(1.0, 0.9, 0.6);
+const float CoronaBrightness = 0.2;
+const float CoronaTransparency = 0.3;
 
 // ---- Star parameters (from tenebris) ----
 const float STAR_SHARPNESS = 0.02;
@@ -155,10 +171,36 @@ vec3 nebula(vec3 dir) {
     return nebColor * NEBULA_INTENSITY;
 }
 
+// ---- Sun rendering (from tenebris Starfield.fs) ----
+
+vec3 renderSun(vec3 dir, vec3 sunDir) {
+    float sunDot = dot(dir, sunDir);
+
+    // Sun core (bright center)
+    float core = smoothstep(1.0 - SunSize, 1.0, sunDot);
+    core = pow(core, 3.0);
+
+    // Sun glow (soft outer glow)
+    float glow = smoothstep(1.0 - SunGlowSize, 1.0, sunDot);
+    glow = pow(glow, 2.0);
+
+    // Static corona ring
+    float corona = smoothstep(1.0 - SunGlowSize, 1.0 - SunSize * 0.5, sunDot);
+    corona *= smoothstep(1.0, 1.0 - SunSize * 2.0, sunDot);
+    corona *= CoronaBrightness * CoronaTransparency;
+
+    // Combine effects
+    vec3 sunColor = mix(SunGlowColor, SunCoreColor, core);
+    float brightness = core * 3.0 + glow + corona;
+
+    return sunColor * brightness;
+}
+
 // ---- Main ----
 
 void main() {
     vec3 dir = normalize(view_dir);
+    vec3 sunDir = normalize(sun_direction.xyz);
 
     // Starfield with three density layers (80 / 160 / 280)
     float stars = 0.0;
@@ -169,8 +211,11 @@ void main() {
     // Nebula background
     vec3 nebColor = nebula(dir);
 
-    // Composite: space + nebula + stars
-    vec3 color = SPACE_COLOR + nebColor + stars * STAR_COLOR;
+    // Sun (core + glow + corona from tenebris)
+    vec3 sunColor = renderSun(dir, sunDir);
+
+    // Composite: space + nebula + stars + sun
+    vec3 color = SPACE_COLOR + nebColor + stars * STAR_COLOR + sunColor;
 
     frag_color = vec4(color, 1.0);
 }

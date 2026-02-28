@@ -45,7 +45,7 @@ void main() {
 layout(binding=1) uniform planet_fs_params {
     vec4 sun_direction;     // xyz = normalized sun dir
     vec4 camera_pos;        // xyz = camera world position (for surface_dir computation)
-    vec4 fog_params;        // x = fog_density, y = fog_max_distance, z = inscatter_strength
+    vec4 atmos_params;      // x = planet_radius, y = atmos_radius, z = rayleigh_scale, w = sun_intensity
     vec4 lod_debug;         // x = LOD depth (0 = off/normal), y = max_depth for color mapping
 };
 
@@ -68,6 +68,11 @@ void main() {
     float sun_facing = dot(surface_dir, L);
     float sun_brightness = smoothstep(-0.1, 0.3, sun_facing);
 
+    // Atmospheric sun tinting: when the sun is low on the local horizon,
+    // sunlight passes through more atmosphere, scattering out blue → warm orange.
+    float dusk_factor = smoothstep(0.0, 0.35, sun_facing);
+    vec3 sunColor = mix(vec3(1.3, 0.45, 0.12), vec3(1.0, 0.98, 0.95), dusk_factor);
+
     // ---- Normal-based ambient occlusion (tenebris crevice darkening) ----
     // Faces pointing outward (aligned with surface_dir) get full ambient.
     // Side/inward faces (hex walls, cliff sides) get reduced ambient.
@@ -76,13 +81,12 @@ void main() {
     ao_factor = mix(0.45, 1.0, ao_factor);             // Range: 45% to 100%
 
     // Ambient: transitions from dim starlight (night) to fill light (day)
-    float ambient = mix(0.06, 0.35, sun_brightness) * ao_factor;
+    // Dusk ambient picks up warm tint from the sky
+    vec3 ambientColor = mix(vec3(0.06), vec3(0.35) * mix(vec3(0.9, 0.7, 0.5), vec3(1.0), dusk_factor), sun_brightness) * ao_factor;
 
-    // Directional: Lambert diffuse, only on day side
+    // Directional: Lambert diffuse with atmospheric sun tint, only on day side
     float ndotl = max(0.0, dot(N, L));
-    float directional = ndotl * sun_brightness * 0.7;
-
-    float brightness = ambient + directional;
+    vec3 directionalColor = sunColor * ndotl * sun_brightness * 0.7;
 
     // LOD debug mode: color by depth level
     vec3 base_color = fs_color;
@@ -92,7 +96,7 @@ void main() {
         base_color.g = clamp(t * 2.0, 0.0, 1.0) - clamp(t * 2.0 - 1.0, 0.0, 1.0);
         base_color.b = clamp(t * 2.0 - 1.0, 0.0, 1.0);
     }
-    vec3 terrain_color = base_color * brightness;
+    vec3 terrain_color = base_color * (ambientColor + directionalColor);
 
     // ---- Ocean specular (tenebris Blinn-Phong) ----
     // Detect water: blue-dominant vertex color (b > 0.5, b > r*1.5, b > g*1.3)
@@ -101,7 +105,7 @@ void main() {
                      * step(base_color.g * 1.3, base_color.b);
     vec3 H = normalize(L + V);
     float spec = pow(max(0.0, dot(N, H)), 32.0);
-    terrain_color += vec3(1.0) * spec * ocean_mask * 0.4 * sun_brightness;
+    terrain_color += sunColor * spec * ocean_mask * 0.4 * sun_brightness;
 
     // ---- Rim lighting (tenebris silhouette backlight) ----
     // Subtle glow at terrain edges, emphasizes topography from any angle
@@ -116,22 +120,39 @@ void main() {
     vec3 lum = vec3(dot(terrain_color, vec3(0.299, 0.587, 0.114)));
     terrain_color = mix(lum, terrain_color, saturation);
 
-    // ---- Aerial perspective fog ----
-    // Use camera-relative position directly (already precise, no large-float subtraction)
+    // ---- Atmospheric fog (Rayleigh aerial perspective) ----
+    // Physically-based: extinction dims terrain, inscatter adds sky-colored haze.
+    // Naturally blue by day, warm orange at dusk, dark at night.
+    const vec3 wl4 = vec3(5.602, 9.473, 19.644); // (1/wavelength)^4 for Rayleigh
+    const float fogScaleH = 0.25;
+
+    float pR = atmos_params.x;
+    float aR = atmos_params.y;
+    float rScale = atmos_params.z;
+    float sInt = atmos_params.w;
+    float aThick = aR - pR;
+
+    // Average density along the camera-to-fragment ray
+    float camAlt = clamp((length(camera_pos.xyz) - pR) / aThick, 0.0, 1.0);
+    float fragAlt = clamp((length(world_pos_approx) - pR) / aThick, 0.0, 1.0);
+    float avgDensity = exp(-((camAlt + fragAlt) * 0.5) / fogScaleH);
+
+    // Optical depth: wavelength-dependent (blue extinguishes faster → warm at distance)
     float dist = length(fs_cam_rel_pos);
-    float fog_density = fog_params.x;
-    float fog_max_dist = fog_params.y;
-    float inscatter_strength = fog_params.z;
+    vec3 tau = rScale * wl4 * avgDensity * (dist / aThick);
+    vec3 transmittance = exp(-tau);
 
-    float normalized_dist = dist / max(fog_max_dist, 1.0);
-    float fog_amount = 1.0 - exp(-(normalized_dist * fog_density) * (normalized_dist * fog_density));
-    fog_amount = clamp(fog_amount, 0.0, 0.85);
+    // Inscatter: single-scatter Rayleigh approximation
+    // Phase function adds view-direction dependence (brighter toward sun)
+    float cosTheta = dot(normalize(fs_cam_rel_pos), L);
+    float phaseR = 0.75 * (1.0 + cosTheta * cosTheta);
+    vec3 fogEquilibrium = sunColor * sInt * phaseR * sun_brightness;
+    fogEquilibrium = vec3(1.0) - exp(-fogEquilibrium);  // tone map (can exceed 1.0)
 
-    vec3 day_fog = vec3(0.35, 0.55, 0.85);
-    vec3 night_fog = vec3(0.01, 0.01, 0.03);
-    vec3 fog_color = mix(night_fog, day_fog, sun_brightness) * inscatter_strength;
+    // Aerial perspective blend: attenuate terrain + add inscattered light
+    terrain_color = terrain_color * transmittance + fogEquilibrium * (vec3(1.0) - transmittance);
 
-    frag_color = vec4(mix(terrain_color, fog_color, fog_amount), 1.0);
+    frag_color = vec4(terrain_color, 1.0);
 }
 @end
 
