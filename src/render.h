@@ -9,6 +9,42 @@
 #include "lod.h"
 #include "hex_terrain.h"
 
+// ---- Profiler stats (F3 overlay) ----
+typedef struct ProfileStats {
+    // Per-frame CPU timings (ms), smoothed over ~0.5s
+    float camera_ms;
+    float lod_update_ms;
+    float lod_upload_ms;
+    float hex_update_ms;
+    float hex_upload_ms;
+    float render_ms;
+    float frame_total_ms;
+
+    // GPU resource counts
+    int draw_calls;
+    int total_triangles;
+
+    // Memory estimates
+    int hex_chunks_active;
+    int hex_chunks_meshed;
+    int hex_gpu_verts;
+    int lod_gpu_verts;
+    int lod_patches;
+    int lod_nodes;
+    int job_pending;
+
+    // Smoothing accumulator
+    float accum_time;
+    int accum_frames;
+    float accum_camera_ms;
+    float accum_lod_update_ms;
+    float accum_lod_upload_ms;
+    float accum_hex_update_ms;
+    float accum_hex_upload_ms;
+    float accum_render_ms;
+    float accum_frame_ms;
+} ProfileStats;
+
 typedef struct Renderer {
     // Planet rendering
     sg_pipeline pip;
@@ -38,6 +74,10 @@ typedef struct Renderer {
     float fps_accumulator;
     int fps_frame_count;
     float display_fps;
+
+    // Profiler (F3)
+    bool show_profiler;
+    ProfileStats profile;
 } Renderer;
 
 void render_init(Renderer* r, Planet* planet, const Camera* cam);

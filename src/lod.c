@@ -905,6 +905,16 @@ static void update_node(LodTree* tree, int node_idx) {
     if (patch_on_back_hemisphere(tree, node)) {
         if (!node->is_leaf) {
             merge_node(tree, node_idx);
+            // If merge failed (grandchildren exist), recurse so they can merge first
+            node = &tree->nodes[node_idx];
+            if (!node->is_leaf) {
+                for (int i = 0; i < LOD_CHILDREN; i++) {
+                    int ci = node->children[i];
+                    if (ci >= 0) update_node(tree, ci);
+                }
+                // Retry merge now that children may have been collapsed
+                merge_node(tree, node_idx);
+            }
         }
         return;
     }
@@ -967,8 +977,18 @@ static void update_node(LodTree* tree, int node_idx) {
         if (should_merge(tree, node)) {
             // Too far for this detail level: merge children
             merge_node(tree, node_idx);
-            // After merge, this is a leaf — generate its mesh
             node = &tree->nodes[node_idx];
+            if (!node->is_leaf) {
+                // Merge failed (grandchildren exist) — recurse so they can merge first
+                for (int i = 0; i < LOD_CHILDREN; i++) {
+                    int ci = node->children[i];
+                    if (ci >= 0) update_node(tree, ci);
+                }
+                // Retry merge now that children may have been collapsed
+                merge_node(tree, node_idx);
+                node = &tree->nodes[node_idx];
+            }
+            // After merge, this is a leaf — generate its mesh
             if (node->is_leaf && node->state == LOD_UNLOADED) {
                 if (tree->jobs) {
                     submit_mesh_job(tree, node_idx);

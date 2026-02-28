@@ -58,6 +58,8 @@ out vec4 frag_color;
 void main() {
     vec3 N = normalize(fs_normal);
     vec3 L = normalize(sun_direction.xyz);
+    vec3 V = -normalize(fs_cam_rel_pos);  // View direction: fragment toward camera
+
     // Reconstruct world direction from camera-relative position
     vec3 world_pos_approx = fs_cam_rel_pos + camera_pos.xyz;
     vec3 surface_dir = normalize(world_pos_approx);
@@ -66,8 +68,15 @@ void main() {
     float sun_facing = dot(surface_dir, L);
     float sun_brightness = smoothstep(-0.1, 0.3, sun_facing);
 
+    // ---- Normal-based ambient occlusion (tenebris crevice darkening) ----
+    // Faces pointing outward (aligned with surface_dir) get full ambient.
+    // Side/inward faces (hex walls, cliff sides) get reduced ambient.
+    float ao_dot = dot(N, surface_dir);
+    float ao_factor = smoothstep(-0.2, 0.8, ao_dot);  // 0 at inward → 1 at outward
+    ao_factor = mix(0.45, 1.0, ao_factor);             // Range: 45% to 100%
+
     // Ambient: transitions from dim starlight (night) to fill light (day)
-    float ambient = mix(0.06, 0.35, sun_brightness);
+    float ambient = mix(0.06, 0.35, sun_brightness) * ao_factor;
 
     // Directional: Lambert diffuse, only on day side
     float ndotl = max(0.0, dot(N, L));
@@ -84,6 +93,28 @@ void main() {
         base_color.b = clamp(t * 2.0 - 1.0, 0.0, 1.0);
     }
     vec3 terrain_color = base_color * brightness;
+
+    // ---- Ocean specular (tenebris Blinn-Phong) ----
+    // Detect water: blue-dominant vertex color (b > 0.5, b > r*1.5, b > g*1.3)
+    float ocean_mask = step(0.5, base_color.b)
+                     * step(base_color.r * 1.5, base_color.b)
+                     * step(base_color.g * 1.3, base_color.b);
+    vec3 H = normalize(L + V);
+    float spec = pow(max(0.0, dot(N, H)), 32.0);
+    terrain_color += vec3(1.0) * spec * ocean_mask * 0.4 * sun_brightness;
+
+    // ---- Rim lighting (tenebris silhouette backlight) ----
+    // Subtle glow at terrain edges, emphasizes topography from any angle
+    float rim_dot = 1.0 - max(0.0, dot(V, N));
+    float rim = pow(rim_dot, 3.0) * 0.12 * sun_brightness;
+    terrain_color += vec3(0.35, 0.45, 0.6) * rim;
+
+    // ---- Shadow desaturation (tenebris) ----
+    // Colors become more gray in shadow for a more realistic look
+    float shadow_amount = 1.0 - ndotl * sun_brightness;
+    float saturation = mix(1.0, 0.7, shadow_amount * 0.4);
+    vec3 lum = vec3(dot(terrain_color, vec3(0.299, 0.587, 0.114)));
+    terrain_color = mix(lum, terrain_color, saturation);
 
     // ---- Aerial perspective fog ----
     // Use camera-relative position directly (already precise, no large-float subtraction)

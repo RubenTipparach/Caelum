@@ -230,6 +230,25 @@ void camera_update(Camera* cam, Planet* planet, const LodTree* lod, float dt) {
         current_ground_r = planet->radius + planet->sea_level * planet->layer_thickness;
     }
 
+    // ---- Cap jetpack speed by altitude ----
+    // <1km: max 25x, 1-5km: max 200x, 5-200km: max 500x, >200km: unlimited
+    {
+        float altitude = pos_len - current_ground_r;
+        float max_mult;
+        if (altitude < 1000.0f) {
+            max_mult = 25.0f;
+        } else if (altitude < 5000.0f) {
+            max_mult = 200.0f;
+        } else if (altitude < 200000.0f) {
+            max_mult = 500.0f;
+        } else {
+            max_mult = 1e9f;  // effectively unlimited
+        }
+        if (cam->jetpack_speed_mult > max_mult) {
+            cam->jetpack_speed_mult = max_mult;
+        }
+    }
+
     // ---- Movement (accumulated in double precision) ----
     float move_speed;
     if (cam->jetpack_active) {
@@ -322,13 +341,13 @@ void camera_update(Camera* cam, Planet* planet, const LodTree* lod, float dt) {
         // Initialize smoothed height on first frame
         if (smoothed_ground_r == 0.0) smoothed_ground_r = ground_r;
 
-        // Smooth ground height: fast enough to follow terrain, slow enough to
-        // filter out per-frame noise bumps. ~15Hz cutoff = smooth at 165fps.
+        // Smooth ground height: filter out terrain micro-noise to prevent
+        // view bobbing. 3Hz cutoff = imperceptible smoothing at walk speed.
         // Always snap DOWN instantly (never float above a cliff edge).
         if (ground_r < smoothed_ground_r) {
             smoothed_ground_r = ground_r;  // Snap down immediately
         } else {
-            double alpha = 1.0 - exp(-15.0 * dd);
+            double alpha = 1.0 - exp(-3.0 * dd);
             smoothed_ground_r += (ground_r - smoothed_ground_r) * alpha;
         }
 
