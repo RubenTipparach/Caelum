@@ -2,6 +2,7 @@
 #include "sokol_gfx.h"
 #include "sokol_app.h"
 #include "sokol_glue.h"
+#include "sokol_time.h"
 #include "util/sokol_debugtext.h"
 #include "planet.glsl.h"
 #include "sky.glsl.h"
@@ -84,6 +85,13 @@ void render_init(Renderer* r, Planet* planet, const Camera* cam) {
     lod_tree_init(&r->lod_tree, planet->radius, planet->layer_thickness,
                   planet->sea_level, 42);
 
+    // ---- Hex terrain (close-range voxel grid) ----
+    hex_terrain_init(&r->hex_terrain, planet->radius, planet->layer_thickness,
+                     planet->sea_level, 42, r->lod_tree.jobs);
+
+    // Suppress range is updated dynamically each frame in render_update_mesh()
+    r->lod_tree.suppress_range = 0.0f;
+
     r->pass_action = (sg_pass_action){
         .colors[0] = {
             .load_action = SG_LOADACTION_CLEAR,
@@ -106,9 +114,41 @@ void render_init(Renderer* r, Planet* planet, const Camera* cam) {
 
 void render_update_mesh(Renderer* r, Planet* planet, const Camera* cam) {
     (void)planet;
+
+    uint64_t t0 = stm_now();
+
     HMM_Mat4 vp = HMM_MulM4(cam->proj, cam->view);
     lod_tree_update(&r->lod_tree, cam->position, vp);
+    uint64_t t1 = stm_now();
+
     lod_tree_upload_meshes(&r->lod_tree);
+    uint64_t t2 = stm_now();
+
+    // Update hex terrain (close-range voxel grid).
+    // Only run after LOD tree has built enough patches (avoid competing during loading).
+    double hex_update_ms = 0, hex_upload_ms = 0;
+    if (lod_tree_active_leaves(&r->lod_tree) >= 20) {
+        hex_terrain_update(&r->hex_terrain, cam->position, r->lod_tree.world_origin);
+        uint64_t t3 = stm_now();
+        hex_terrain_upload_meshes(&r->hex_terrain);
+        uint64_t t4 = stm_now();
+        hex_update_ms = stm_ms(stm_diff(t3, t2));
+        hex_upload_ms = stm_ms(stm_diff(t4, t3));
+
+        // Dynamic LOD suppress: only suppress when hex terrain has enough coverage
+        r->lod_tree.suppress_range = hex_terrain_effective_range(&r->hex_terrain) * HEX_SUPPRESS_FACTOR;
+    }
+    uint64_t t_end = stm_now();
+
+    double total_ms = stm_ms(stm_diff(t_end, t0));
+    if (total_ms > 16.0) {
+        printf("[RENDER] SLOW update: %.1fms (lod_update=%.1f, lod_upload=%.1f, hex_update=%.1f, hex_upload=%.1f)\n",
+            total_ms,
+            stm_ms(stm_diff(t1, t0)),
+            stm_ms(stm_diff(t2, t1)),
+            hex_update_ms, hex_upload_ms);
+        fflush(stdout);
+    }
 }
 
 void render_frame(Renderer* r, const Camera* cam, float dt) {
@@ -229,6 +269,10 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
         lod_tree_render(&r->lod_tree, r->pip, vp, NULL, NULL);
     }
 
+    // ---- 3b. Draw hex terrain (close-range voxel grid) ----
+    // Uses same pipeline and uniforms as LOD terrain
+    hex_terrain_render(&r->hex_terrain, r->pip);
+
     // ---- 4. HUD overlay ----
     sdtx_canvas(sapp_widthf() * 0.5f, sapp_heightf() * 0.5f);
     sdtx_origin(0.5f, 0.5f);
@@ -242,6 +286,12 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
         r->lod_tree.node_count,
         r->lod_tree.node_capacity);
 
+    // Hex terrain stats
+    sdtx_color3f(0.5f, 1.0f, 0.5f);
+    sdtx_printf("hex: %d chunks  %dk verts\n",
+        r->hex_terrain.chunks_rendered,
+        r->hex_terrain.total_vertex_count / 1000);
+
     // Player position + altitude
     {
         float cam_r = sqrtf(cam->position.X * cam->position.X +
@@ -251,6 +301,7 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
         sdtx_color3f(0.6f, 0.8f, 1.0f);
         sdtx_printf("alt: %.0fm  r: %.0fkm\n", altitude, cam_r / 1000.0f);
     }
+
 
     // Jetpack status
     if (cam->jetpack_active) {
@@ -283,6 +334,7 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
 }
 
 void render_shutdown(Renderer* r) {
+    hex_terrain_destroy(&r->hex_terrain);
     atmosphere_destroy(&r->atmosphere);
     lod_tree_destroy(&r->lod_tree);
 }

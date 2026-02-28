@@ -8,11 +8,10 @@
 #include "job_system.h"
 
 // ---- Configuration ----
-#define LOD_MAX_DEPTH       16      // Max subdivision depth (depth 16 ≈ 7m patches)
+#define LOD_MAX_DEPTH       13      // Max subdivision depth
 #define LOD_MAX_NODES       16384   // Node pool (intermediate + leaf nodes)
 #define LOD_ROOT_COUNT      20      // 20 icosahedron faces
 #define LOD_CHILDREN        4       // Aperture-4 subdivision
-#define LOD_VOXEL_DEPTH     13      // Depth at which hex prism voxels begin (~63m patches, ~1m hex radius)
 #define LOD_MAX_UPLOADS_PER_FRAME 64 // Max GPU uploads per frame
 #define LOD_MAX_SPLITS_PER_FRAME 256 // Tree builds fast; capped at voxel depth anyway
 #define LOD_NUM_WORKERS     4       // Worker threads for mesh generation
@@ -99,6 +98,11 @@ typedef struct LodTree {
     // Per-frame budget
     int splits_this_frame;
 
+    // Hex terrain suppression: don't render LOD patches closer than this distance.
+    // Set to 0 to disable suppression. When > 0, leaf patches with
+    // patch_distance < suppress_range are skipped during rendering.
+    float suppress_range;
+
     // Stats
     int active_leaf_count;
     int total_vertex_count;
@@ -130,7 +134,6 @@ void lod_tree_render(LodTree* tree, sg_pipeline pip, HMM_Mat4 vp,
                      LodPreDrawFunc pre_draw, void* user_data);
 
 // Find the finest leaf node containing a world position
-int lod_tree_find_node(const LodTree* tree, HMM_Vec3 world_pos);
 
 // Get terrain height at a world position (for collision)
 // Returns double to avoid float quantization at large radii (6cm steps at 800km)
