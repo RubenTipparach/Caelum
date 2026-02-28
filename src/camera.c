@@ -13,8 +13,8 @@
 #define SPRINT_SPEED    8.0f
 #define JUMP_FORCE      8.0f    // Initial upward velocity on jump (m/s)
 #define BASE_GRAVITY    20.0f   // Gravitational acceleration toward center (m/s^2)
-#define PLAYER_EYE_HEIGHT 1.6f  // Eye height above feet (meters)
-#define PLAYER_HEIGHT   1.8f    // Total player height (meters)
+#define PLAYER_EYE_HEIGHT 1.7f  // Eye height above feet (meters)
+#define PLAYER_HEIGHT   2.0f    // Total player height (2m capsule)
 #define PLAYER_RADIUS   0.3f    // Horizontal collision radius (meters)
 #define GROUND_SNAP_THRESHOLD 0.5f  // Snap to ground if within this distance
 #define AUTO_STEP_HEIGHT 0.3f   // Can step up blocks this tall without jumping
@@ -389,7 +389,7 @@ void camera_update(Camera* cam, Planet* planet, const LodTree* lod, float dt) {
 
     // ---- Projection ----
     float aspect = sapp_widthf() / sapp_heightf();
-    cam->proj = HMM_Perspective_RH_NO(HMM_ToRad(70.0f), aspect, 0.1f, 10000000.0f);
+    cam->proj = HMM_Perspective_RH_NO(HMM_ToRad(70.0f), aspect, 0.01f, 10000000.0f);
 
     // ---- Periodic logging ----
     log_frame_counter++;

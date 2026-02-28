@@ -242,6 +242,16 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
         r->lod_tree.node_count,
         r->lod_tree.node_capacity);
 
+    // Player position + altitude
+    {
+        float cam_r = sqrtf(cam->position.X * cam->position.X +
+                            cam->position.Y * cam->position.Y +
+                            cam->position.Z * cam->position.Z);
+        float altitude = cam_r - r->lod_tree.planet_radius;
+        sdtx_color3f(0.6f, 0.8f, 1.0f);
+        sdtx_printf("alt: %.0fm  r: %.0fkm\n", altitude, cam_r / 1000.0f);
+    }
+
     // Jetpack status
     if (cam->jetpack_active) {
         sdtx_color3f(0.3f, 1.0f, 0.5f);

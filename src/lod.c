@@ -290,8 +290,35 @@ static bool point_in_spherical_triangle(const SphericalTriangle* tri, HMM_Vec3 p
 // ---- Node allocation ----
 
 static int allocate_node(LodTree* tree) {
+    // First, try to reuse a dead node (freed by merge_node).
+    // Dead nodes have: state=LOD_UNLOADED, parent=-1, no children, is_leaf=true.
+    for (int i = 0; i < tree->node_count; i++) {
+        LodNode* n = &tree->nodes[i];
+        if (n->state == LOD_UNLOADED && n->parent == -1 && n->is_leaf &&
+            n->children[0] == -1 && n->children[1] == -1 &&
+            n->children[2] == -1 && n->children[3] == -1 &&
+            n->gpu_buffer.id == SG_INVALID_ID && n->pending_job == NULL) {
+            // Skip root nodes (they're always alive)
+            bool is_root = false;
+            for (int r = 0; r < LOD_ROOT_COUNT; r++) {
+                if (tree->root_nodes[r] == i) { is_root = true; break; }
+            }
+            if (is_root) continue;
+
+            // Reuse this slot
+            memset(n, 0, sizeof(LodNode));
+            n->parent = -1;
+            for (int j = 0; j < LOD_CHILDREN; j++) n->children[j] = -1;
+            n->gpu_buffer.id = SG_INVALID_ID;
+            n->is_leaf = true;
+            n->state = LOD_UNLOADED;
+            n->pending_job = NULL;
+            return i;
+        }
+    }
+
+    // No dead node available — grow the array
     if (tree->node_count >= tree->node_capacity) {
-        // Grow the array
         int new_cap = tree->node_capacity * 2;
         if (new_cap > LOD_MAX_NODES) new_cap = LOD_MAX_NODES;
         if (tree->node_count >= new_cap) {
@@ -601,256 +628,207 @@ static void generate_coarse_mesh_params(
     free(row_offsets);
 }
 
-// ---- Voxel mesh generation for fine LOD nodes (depth >= LOD_VOXEL_DEPTH) ----
-// Each tessellation triangle becomes a discrete-height "cell" with wall faces
-// between adjacent cells at different heights, giving a Minecraft-like stepped look.
+// ---- Hex prism voxel mesh for fine LOD (depth >= LOD_VOXEL_DEPTH) ----
+// Generates hexagonal columns from the dual of a triangular grid within each patch.
+// Each grid vertex becomes a hex cell center; the hex corners are triangle centroids.
+// Height is sampled and quantized to 1m steps for a Minecraft-like stepped hex look.
 
-// Edge info for tracking adjacency between tessellation triangles
-typedef struct {
-    int va, vb;     // Sorted vertex indices (va < vb)
-    int tri[2];     // Up to 2 triangles sharing this edge
-    int count;      // Number of triangles (1 = boundary, 2 = interior)
-} VoxelEdge;
+// Target hex circumradius (center-to-corner) ≈ 1 meter.
+// Grid spacing d relates to hex radius by: radius = d / sqrt(3).
+// So d = radius * sqrt(3) ≈ 1.732m for 1m hex radius.
+#define HEX_TARGET_SPACING 1.732f
+#define HEX_N_MIN  3
+#define HEX_N_MAX  48
 
-// Find or create an edge entry in the flat array
-static int find_or_add_edge(VoxelEdge* edges, int* edge_count, int cap, int va, int vb) {
-    int a = va < vb ? va : vb;
-    int b = va < vb ? vb : va;
-    for (int i = 0; i < *edge_count; i++) {
-        if (edges[i].va == a && edges[i].vb == b) {
-            return i;
-        }
-    }
-    if (*edge_count >= cap) return -1;
-    int idx = (*edge_count)++;
-    edges[idx].va = a;
-    edges[idx].vb = b;
-    edges[idx].count = 0;
-    edges[idx].tri[0] = -1;
-    edges[idx].tri[1] = -1;
-    return idx;
-}
+// Grid index macros (N is a runtime variable, passed explicitly)
+#define HG_IDX(N, r, c)   ((r) * ((N) + 1) - (r) * ((r) - 1) / 2 + (c))
+#define HG_UP(N, r, c)    ((r) * (N) - (r) * ((r) - 1) / 2 + (c))
+#define HG_DN(N, r, c)    ((r) * ((N) - 1) - (r) * ((r) - 1) / 2 + (c))
 
 static void generate_voxel_mesh_params(
     const SphericalTriangle* stri, int depth,
     float planet_radius, float layer_thickness, int sea_level, int seed,
     LodVertex** out_vertices, int* out_count)
 {
-    (void)depth;
-    int tess = 8;  // Fine tessellation for voxel detail
+    (void)depth; (void)sea_level; (void)layer_thickness;
     fnl_state noise = create_terrain_noise(seed);
     fnl_state warp = create_warp_noise(seed);
     fnl_state detail = create_detail_noise(seed);
     fnl_state cnoise = create_color_noise(seed);
 
-    // 1. Generate grid vertices on unit sphere
-    int num_pts = (tess + 1) * (tess + 2) / 2;
-    HMM_Vec3* unit_pts = (HMM_Vec3*)malloc(num_pts * sizeof(HMM_Vec3));
+    // Exactly 1m height steps — each hex column is a multiple of 1m
+    float step_h = 1.0f;
 
-    int pidx = 0;
-    for (int row = 0; row <= tess; row++) {
-        for (int col = 0; col <= tess - row; col++) {
-            float u = (float)col / (float)tess;
-            float v = (float)row / (float)tess;
+    // Compute dynamic grid resolution targeting ~1m hex radius
+    float patch_arc = stri->angular_radius * planet_radius;
+    int N = (int)(patch_arc / HEX_TARGET_SPACING);
+    if (N < HEX_N_MIN) N = HEX_N_MIN;
+    if (N > HEX_N_MAX) N = HEX_N_MAX;
+
+    // 1. Generate grid vertices on unit sphere, sample terrain heights
+    int num_grid = (N + 1) * (N + 2) / 2;
+    HMM_Vec3* gpos = (HMM_Vec3*)malloc(num_grid * sizeof(HMM_Vec3));
+    float* g_raw_h = (float*)malloc(num_grid * sizeof(float));
+    float* g_qh = (float*)malloc(num_grid * sizeof(float));
+
+    for (int r = 0; r <= N; r++) {
+        for (int c = 0; c <= N - r; c++) {
+            int idx = HG_IDX(N, r, c);
+            float u = (float)c / N;
+            float v = (float)r / N;
             float w = 1.0f - u - v;
-            HMM_Vec3 p = vec3_add(
+            HMM_Vec3 p = vec3_normalize(vec3_add(
                 vec3_add(vec3_scale(stri->v0, w), vec3_scale(stri->v1, u)),
-                vec3_scale(stri->v2, v));
-            unit_pts[pidx++] = vec3_normalize(p);
+                vec3_scale(stri->v2, v)));
+            gpos[idx] = p;
+            float h = sample_terrain_height_m(&noise, &warp, &detail, p);
+            g_raw_h[idx] = h;
+            float eff = fmaxf(h, TERRAIN_SEA_LEVEL_M);
+            g_qh[idx] = floorf(eff / step_h) * step_h;
         }
     }
 
-    // 2. Build row offsets for grid indexing
-    int* row_off = (int*)malloc((tess + 1) * sizeof(int));
-    row_off[0] = 0;
-    for (int r = 1; r <= tess; r++) {
-        row_off[r] = row_off[r - 1] + (tess - (r - 1) + 1);
+    // 2. Precompute triangle centroids (these become hex corners)
+    int num_up = N * (N + 1) / 2;
+    int num_down = N * (N - 1) / 2;
+    HMM_Vec3* up_ctr = (HMM_Vec3*)malloc(num_up * sizeof(HMM_Vec3));
+    HMM_Vec3* dn_ctr = (HMM_Vec3*)malloc((num_down > 0 ? num_down : 1) * sizeof(HMM_Vec3));
+
+    for (int r = 0; r < N; r++) {
+        for (int c = 0; c < N - r; c++) {
+            int ti = HG_UP(N, r, c);
+            HMM_Vec3 a = gpos[HG_IDX(N, r, c)];
+            HMM_Vec3 b = gpos[HG_IDX(N, r, c + 1)];
+            HMM_Vec3 d = gpos[HG_IDX(N, r + 1, c)];
+            up_ctr[ti] = vec3_normalize(vec3_scale(vec3_add(vec3_add(a, b), d), 1.0f / 3.0f));
+        }
     }
-
-    // 3. Build triangle list with terrain heights at centroids (in meters)
-    float step_h = layer_thickness;  // Voxel step height for Minecraft-like look
-    if (step_h < 1.0f) step_h = 2.0f;  // Minimum 2m steps for visible voxels
-
-    int num_tris = tess * tess;
-    int* tri_v = (int*)malloc(num_tris * 3 * sizeof(int));
-    float* tri_h = (float*)malloc(num_tris * sizeof(float));   // raw terrain height (meters)
-    float* tri_eh = (float*)malloc(num_tris * sizeof(float));  // effective height (clamped to sea level, quantized)
-
-    int tidx = 0;
-    for (int row = 0; row < tess; row++) {
-        for (int col = 0; col < tess - row; col++) {
-            // Upward triangle: V(row,col), V(row,col+1), V(row+1,col)
-            int i0 = row_off[row] + col;
-            int i1 = row_off[row] + col + 1;
-            int i2 = row_off[row + 1] + col;
-            tri_v[tidx * 3 + 0] = i0;
-            tri_v[tidx * 3 + 1] = i1;
-            tri_v[tidx * 3 + 2] = i2;
-
-            HMM_Vec3 c = vec3_normalize(vec3_scale(
-                vec3_add(vec3_add(unit_pts[i0], unit_pts[i1]), unit_pts[i2]),
-                1.0f / 3.0f));
-            float h_m = sample_terrain_height_m(&noise, &warp, &detail, c);
-            tri_h[tidx] = h_m;
-            // Quantize to step height for voxel look, clamp to sea level
-            float eff = fmaxf(h_m, TERRAIN_SEA_LEVEL_M);
-            tri_eh[tidx] = floorf(eff / step_h) * step_h;
-            tidx++;
-
-            // Downward triangle: V(row+1,col), V(row,col+1), V(row+1,col+1)
-            if (col < tess - row - 1) {
-                int j0 = row_off[row + 1] + col;
-                int j1 = row_off[row] + col + 1;
-                int j2 = row_off[row + 1] + col + 1;
-                tri_v[tidx * 3 + 0] = j0;
-                tri_v[tidx * 3 + 1] = j1;
-                tri_v[tidx * 3 + 2] = j2;
-
-                c = vec3_normalize(vec3_scale(
-                    vec3_add(vec3_add(unit_pts[j0], unit_pts[j1]), unit_pts[j2]),
-                    1.0f / 3.0f));
-                h_m = sample_terrain_height_m(&noise, &warp, &detail, c);
-                tri_h[tidx] = h_m;
-                eff = fmaxf(h_m, TERRAIN_SEA_LEVEL_M);
-                tri_eh[tidx] = floorf(eff / step_h) * step_h;
-                tidx++;
-            }
+    for (int r = 0; r < N; r++) {
+        for (int c = 0; c < N - r - 1; c++) {
+            int ti = HG_DN(N, r, c);
+            HMM_Vec3 a = gpos[HG_IDX(N, r + 1, c)];
+            HMM_Vec3 b = gpos[HG_IDX(N, r, c + 1)];
+            HMM_Vec3 d = gpos[HG_IDX(N, r + 1, c + 1)];
+            dn_ctr[ti] = vec3_normalize(vec3_scale(vec3_add(vec3_add(a, b), d), 1.0f / 3.0f));
         }
     }
 
-    // 4. Build edge adjacency
-    int edge_cap = num_tris * 2;
-    VoxelEdge* edges = (VoxelEdge*)calloc(edge_cap, sizeof(VoxelEdge));
-    int edge_count = 0;
-
-    for (int t = 0; t < tidx; t++) {
-        for (int e = 0; e < 3; e++) {
-            int va = tri_v[t * 3 + e];
-            int vb = tri_v[t * 3 + (e + 1) % 3];
-            int ei = find_or_add_edge(edges, &edge_count, edge_cap, va, vb);
-            if (ei >= 0 && edges[ei].count < 2) {
-                edges[ei].tri[edges[ei].count++] = t;
-            }
-        }
-    }
-
-    // 5. Allocate output
-    int max_verts = num_tris * 3 * 20;  // Extra room for wall quads and skirts
-    *out_vertices = (LodVertex*)malloc(max_verts * sizeof(LodVertex));
+    // 3. Allocate output
+    int max_out = num_grid * 24;  // ~24 verts/hex avg; lod_emit_tri reallocs if needed
+    *out_vertices = (LodVertex*)malloc(max_out * sizeof(LodVertex));
     *out_count = 0;
-    int cap = max_verts;
+    int cap = max_out;
 
-    // 6. Render top faces (each triangle at its quantized height)
-    for (int t = 0; t < tidx; t++) {
-        float eh = tri_eh[t];
-        float r_top = planet_radius + eh + step_h;
+    // 4. Generate hex prisms for each grid vertex
+    for (int r = 0; r <= N; r++) {
+        for (int c = 0; c <= N - r; c++) {
+            int vi = HG_IDX(N, r, c);
+            float qh = g_qh[vi];
+            float r_top = planet_radius + qh + step_h;
+            HMM_Vec3 color = perturb_color(terrain_color_m(g_raw_h[vi]), &cnoise, gpos[vi]);
 
-        HMM_Vec3 p0 = vec3_scale(unit_pts[tri_v[t * 3 + 0]], r_top);
-        HMM_Vec3 p1 = vec3_scale(unit_pts[tri_v[t * 3 + 1]], r_top);
-        HMM_Vec3 p2 = vec3_scale(unit_pts[tri_v[t * 3 + 2]], r_top);
+            // 6 hex corners (centroids of surrounding triangles, clockwise):
+            // [0] ▽(r-1,c-1)  [1] △(r-1,c)  [2] ▽(r-1,c)
+            // [3] △(r,c)      [4] ▽(r,c-1)  [5] △(r,c-1)
+            bool ce[6];
+            ce[0] = (r > 0 && c > 0);
+            ce[1] = (r > 0);
+            ce[2] = (r > 0 && r + c < N);
+            ce[3] = (r + c < N);
+            ce[4] = (c > 0 && r + c < N);
+            ce[5] = (c > 0 && r < N);
 
-        HMM_Vec3 edge1 = vec3_sub(p1, p0);
-        HMM_Vec3 edge2 = vec3_sub(p2, p0);
-        HMM_Vec3 normal = vec3_normalize(vec3_cross(edge1, edge2));
+            HMM_Vec3 hc[6];
+            if (ce[0]) hc[0] = dn_ctr[HG_DN(N, r - 1, c - 1)];
+            if (ce[1]) hc[1] = up_ctr[HG_UP(N, r - 1, c)];
+            if (ce[2]) hc[2] = dn_ctr[HG_DN(N, r - 1, c)];
+            if (ce[3]) hc[3] = up_ctr[HG_UP(N, r, c)];
+            if (ce[4]) hc[4] = dn_ctr[HG_DN(N, r, c - 1)];
+            if (ce[5]) hc[5] = up_ctr[HG_UP(N, r, c - 1)];
 
-        // Ensure normal points outward (away from planet center)
-        HMM_Vec3 fc = vec3_scale(vec3_add(vec3_add(p0, p1), p2), 1.0f / 3.0f);
-        if (vec3_dot(normal, fc) < 0) {
-            normal = vec3_scale(normal, -1.0f);
-            HMM_Vec3 tmp = p1; p1 = p2; p2 = tmp;
+            // Extend boundary hexes: reflect missing corners from their opposite
+            // so hex geometry extends past the patch edge, overlapping with neighbor.
+            // Corner k is opposite to corner (k+3)%6.
+            for (int k = 0; k < 6; k++) {
+                if (!ce[k]) {
+                    int opp = (k + 3) % 6;
+                    if (ce[opp]) {
+                        hc[k] = vec3_normalize(vec3_sub(
+                            vec3_scale(gpos[vi], 2.0f), hc[opp]));
+                        ce[k] = true;
+                    }
+                }
+            }
+
+            int n_corners = 0, first_k = -1;
+            for (int k = 0; k < 6; k++)
+                if (ce[k]) { n_corners++; if (first_k < 0) first_k = k; }
+            if (n_corners < 3) continue;
+
+            // ---- Top face: fan from center to consecutive valid corners ----
+            HMM_Vec3 center_top = vec3_scale(gpos[vi], r_top);
+            HMM_Vec3 top_normal = gpos[vi];
+
+            int prev_k = -1;
+            for (int k = 0; k < 6; k++) {
+                if (!ce[k]) continue;
+                if (prev_k >= 0) {
+                    HMM_Vec3 c1 = vec3_scale(hc[prev_k], r_top);
+                    HMM_Vec3 c2 = vec3_scale(hc[k], r_top);
+                    lod_emit_tri(out_vertices, out_count, &cap,
+                                 center_top, c1, c2, top_normal, color);
+                }
+                prev_k = k;
+            }
+            if (prev_k != first_k) {
+                HMM_Vec3 c1 = vec3_scale(hc[prev_k], r_top);
+                HMM_Vec3 c2 = vec3_scale(hc[first_k], r_top);
+                lod_emit_tri(out_vertices, out_count, &cap,
+                             center_top, c1, c2, top_normal, color);
+            }
+
+            // ---- Side walls: only between interior neighbors ----
+            int ndr[6] = {-1, -1,  0,  1,  1,  0};
+            int ndc[6] = { 0,  1,  1,  0, -1, -1};
+            bool nb[6];
+            nb[0] = (r > 0);
+            nb[1] = (r > 0 && r + c <= N);
+            nb[2] = (r + c < N);
+            nb[3] = (r + c < N);
+            nb[4] = (c > 0);
+            nb[5] = (c > 0);
+
+            for (int k = 0; k < 6; k++) {
+                int k2 = (k + 1) % 6;
+                if (!ce[k] || !ce[k2]) continue;
+                if (!nb[k]) continue;  // Skip boundary sides — neighbor patch handles it
+
+                float neighbor_qh = g_qh[HG_IDX(N, r + ndr[k], c + ndc[k])];
+                if (qh <= neighbor_qh) continue;
+
+                float rw_top = planet_radius + qh + step_h;
+                float rw_bot = planet_radius + neighbor_qh + step_h;
+
+                HMM_Vec3 tl = vec3_scale(hc[k],  rw_top);
+                HMM_Vec3 tr = vec3_scale(hc[k2], rw_top);
+                HMM_Vec3 bl = vec3_scale(hc[k],  rw_bot);
+                HMM_Vec3 br = vec3_scale(hc[k2], rw_bot);
+
+                HMM_Vec3 side_mid = vec3_normalize(vec3_scale(vec3_add(hc[k], hc[k2]), 0.5f));
+                HMM_Vec3 wall_n = vec3_normalize(vec3_sub(side_mid, gpos[vi]));
+                HMM_Vec3 wall_col = perturb_color(terrain_color_m(qh), &cnoise, side_mid);
+
+                lod_emit_tri(out_vertices, out_count, &cap, bl, tr, br, wall_n, wall_col);
+                lod_emit_tri(out_vertices, out_count, &cap, bl, tl, tr, wall_n, wall_col);
+            }
         }
-
-        HMM_Vec3 tri_center = vec3_normalize(vec3_scale(
-            vec3_add(vec3_add(unit_pts[tri_v[t * 3 + 0]],
-                              unit_pts[tri_v[t * 3 + 1]]),
-                     unit_pts[tri_v[t * 3 + 2]]), 1.0f / 3.0f));
-        HMM_Vec3 color = perturb_color(terrain_color_m(tri_h[t]), &cnoise, tri_center);
-
-        lod_emit_tri(out_vertices, out_count, &cap, p0, p1, p2, normal, color);
     }
 
-    // 7. Render walls between adjacent triangles and boundary skirts
-    for (int i = 0; i < edge_count; i++) {
-        VoxelEdge* e = &edges[i];
-        HMM_Vec3 ua = unit_pts[e->va];
-        HMM_Vec3 ub = unit_pts[e->vb];
-
-        if (e->count == 1) {
-            // Boundary edge: render skirt extending downward
-            int t = e->tri[0];
-            float eh = tri_eh[t];
-            float skirt_drop_m = step_h * 3.0f;
-
-            HMM_Vec3 tri_c = vec3_normalize(vec3_scale(
-                vec3_add(vec3_add(
-                    unit_pts[tri_v[t * 3 + 0]],
-                    unit_pts[tri_v[t * 3 + 1]]),
-                    unit_pts[tri_v[t * 3 + 2]]), 1.0f / 3.0f));
-            HMM_Vec3 edge_mid = vec3_normalize(vec3_scale(vec3_add(ua, ub), 0.5f));
-            HMM_Vec3 outward = vec3_normalize(vec3_sub(edge_mid, tri_c));
-
-            float r_top = planet_radius + eh + step_h;
-            float r_bot = planet_radius + eh - skirt_drop_m;
-            HMM_Vec3 color = perturb_color(terrain_color_m(tri_h[t]), &cnoise, edge_mid);
-
-            HMM_Vec3 bl = vec3_scale(ua, r_bot);
-            HMM_Vec3 br = vec3_scale(ub, r_bot);
-            HMM_Vec3 tl = vec3_scale(ua, r_top);
-            HMM_Vec3 tr = vec3_scale(ub, r_top);
-
-            lod_emit_tri(out_vertices, out_count, &cap, bl, tr, br, outward, color);
-            lod_emit_tri(out_vertices, out_count, &cap, bl, tl, tr, outward, color);
-        } else {
-            // Interior edge: render wall if heights differ
-            int t0 = e->tri[0];
-            int t1 = e->tri[1];
-            float h0 = tri_eh[t0];
-            float h1 = tri_eh[t1];
-
-            if (fabsf(h0 - h1) < 0.01f) continue;  // Same height, no wall needed
-
-            int tall = h0 > h1 ? t0 : t1;
-            float high = h0 > h1 ? h0 : h1;
-            float low = h0 > h1 ? h1 : h0;
-
-            HMM_Vec3 tall_c = vec3_normalize(vec3_scale(
-                vec3_add(vec3_add(
-                    unit_pts[tri_v[tall * 3 + 0]],
-                    unit_pts[tri_v[tall * 3 + 1]]),
-                    unit_pts[tri_v[tall * 3 + 2]]), 1.0f / 3.0f));
-            int shor = h0 > h1 ? t1 : t0;
-            HMM_Vec3 short_c = vec3_normalize(vec3_scale(
-                vec3_add(vec3_add(
-                    unit_pts[tri_v[shor * 3 + 0]],
-                    unit_pts[tri_v[shor * 3 + 1]]),
-                    unit_pts[tri_v[shor * 3 + 2]]), 1.0f / 3.0f));
-            HMM_Vec3 wall_normal = vec3_normalize(vec3_sub(short_c, tall_c));
-            HMM_Vec3 wall_mid = vec3_normalize(vec3_scale(vec3_add(ua, ub), 0.5f));
-
-            // Single wall quad from low to high
-            float r_bot = planet_radius + low + step_h;
-            float r_top = planet_radius + high + step_h;
-
-            HMM_Vec3 bl = vec3_scale(ua, r_bot);
-            HMM_Vec3 br = vec3_scale(ub, r_bot);
-            HMM_Vec3 tl = vec3_scale(ua, r_top);
-            HMM_Vec3 tr = vec3_scale(ub, r_top);
-
-            float wall_h = (high + low) * 0.5f;
-            HMM_Vec3 color = perturb_color(terrain_color_m(wall_h), &cnoise, wall_mid);
-
-            lod_emit_tri(out_vertices, out_count, &cap, bl, tr, br, wall_normal, color);
-            lod_emit_tri(out_vertices, out_count, &cap, bl, tl, tr, wall_normal, color);
-        }
-    }
-
-    // Cleanup
-    free(unit_pts);
-    free(row_off);
-    free(tri_v);
-    free(tri_h);
-    free(tri_eh);
-    free(edges);
+    free(gpos);
+    free(g_raw_h);
+    free(g_qh);
+    free(up_ctr);
+    free(dn_ctr);
 }
 
 // Apply floating origin offset to all vertex positions in a mesh.
@@ -907,8 +885,9 @@ static void generate_node_mesh(LodTree* tree, LodNode* node) {
     node->state = LOD_READY;
 }
 
-// Submit async mesh generation job for a node
-static void submit_mesh_job(LodTree* tree, int node_idx) {
+// Submit async mesh generation job for a node.
+// Returns true if job was submitted, false if queue is full (node stays UNLOADED).
+static bool submit_mesh_job(LodTree* tree, int node_idx) {
     LodNode* node = &tree->nodes[node_idx];
 
     MeshGenJob* job = (MeshGenJob*)calloc(1, sizeof(MeshGenJob));
@@ -926,10 +905,15 @@ static void submit_mesh_job(LodTree* tree, int node_idx) {
     job->vertex_count = 0;
     job->completed = 0;
 
+    // Non-blocking submit: if queue is full, free the job and let caller retry next frame
+    if (!job_system_try_submit(tree->jobs, mesh_gen_worker, job)) {
+        free(job);
+        return false;  // Node stays in current state, will retry next frame
+    }
+
     node->pending_job = job;
     node->state = LOD_GENERATING;
-
-    job_system_submit(tree->jobs, mesh_gen_worker, job);
+    return true;
 }
 
 static void free_node_mesh(LodNode* node) {
@@ -1037,7 +1021,7 @@ static void merge_node(LodTree* tree, int node_idx) {
         if (tree->nodes[child_idx].state == LOD_GENERATING) return;
     }
 
-    // Free children's resources
+    // Free children's resources and mark them as dead (reusable by allocate_node)
     for (int i = 0; i < LOD_CHILDREN; i++) {
         int child_idx = node->children[i];
         if (child_idx < 0) continue;
@@ -1058,9 +1042,8 @@ static void merge_node(LodTree* tree, int node_idx) {
             child->gpu_buffer.id = SG_INVALID_ID;
         }
         child->state = LOD_UNLOADED;
+        child->parent = -1;  // Mark as dead — allocate_node can now reclaim this slot
 
-        // Note: we don't compact the array (would invalidate indices).
-        // Dead nodes stay with state=LOD_UNLOADED.
         node->children[i] = -1;
     }
 
@@ -1069,7 +1052,9 @@ static void merge_node(LodTree* tree, int node_idx) {
 
 // ---- Distance-based LOD decision ----
 
-// Returns the world-space distance from the camera to the nearest edge of a patch.
+// Returns effective distance from camera to nearest patch edge for LOD decisions.
+// On the ground: pure arc distance (splits correctly near the player).
+// Above max terrain: adds altitude penalty to prevent over-splitting from orbit.
 static float patch_distance(const LodTree* tree, const LodNode* node) {
     float cam_r = sqrtf(vec3_dot(tree->camera_pos, tree->camera_pos));
     if (cam_r < 1.0f) cam_r = 1.0f;
@@ -1080,13 +1065,24 @@ static float patch_distance(const LodTree* tree, const LodNode* node) {
     float angle_to_center = acosf(cos_angle);
     float edge_angle = angle_to_center - node->tri.angular_radius;
     if (edge_angle < 0.0f) edge_angle = 0.0f;
-    return edge_angle * tree->planet_radius;
+
+    // Arc distance along the surface to nearest patch edge
+    float arc_dist = edge_angle * tree->planet_radius;
+
+    // Altitude above the highest possible terrain (prevents over-splitting from orbit)
+    float max_surface_r = tree->planet_radius + TERRAIN_AMPLITUDE_M;
+    float altitude = cam_r - max_surface_r;
+    if (altitude < 0.0f) altitude = 0.0f;
+
+    // On/below max terrain: pure arc distance. Above: altitude adds to distance.
+    return sqrtf(arc_dist * arc_dist + altitude * altitude);
 }
 
 // Check if a patch should be split: split when camera is close relative to patch size.
 // Each depth level halves the angular radius, so the patch arc length halves.
+// Hex prism patches (depth >= LOD_VOXEL_DEPTH) are the finest detail — never split further.
 static bool should_split(const LodTree* tree, const LodNode* node) {
-    if (node->depth >= LOD_MAX_DEPTH) return false;
+    if (node->depth >= LOD_VOXEL_DEPTH) return false;
     float dist = patch_distance(tree, node);
     float patch_arc = node->tri.angular_radius * tree->planet_radius;
     return dist < patch_arc * LOD_SPLIT_FACTOR;
@@ -1217,10 +1213,20 @@ void lod_tree_update(LodTree* tree, HMM_Vec3 camera_pos, HMM_Mat4 view_proj) {
     // Process completed async jobs first (transfers mesh data to nodes)
     process_completed_jobs(tree);
 
+    // Backpressure: if job queue is heavily loaded, skip tree updates this frame.
+    // This prevents the main thread from queuing faster than workers can process,
+    // which would eventually fill the queue and stall the frame loop.
+    int pending = job_system_pending(tree->jobs);
+    if (pending > 128) {  // Let workers catch up but don't starve the tree build
+        // Queue heavily loaded — skip splits this frame, let workers catch up
+        goto collect_stats;
+    }
+
     for (int i = 0; i < LOD_ROOT_COUNT; i++) {
         update_node(tree, tree->root_nodes[i]);
     }
 
+collect_stats:
     // Reset per-level stats
     for (int d = 0; d <= LOD_MAX_DEPTH; d++) {
         tree->level_stats[d].patch_count = 0;
@@ -1249,10 +1255,8 @@ void lod_tree_update(LodTree* tree, HMM_Vec3 camera_pos, HMM_Mat4 view_proj) {
             tree->level_stats[d].vertex_count += node->gpu_vertex_count;
         }
 
-        // Compute distance from camera to patch center
-        HMM_Vec3 world_center = HMM_MulV3F(node->tri.center, tree->planet_radius);
-        HMM_Vec3 diff = HMM_SubV3(world_center, tree->camera_pos);
-        float dist = HMM_LenV3(diff);
+        // Compute arc distance from camera to patch edge (same metric used for LOD decisions)
+        float dist = patch_distance(tree, node);
 
         if (dist < tree->level_stats[d].min_distance)
             tree->level_stats[d].min_distance = dist;
@@ -1360,11 +1364,9 @@ static void render_node(const LodTree* tree, int node_idx,
                 break;
             }
         }
-        // If child is an internal node, it will handle its own rendering
     }
 
     if (all_children_ready) {
-        // All children ready — recurse into them for finer detail
         for (int i = 0; i < LOD_CHILDREN; i++) {
             if (node->children[i] >= 0) {
                 render_node(tree, node->children[i], bind, total_verts,
@@ -1372,7 +1374,6 @@ static void render_node(const LodTree* tree, int node_idx,
             }
         }
     } else {
-        // Fallback: render this node's mesh if available (parent-as-fallback)
         if (node->state == LOD_ACTIVE && node->gpu_vertex_count > 0 &&
             node->gpu_buffer.id != SG_INVALID_ID) {
             if (pre_draw) pre_draw(node->depth, user_data);
@@ -1381,7 +1382,6 @@ static void render_node(const LodTree* tree, int node_idx,
             sg_draw(0, node->gpu_vertex_count, 1);
             *total_verts += node->gpu_vertex_count;
         } else {
-            // No fallback mesh — still recurse and render whatever children have
             for (int i = 0; i < LOD_CHILDREN; i++) {
                 if (node->children[i] >= 0) {
                     render_node(tree, node->children[i], bind, total_verts,
@@ -1469,7 +1469,7 @@ int lod_tree_find_node(const LodTree* tree, HMM_Vec3 world_pos) {
 
 // ---- Floating origin recentering ----
 
-#define ORIGIN_RECENTER_THRESHOLD 50000.0  // 50km — recenter when camera drifts this far
+#define ORIGIN_RECENTER_THRESHOLD 5000000.0  // 5000km — well beyond single-planet range (r=796km, max surface distance ~2500km)
 
 bool lod_tree_update_origin(LodTree* tree, const double cam_pos_d[3]) {
     double dx = cam_pos_d[0] - tree->world_origin[0];
@@ -1535,6 +1535,12 @@ double lod_tree_terrain_height(const LodTree* tree, HMM_Vec3 world_pos) {
     fnl_state detail = create_detail_noise(tree->seed);
     float h_m = sample_terrain_height_m(&noise, &warp, &detail, unit);
     float effective_h_m = fmaxf(h_m, TERRAIN_SEA_LEVEL_M);
+    // Only quantize when hex prism patches are active under the player.
+    // At coarse LOD depths the terrain is smooth — no quantization.
+    int node_idx = lod_tree_find_node(tree, world_pos);
+    if (node_idx >= 0 && tree->nodes[node_idx].depth >= LOD_VOXEL_DEPTH) {
+        effective_h_m = floorf(effective_h_m) + 1.0f;
+    }
     // Add in double to avoid float quantization (6.25cm steps at 800km)
     return (double)tree->planet_radius + (double)effective_h_m;
 }

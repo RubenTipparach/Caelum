@@ -110,8 +110,29 @@ void job_system_submit(JobSystem* sys, JobFunc func, void* data) {
     LeaveCriticalSection(&sys->mutex);
 }
 
-int job_system_pending(const JobSystem* sys) {
-    return sys->queue_count;
+bool job_system_try_submit(JobSystem* sys, JobFunc func, void* data) {
+    EnterCriticalSection(&sys->mutex);
+
+    if (sys->queue_count >= JOB_QUEUE_SIZE) {
+        LeaveCriticalSection(&sys->mutex);
+        return false;  // Queue full — caller should retry later
+    }
+
+    sys->queue[sys->queue_tail].func = func;
+    sys->queue[sys->queue_tail].data = data;
+    sys->queue_tail = (sys->queue_tail + 1) % JOB_QUEUE_SIZE;
+    sys->queue_count++;
+
+    WakeConditionVariable(&sys->cond_not_empty);
+    LeaveCriticalSection(&sys->mutex);
+    return true;
+}
+
+int job_system_pending(JobSystem* sys) {
+    EnterCriticalSection(&sys->mutex);
+    int count = sys->queue_count;
+    LeaveCriticalSection(&sys->mutex);
+    return count;
 }
 
 void job_system_destroy(JobSystem* sys) {
@@ -230,8 +251,29 @@ void job_system_submit(JobSystem* sys, JobFunc func, void* data) {
     pthread_mutex_unlock(&sys->mutex);
 }
 
-int job_system_pending(const JobSystem* sys) {
-    return sys->queue_count;
+bool job_system_try_submit(JobSystem* sys, JobFunc func, void* data) {
+    pthread_mutex_lock(&sys->mutex);
+
+    if (sys->queue_count >= JOB_QUEUE_SIZE) {
+        pthread_mutex_unlock(&sys->mutex);
+        return false;
+    }
+
+    sys->queue[sys->queue_tail].func = func;
+    sys->queue[sys->queue_tail].data = data;
+    sys->queue_tail = (sys->queue_tail + 1) % JOB_QUEUE_SIZE;
+    sys->queue_count++;
+
+    pthread_cond_signal(&sys->cond_not_empty);
+    pthread_mutex_unlock(&sys->mutex);
+    return true;
+}
+
+int job_system_pending(JobSystem* sys) {
+    pthread_mutex_lock(&sys->mutex);
+    int count = sys->queue_count;
+    pthread_mutex_unlock(&sys->mutex);
+    return count;
 }
 
 void job_system_destroy(JobSystem* sys) {

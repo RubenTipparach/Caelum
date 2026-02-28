@@ -8,15 +8,15 @@
 #include "job_system.h"
 
 // ---- Configuration ----
-#define LOD_MAX_DEPTH       16      // Depth 16 = ~8m patches, tess=8 → ~1m hex cells
+#define LOD_MAX_DEPTH       16      // Max subdivision depth (depth 16 ≈ 7m patches)
 #define LOD_MAX_NODES       16384   // Node pool (intermediate + leaf nodes)
 #define LOD_ROOT_COUNT      20      // 20 icosahedron faces
 #define LOD_CHILDREN        4       // Aperture-4 subdivision
-#define LOD_VOXEL_DEPTH     16      // Depth at which we switch to voxel mesh
+#define LOD_VOXEL_DEPTH     13      // Depth at which hex prism voxels begin (~63m patches, ~1m hex radius)
 #define LOD_MAX_UPLOADS_PER_FRAME 64 // Max GPU uploads per frame
-#define LOD_MAX_SPLITS_PER_FRAME 512 // High limit — tree builds fast via force-split
+#define LOD_MAX_SPLITS_PER_FRAME 256 // Tree builds fast; capped at voxel depth anyway
 #define LOD_NUM_WORKERS     4       // Worker threads for mesh generation
-#define LOD_SPLIT_FACTOR    6.0f    // Split when distance < patch_arc * factor (higher = more detail)
+#define LOD_SPLIT_FACTOR    8.0f    // Split when distance < patch_arc * factor (higher = more detail)
 
 // Vertex format for LOD mesh patches (same as existing Vertex)
 typedef struct LodVertex {

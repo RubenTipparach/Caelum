@@ -62,6 +62,8 @@ static struct {
     GameState state;
     int loading_phase;  // 0 = spawn thread, 1 = wait for planet_init, 2 = render_init, 3 = LOD loading
     bool screenshot_requested;
+    uint64_t load_start_time;   // Benchmark: time when loading started
+    int load_frame_count;       // Benchmark: frames spent in loading phase 3
 
     // Background loading
     PlanetInitTask init_task;
@@ -302,6 +304,7 @@ static void frame(void) {
         }
         if (app.loading_phase == 3) {
             // Phase 3: pump LOD tree until enough patches are ACTIVE
+            app.load_frame_count++;
             camera_update(&app.camera, &app.planet, &app.renderer.lod_tree, dt);
 
             HMM_Mat4 vp = HMM_MulM4(app.camera.proj, app.camera.view);
@@ -319,8 +322,9 @@ static void frame(void) {
 
             // Transition once we have some patches and no pending jobs
             if ((active >= 20 && pending == 0) || active >= 50) {
-                printf("[GAME] Terrain ready: %d patches, %d vertices. Starting game.\n",
-                    active, total_verts);
+                double load_ms = stm_ms(stm_diff(stm_now(), app.load_start_time));
+                printf("[GAME] Terrain ready: %d patches, %d vertices. Load time: %.0fms (%d frames). Starting game.\n",
+                    active, total_verts, load_ms, app.load_frame_count);
                 fflush(stdout);
                 app.state = STATE_PLAYING;
             }
@@ -351,6 +355,8 @@ static void event(const sapp_event* ev) {
         if (ev->type == SAPP_EVENTTYPE_KEY_DOWN) {
             if (ev->key_code == SAPP_KEYCODE_1) {
                 LOG(GAME, "Starting single player...\n");
+                app.load_start_time = stm_now();
+                app.load_frame_count = 0;
                 start_loading();
                 return;
             }
