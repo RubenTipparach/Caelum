@@ -40,6 +40,7 @@ add_executable(hex-planets
     src/render.c
     src/atmosphere.c
     src/lod.c
+    src/hex_terrain.c
     src/job_system.c
     src/math_utils.c
     src/screenshot.c

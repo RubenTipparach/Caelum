@@ -7,6 +7,7 @@
 #include "camera.h"
 #include "atmosphere.h"
 #include "lod.h"
+#include "hex_terrain.h"
 
 typedef struct Renderer {
     // Planet rendering
@@ -24,6 +25,9 @@ typedef struct Renderer {
     // LOD tree (large-scale planet rendering)
     LodTree lod_tree;
     bool show_lod_debug;    // L key: color patches by LOD depth + show depth stats
+
+    // Hex terrain (close-range voxel grid)
+    HexTerrain hex_terrain;
 
     // Common
     sg_pass_action pass_action;

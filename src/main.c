@@ -188,10 +188,6 @@ static int frame_count = 0;
 
 static void frame(void) {
     frame_count++;
-    if (frame_count <= 3) {
-        printf("[GAME] frame %d, state=%d\n", frame_count, app.state);
-        fflush(stdout);
-    }
 
     uint64_t now = stm_now();
     float dt = (float)stm_sec(stm_diff(now, app.last_time));
@@ -243,7 +239,7 @@ static void frame(void) {
     if (app.state == STATE_LOADING) {
         if (app.loading_phase == 0) {
             // Phase 0: spawn background thread for planet_init
-            printf("[GAME] Spawning planet_init thread (subdivision=64)...\n");
+            printf("[GAME] PHASE 0 ENTER: spawning planet_init thread\n");
             fflush(stdout);
 
             app.init_task.planet = &app.planet;
@@ -256,6 +252,7 @@ static void frame(void) {
             pthread_create(&app.init_thread, NULL, planet_init_thread, &app.init_task);
 #endif
             app.loading_phase = 1;
+            printf("[GAME] PHASE 0 DONE: thread spawned, moving to phase 1\n"); fflush(stdout);
             draw_loading_screen("Generating planet...", 0, 0, 0);
             return;
         }
@@ -269,7 +266,7 @@ static void frame(void) {
 #else
                 pthread_join(app.init_thread, NULL);
 #endif
-                printf("[GAME] Planet ready: %d cells\n", app.planet.cell_count);
+                printf("[GAME] PHASE 1 DONE: planet ready, %d cells, moving to phase 2\n", app.planet.cell_count);
                 fflush(stdout);
                 app.loading_phase = 2;
             }
@@ -278,7 +275,9 @@ static void frame(void) {
         }
         if (app.loading_phase == 2) {
             // Phase 2: render_init (GPU resources — must be on main thread)
+            printf("[GAME] PHASE 2 ENTER: calling render_init...\n"); fflush(stdout);
             render_init(&app.renderer, &app.planet, &app.camera);
+            printf("[GAME] PHASE 2: render_init done\n"); fflush(stdout);
 
             // Position camera above the actual terrain at spawn point
             HMM_Vec3 spawn_dir = (HMM_Vec3){{0.0f, 1.0f, 0.0f}};
@@ -295,7 +294,7 @@ static void frame(void) {
             app.renderer.lod_tree.world_origin[1] = app.camera.pos_d[1];
             app.renderer.lod_tree.world_origin[2] = app.camera.pos_d[2];
 
-            printf("[GAME] Camera at (0, %.0f, 0), origin set, LOD loading...\n", surface_r);
+            printf("[GAME] PHASE 2 DONE: camera at (0, %.0f, 0), origin set, moving to phase 3\n", surface_r);
             fflush(stdout);
 
             app.loading_phase = 3;
@@ -303,7 +302,7 @@ static void frame(void) {
             return;
         }
         if (app.loading_phase == 3) {
-            // Phase 3: pump LOD tree until enough patches are ACTIVE
+            // Phase 3: one update+upload per frame, tree builds progressively
             app.load_frame_count++;
             camera_update(&app.camera, &app.planet, &app.renderer.lod_tree, dt);
 
@@ -314,17 +313,24 @@ static void frame(void) {
             int active = lod_tree_active_leaves(&app.renderer.lod_tree);
             int total_verts = app.renderer.lod_tree.total_vertex_count;
             int pending = job_system_pending(app.renderer.lod_tree.jobs);
+            printf("[LOAD] frame %d: %d patches, %d pending, %dk verts\n",
+                app.load_frame_count, active, pending, total_verts / 1000);
+            fflush(stdout);
 
-            // Show loading progress
+            // Show loading progress with detail
             int display_total = active + pending;
             if (display_total < 100) display_total = 100;
-            draw_loading_screen("Building terrain...", active, display_total, total_verts);
+            double elapsed_ms = stm_ms(stm_diff(stm_now(), app.load_start_time));
+            char status_buf[128];
+            snprintf(status_buf, sizeof(status_buf),
+                "Building terrain... (%d patches, %d pending, %.1fs)",
+                active, pending, elapsed_ms / 1000.0);
+            draw_loading_screen(status_buf, active, display_total, total_verts);
 
-            // Transition once we have some patches and no pending jobs
+            // Transition once we have enough patches and workers are idle
             if ((active >= 20 && pending == 0) || active >= 50) {
-                double load_ms = stm_ms(stm_diff(stm_now(), app.load_start_time));
                 printf("[GAME] Terrain ready: %d patches, %d vertices. Load time: %.0fms (%d frames). Starting game.\n",
-                    active, total_verts, load_ms, app.load_frame_count);
+                    active, total_verts, elapsed_ms, app.load_frame_count);
                 fflush(stdout);
                 app.state = STATE_PLAYING;
             }
@@ -333,15 +339,32 @@ static void frame(void) {
     }
 
     // STATE_PLAYING
-    camera_update(&app.camera, &app.planet, &app.renderer.lod_tree, dt);
+    {
+        uint64_t t_frame_start = stm_now();
 
-    // Floating origin: recenter if camera has drifted far from current origin
-    lod_tree_update_origin(&app.renderer.lod_tree, app.camera.pos_d);
+        camera_update(&app.camera, &app.planet, &app.renderer.lod_tree, dt);
+        uint64_t t_cam = stm_now();
 
-    // Re-upload mesh if planet was modified or player moved far enough
-    render_update_mesh(&app.renderer, &app.planet, &app.camera);
+        // Floating origin: recenter if camera has drifted far from current origin
+        lod_tree_update_origin(&app.renderer.lod_tree, app.camera.pos_d);
 
-    render_frame(&app.renderer, &app.camera, dt);
+        // Re-upload mesh if planet was modified or player moved far enough
+        render_update_mesh(&app.renderer, &app.planet, &app.camera);
+        uint64_t t_update = stm_now();
+
+        render_frame(&app.renderer, &app.camera, dt);
+        uint64_t t_render = stm_now();
+
+        double frame_ms = stm_ms(stm_diff(t_render, t_frame_start));
+        if (frame_ms > 33.0) {
+            printf("[GAME] SLOW frame: %.1fms (cam=%.1f, update=%.1f, render=%.1f)\n",
+                frame_ms,
+                stm_ms(stm_diff(t_cam, t_frame_start)),
+                stm_ms(stm_diff(t_update, t_cam)),
+                stm_ms(stm_diff(t_render, t_update)));
+            fflush(stdout);
+        }
+    }
 
     // Screenshot: capture after render_frame (which calls sg_commit)
     if (app.screenshot_requested) {
@@ -354,7 +377,7 @@ static void event(const sapp_event* ev) {
     if (app.state == STATE_MENU) {
         if (ev->type == SAPP_EVENTTYPE_KEY_DOWN) {
             if (ev->key_code == SAPP_KEYCODE_1) {
-                LOG(GAME, "Starting single player...\n");
+                printf("[GAME] KEY '1' PRESSED - starting single player\n"); fflush(stdout);
                 app.load_start_time = stm_now();
                 app.load_frame_count = 0;
                 start_loading();
