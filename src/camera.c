@@ -231,18 +231,19 @@ void camera_update(Camera* cam, Planet* planet, const LodTree* lod, float dt) {
     }
 
     // ---- Cap jetpack speed by altitude ----
-    // <1km: max 25x, 1-5km: max 200x, 5-200km: max 500x, >200km: unlimited
+    // <1km: max 25x, 1-5km: max 200x, 5-50km: max 500x, >50km: unlimited
+    // Once you drop below 50km, speed is clamped to the tier cap.
     {
         float altitude = pos_len - current_ground_r;
         float max_mult;
-        if (altitude < 1000.0f) {
-            max_mult = 25.0f;
-        } else if (altitude < 5000.0f) {
-            max_mult = 200.0f;
-        } else if (altitude < 200000.0f) {
+        if (altitude >= 50000.0f) {
+            max_mult = 1e9f;  // unlimited above 50km
+        } else if (altitude >= 5000.0f) {
             max_mult = 500.0f;
+        } else if (altitude >= 1000.0f) {
+            max_mult = 200.0f;
         } else {
-            max_mult = 1e9f;  // effectively unlimited
+            max_mult = 25.0f;
         }
         if (cam->jetpack_speed_mult > max_mult) {
             cam->jetpack_speed_mult = max_mult;

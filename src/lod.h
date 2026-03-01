@@ -110,6 +110,14 @@ typedef struct LodTree {
     // patch_distance < suppress_range are skipped during rendering.
     float suppress_range;
 
+    // Shared hex tangent frame — all depth-13 patches use this single frame
+    // so hex grids are globally consistent (no seams between patches).
+    // Re-anchored when camera drifts far from frame center.
+    HMM_Vec3 hex_frame_origin;   // unit vector: tangent point on sphere
+    HMM_Vec3 hex_frame_east;     // tangent plane X axis
+    HMM_Vec3 hex_frame_north;    // tangent plane Z axis
+    bool hex_frame_valid;
+
     // Stats
     int active_leaf_count;
     int total_vertex_count;

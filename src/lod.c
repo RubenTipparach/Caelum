@@ -32,6 +32,11 @@ typedef struct MeshGenJob {
     int seed;
     float origin[3];  // Floating origin — subtract from world positions
 
+    // Shared hex tangent frame (copied from LodTree for thread safety)
+    HMM_Vec3 hex_frame_origin;
+    HMM_Vec3 hex_frame_east;
+    HMM_Vec3 hex_frame_north;
+
     // Output (written by worker thread)
     void* vertices;
     int vertex_count;
@@ -631,18 +636,18 @@ static bool point_in_triangle_margin(float px, float pz,
 // Generate hex prism mesh filling a spherical triangle.
 // Each hex gets a quantized height (1m steps), flat cap perpendicular to planet
 // radial direction, and vertical walls where adjacent hexes differ in height.
+// Uses a shared tangent frame (hex_origin/east/north) so all depth-13 patches
+// generate hexes from the same global grid — no seams between patches.
 // Outputs HexVertex[] (pos + normal + uv) for rendering with hex terrain pipeline.
 static void generate_hex_mesh_for_triangle(
     const SphericalTriangle* tri, float planet_radius, int seed,
+    HMM_Vec3 hex_origin, HMM_Vec3 hex_east, HMM_Vec3 hex_north,
     HexVertex** out_vertices, int* out_count)
 {
-    // 1. Compute local tangent frame at triangle center
-    HMM_Vec3 center = tri->center;
-    HMM_Vec3 world_y = {{0.0f, 1.0f, 0.0f}};
-    if (fabsf(vec3_dot(center, world_y)) > 0.99f)
-        world_y = (HMM_Vec3){{1.0f, 0.0f, 0.0f}};
-    HMM_Vec3 east = vec3_normalize(vec3_cross(world_y, center));
-    HMM_Vec3 north = vec3_normalize(vec3_cross(center, east));
+    // 1. Use shared tangent frame (same for ALL depth-13 patches → seamless tiling)
+    HMM_Vec3 center = hex_origin;  // frame center, NOT per-triangle center
+    HMM_Vec3 east = hex_east;
+    HMM_Vec3 north = hex_north;
 
     // 2. Project triangle vertices to 2D tangent plane
     float tvx[3], tvz[3];
@@ -661,18 +666,26 @@ static void generate_hex_mesh_for_triangle(
     float min_z = fminf(tvz[0], fminf(tvz[1], tvz[2])) - margin;
     float max_z = fmaxf(tvz[0], fmaxf(tvz[1], tvz[2])) + margin;
 
-    // 4. Convert to hex grid column/row range
-    int col_min = (int)floorf(min_x / LOD_HEX_COL_SPACING);
-    int col_max = (int)ceilf(max_x / LOD_HEX_COL_SPACING);
-    int row_min = (int)floorf(min_z / LOD_HEX_ROW_SPACING) - 1;
-    int row_max = (int)ceilf(max_z / LOD_HEX_ROW_SPACING) + 1;
-
-    // 5. Create noise states
+    // 4. Create noise states
     fnl_state noise = create_terrain_noise(seed);
     fnl_state warp = create_warp_noise(seed);
     fnl_state detail = create_detail_noise(seed);
 
     HMM_Vec3 center_scaled = vec3_scale(center, planet_radius);
+
+    // 5. Column/row range from bounding box.
+    // All patches share the same tangent frame, so col=0/row=0 maps to the
+    // frame center for every patch.  Simple direct grid enumeration works.
+    int col_min = (int)floorf(min_x / LOD_HEX_COL_SPACING);
+    int col_max = (int)ceilf(max_x / LOD_HEX_COL_SPACING);
+    int row_min = (int)floorf(min_z / LOD_HEX_ROW_SPACING) - 1;
+    int row_max = (int)ceilf(max_z / LOD_HEX_ROW_SPACING) + 1;
+
+    // Helper: convert (col, row) to tangent-plane position (hx, hz).
+    #define HEX_POS(col, row, hx, hz) do { \
+        (hx) = (float)(col) * LOD_HEX_COL_SPACING; \
+        (hz) = (((col) & 1) ? ((row) + 0.5f) : (float)(row)) * LOD_HEX_ROW_SPACING; \
+    } while(0)
 
     // 6. Phase 1: Build height map — sample terrain at hex centers, quantize
     int grid_cols = col_max - col_min + 1;
@@ -684,8 +697,8 @@ static void generate_hex_mesh_for_triangle(
 
     for (int col = col_min; col <= col_max; col++) {
         for (int row = row_min; row <= row_max; row++) {
-            float hx = col * LOD_HEX_COL_SPACING;
-            float hz = ((col & 1) ? (row + 0.5f) : (float)row) * LOD_HEX_ROW_SPACING;
+            float hx, hz;
+            HEX_POS(col, row, hx, hz);
             if (!point_in_triangle_margin(hx, hz, tvx, tvz, margin))
                 continue;
 
@@ -715,8 +728,8 @@ static void generate_hex_mesh_for_triangle(
                 continue;
             }
 
-            float hx = col * LOD_HEX_COL_SPACING;
-            float hz = ((col & 1) ? (row + 0.5f) : (float)row) * LOD_HEX_ROW_SPACING;
+            float hx, hz;
+            HEX_POS(col, row, hx, hz);
             int h = hm_heights[gi];
 
             // Accumulate gradient from neighbor height differences
@@ -730,8 +743,8 @@ static void generate_hex_mesh_for_triangle(
                 int ni = (ncol - col_min) * grid_rows + (nrow - row_min);
                 if (hm_heights[ni] == INT16_MIN) continue;
 
-                float nhx = ncol * LOD_HEX_COL_SPACING;
-                float nhz = ((ncol & 1) ? (nrow + 0.5f) : (float)nrow) * LOD_HEX_ROW_SPACING;
+                float nhx, nhz;
+                HEX_POS(ncol, nrow, nhx, nhz);
                 float dx = nhx - hx;
                 float dz = nhz - hz;
                 float dh = (float)(hm_heights[ni] - h);
@@ -775,8 +788,8 @@ static void generate_hex_mesh_for_triangle(
             int cap_atlas_idx = hm_atlas[gi];
             HMM_Vec3 slope_normal = hm_slopes[gi];
 
-            float hx = col * LOD_HEX_COL_SPACING;
-            float hz = ((col & 1) ? (row + 0.5f) : (float)row) * LOD_HEX_ROW_SPACING;
+            float hx, hz;
+            HEX_POS(col, row, hx, hz);
 
             // Hex center direction = planet radial up
             HMM_Vec3 cdir = vec3_normalize(
@@ -810,23 +823,18 @@ static void generate_hex_mesh_for_triangle(
                     hex_uvs[0], hex_uvs[i + 1], hex_uvs[i + 2]);
             }
 
-            // ---- Walls + boundary skirts ----
+            // ---- Walls: check 6 neighbors ----
             for (int dir = 0; dir < 6; dir++) {
                 int ncol, nrow;
                 lod_hex_neighbor(col, row, dir, &ncol, &nrow);
 
-                // Look up neighbor height — boundary hexes get a skirt
-                bool boundary = (ncol < col_min || ncol > col_max ||
-                                 nrow < row_min || nrow > row_max);
-                int nh = h;
-                if (!boundary) {
-                    int ni = (ncol - col_min) * grid_rows + (nrow - row_min);
-                    if (hm_heights[ni] == INT16_MIN)
-                        boundary = true;
-                    else
-                        nh = hm_heights[ni];
-                }
-                if (boundary) nh = h - 3;  // boundary skirt: drop 3m to fill seams
+                // Look up neighbor height in grid
+                if (ncol < col_min || ncol > col_max ||
+                    nrow < row_min || nrow > row_max)
+                    continue;  // outside grid — skip (shared frame means no seams)
+                int ni = (ncol - col_min) * grid_rows + (nrow - row_min);
+                if (hm_heights[ni] == INT16_MIN) continue;  // invalid neighbor
+                int nh = hm_heights[ni];
                 if (h <= nh) continue;  // neighbor same or taller — no wall
 
                 // Edge vertices for this wall direction
@@ -884,6 +892,7 @@ static void generate_hex_mesh_for_triangle(
     free(hm_heights);
     free(hm_atlas);
     free(hm_slopes);
+    #undef HEX_POS
 }
 
 // Generate mesh for a coarse node (tessellated spherical triangle).
@@ -1082,6 +1091,7 @@ static void mesh_gen_worker(void* data) {
         int hex_count = 0;
         generate_hex_mesh_for_triangle(
             &job->tri, job->planet_radius, job->seed,
+            job->hex_frame_origin, job->hex_frame_east, job->hex_frame_north,
             &hex_verts, &hex_count);
         job->vertices = hex_verts;
         job->vertex_count = hex_count;
@@ -1115,6 +1125,7 @@ static void generate_node_mesh(LodTree* tree, LodNode* node) {
         int hex_count = 0;
         generate_hex_mesh_for_triangle(
             &node->tri, tree->planet_radius, tree->seed,
+            tree->hex_frame_origin, tree->hex_frame_east, tree->hex_frame_north,
             &hex_verts, &hex_count);
         node->cpu_vertices = hex_verts;
         node->cpu_vertex_count = hex_count;
@@ -1155,6 +1166,9 @@ static bool submit_mesh_job(LodTree* tree, int node_idx) {
     job->origin[0] = (float)tree->world_origin[0];
     job->origin[1] = (float)tree->world_origin[1];
     job->origin[2] = (float)tree->world_origin[2];
+    job->hex_frame_origin = tree->hex_frame_origin;
+    job->hex_frame_east = tree->hex_frame_east;
+    job->hex_frame_north = tree->hex_frame_north;
     job->node_index = node_idx;
     job->vertices = NULL;
     job->vertex_count = 0;
@@ -1507,6 +1521,32 @@ void lod_tree_update(LodTree* tree, HMM_Vec3 camera_pos, HMM_Mat4 view_proj) {
     (void)view_proj;
     tree->camera_pos = camera_pos;
     tree->splits_this_frame = 0;
+
+    // Update shared hex tangent frame.
+    // All depth-13 patches use this single frame so their hex grids tile seamlessly.
+    // Re-anchor when camera drifts ~2km from current frame center (well beyond the
+    // ~1.3km depth-13 visible range, so old patches have naturally cycled out by then).
+    {
+        float cam_r = sqrtf(vec3_dot(camera_pos, camera_pos));
+        if (cam_r < 1.0f) cam_r = 1.0f;
+        HMM_Vec3 cam_dir = vec3_scale(camera_pos, 1.0f / cam_r);
+
+        bool need_reanchor = !tree->hex_frame_valid;
+        if (!need_reanchor) {
+            float d = vec3_dot(cam_dir, tree->hex_frame_origin);
+            // cos(angle) < 0.999997 ≈ 0.14° ≈ 2km at 800km radius
+            if (d < 0.999997f) need_reanchor = true;
+        }
+        if (need_reanchor) {
+            tree->hex_frame_origin = cam_dir;
+            HMM_Vec3 wy = {{0.0f, 1.0f, 0.0f}};
+            if (fabsf(vec3_dot(cam_dir, wy)) > 0.99f)
+                wy = (HMM_Vec3){{1.0f, 0.0f, 0.0f}};
+            tree->hex_frame_east = vec3_normalize(vec3_cross(wy, cam_dir));
+            tree->hex_frame_north = vec3_normalize(vec3_cross(cam_dir, tree->hex_frame_east));
+            tree->hex_frame_valid = true;
+        }
+    }
 
     // Process completed async jobs first (transfers mesh data to nodes)
     process_completed_jobs(tree);
