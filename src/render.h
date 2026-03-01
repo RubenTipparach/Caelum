@@ -8,6 +8,7 @@
 #include "atmosphere.h"
 #include "lod.h"
 #include "hex_terrain.h"
+#include "config.h"
 
 // ---- Profiler stats (F3 overlay) ----
 typedef struct ProfileStats {
@@ -74,6 +75,20 @@ typedef struct Renderer {
     float fps_accumulator;
     int fps_frame_count;
     float display_fps;
+
+    // Visual config (config.yaml, hot-reloadable with R key)
+    VisualConfig visual_config;
+
+    // Hex terrain texture pipeline
+    sg_pipeline hex_pip;
+    sg_image hex_atlas_img;
+    sg_view hex_atlas_view;
+    sg_sampler hex_atlas_smp;
+
+    // Hex selection highlight
+    sg_pipeline highlight_pip;
+    sg_buffer highlight_buf;
+    HexHitResult hex_selection;
 
     // Profiler (F3)
     bool show_profiler;

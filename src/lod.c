@@ -160,25 +160,26 @@ static HMM_Vec3 perturb_color(HMM_Vec3 base, fnl_state* color_noise, HMM_Vec3 un
     }};
 }
 
-// Get terrain color based on height in meters above planet_radius
+// Get terrain color based on height in meters above planet_radius.
+// Colors matched to hex terrain texture atlas average colors for seamless LOD transitions.
 static HMM_Vec3 terrain_color_m(float height_m) {
     float rel = height_m - TERRAIN_SEA_LEVEL_M;
     if (height_m < TERRAIN_SEA_LEVEL_M) {
-        // Deeper ocean = darker blue
+        // Deeper ocean = darker blue (matched to water.png avg: 0.12, 0.21, 0.39)
         float depth_factor = fminf(1.0f, -rel / 2000.0f);
-        return (HMM_Vec3){{0.05f + 0.10f * (1.0f - depth_factor),
-                           0.15f + 0.20f * (1.0f - depth_factor),
-                           0.40f + 0.25f * (1.0f - depth_factor)}};
+        return (HMM_Vec3){{0.06f + 0.06f * (1.0f - depth_factor),
+                           0.10f + 0.11f * (1.0f - depth_factor),
+                           0.25f + 0.14f * (1.0f - depth_factor)}};
     } else if (rel < 200.0f) {
-        return (HMM_Vec3){{0.76f, 0.70f, 0.40f}};  // Sand/beach
+        return (HMM_Vec3){{0.94f, 0.84f, 0.77f}};  // Sand (matched to sand.png)
     } else if (rel < 1500.0f) {
-        return (HMM_Vec3){{0.20f, 0.55f, 0.15f}};  // Grass/forest
+        return (HMM_Vec3){{0.07f, 0.58f, 0.35f}};  // Grass (matched to grass.png)
     } else if (rel < 3000.0f) {
-        return (HMM_Vec3){{0.45f, 0.42f, 0.38f}};  // Rock/stone
+        return (HMM_Vec3){{0.46f, 0.45f, 0.45f}};  // Rock (matched to rocks.png)
     } else if (rel < 4500.0f) {
-        return (HMM_Vec3){{0.55f, 0.53f, 0.50f}};  // High stone
+        return (HMM_Vec3){{0.50f, 0.50f, 0.50f}};  // High stone
     } else {
-        return (HMM_Vec3){{0.90f, 0.95f, 1.00f}};  // Snow/ice
+        return (HMM_Vec3){{0.44f, 0.77f, 0.97f}};  // Ice (matched to ice.png)
     }
 }
 
@@ -186,15 +187,15 @@ static HMM_Vec3 terrain_color_m(float height_m) {
 static HMM_Vec3 terrain_color(int height, int sea_level) {
     int rel = height - sea_level;
     if (height < sea_level) {
-        return (HMM_Vec3){{0.15f, 0.35f, 0.65f}};
+        return (HMM_Vec3){{0.12f, 0.21f, 0.39f}};  // Water
     } else if (rel <= 1) {
-        return (HMM_Vec3){{0.76f, 0.70f, 0.40f}};  // Sand
+        return (HMM_Vec3){{0.94f, 0.84f, 0.77f}};  // Sand
     } else if (rel <= 6) {
-        return (HMM_Vec3){{0.20f, 0.60f, 0.15f}};  // Grass
+        return (HMM_Vec3){{0.07f, 0.58f, 0.35f}};  // Grass
     } else if (rel <= 12) {
-        return (HMM_Vec3){{0.50f, 0.50f, 0.50f}};  // Stone
+        return (HMM_Vec3){{0.46f, 0.45f, 0.45f}};  // Stone
     } else {
-        return (HMM_Vec3){{0.90f, 0.95f, 1.00f}};  // Ice
+        return (HMM_Vec3){{0.44f, 0.77f, 0.97f}};  // Ice
     }
 }
 
@@ -219,15 +220,15 @@ static VoxelType compute_voxel_type(int layer, int terrain_height, int sea_level
     return VOXEL_ICE;
 }
 
-// Get color for a voxel type (thread-safe, matches planet.c voxel_color)
+// Get color for a voxel type (thread-safe, matched to hex terrain texture atlas)
 static HMM_Vec3 voxel_type_color(VoxelType type) {
     switch (type) {
-        case VOXEL_WATER: return (HMM_Vec3){{0.15f, 0.35f, 0.65f}};
-        case VOXEL_SAND:  return (HMM_Vec3){{0.76f, 0.70f, 0.40f}};
-        case VOXEL_DIRT:  return (HMM_Vec3){{0.45f, 0.32f, 0.18f}};
-        case VOXEL_GRASS: return (HMM_Vec3){{0.20f, 0.60f, 0.15f}};
-        case VOXEL_STONE: return (HMM_Vec3){{0.50f, 0.50f, 0.50f}};
-        case VOXEL_ICE:   return (HMM_Vec3){{0.90f, 0.95f, 1.00f}};
+        case VOXEL_WATER: return (HMM_Vec3){{0.12f, 0.21f, 0.39f}};
+        case VOXEL_SAND:  return (HMM_Vec3){{0.94f, 0.84f, 0.77f}};
+        case VOXEL_DIRT:  return (HMM_Vec3){{0.59f, 0.29f, 0.24f}};
+        case VOXEL_GRASS: return (HMM_Vec3){{0.07f, 0.58f, 0.35f}};
+        case VOXEL_STONE: return (HMM_Vec3){{0.46f, 0.45f, 0.45f}};
+        case VOXEL_ICE:   return (HMM_Vec3){{0.44f, 0.77f, 0.97f}};
         default:          return (HMM_Vec3){{1.0f, 0.0f, 1.0f}};  // Magenta = error
     }
 }

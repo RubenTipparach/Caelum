@@ -5,7 +5,7 @@
 #include <stdint.h>
 #include "HandmadeMath.h"
 #include "sokol_gfx.h"
-#include "lod.h"
+#include "hex_vertex.h"
 #include "job_system.h"
 
 // ---- Configuration ----
@@ -42,7 +42,7 @@ typedef struct HexChunk {
     int gpu_vertex_count;
 
     // CPU mesh (generated, then uploaded)
-    LodVertex* cpu_vertices;
+    HexVertex* cpu_vertices;
     int cpu_vertex_count;
 
     void* pending_job;          // HexMeshJob* (opaque)
@@ -84,6 +84,16 @@ typedef struct HexTerrain {
     int chunks_rendered;
 } HexTerrain;
 
+// ---- Hex selection / interaction ----
+typedef struct HexHitResult {
+    bool valid;              // True if a hex was hit
+    int chunk_index;         // Index into ht->chunks[]
+    int col, row;            // Local column/row within chunk
+    int gcol, grow;          // Global grid coordinates
+    int height;              // Terrain height at hit hex (in layers)
+    uint8_t type;            // VoxelType of surface block
+} HexHitResult;
+
 // ---- API ----
 
 void hex_terrain_init(HexTerrain* ht, float planet_radius, float layer_thickness,
@@ -98,8 +108,9 @@ void hex_terrain_update(HexTerrain* ht, HMM_Vec3 camera_pos,
 // Upload CPU meshes to GPU
 void hex_terrain_upload_meshes(HexTerrain* ht);
 
-// Render all active hex chunks
-void hex_terrain_render(HexTerrain* ht, sg_pipeline pip);
+// Render all active hex chunks (pipeline must be applied by caller)
+void hex_terrain_render(HexTerrain* ht, sg_pipeline pip,
+                        sg_view atlas_view, sg_sampler atlas_smp);
 
 // Check if a world position is within hex terrain range (for LOD suppression)
 bool hex_terrain_covers_position(const HexTerrain* ht, HMM_Vec3 world_pos);
@@ -111,5 +122,21 @@ float hex_terrain_get_range(void);
 // Returns HEX_RANGE when >=80% of active chunks have GPU meshes, 0 otherwise.
 // Use to prevent black holes during chunk generation.
 float hex_terrain_effective_range(const HexTerrain* ht);
+
+// Raycast from camera into hex terrain. Returns hit info.
+HexHitResult hex_terrain_raycast(const HexTerrain* ht, HMM_Vec3 ray_origin,
+                                  HMM_Vec3 ray_dir, float max_dist);
+
+// Remove top layer at the given hex. Marks chunk dirty for remeshing.
+bool hex_terrain_break(HexTerrain* ht, const HexHitResult* hit);
+
+// Place a block on top of the given hex. Marks chunk dirty for remeshing.
+bool hex_terrain_place(HexTerrain* ht, const HexHitResult* hit, uint8_t voxel_type);
+
+// Generate wireframe vertices for a hex selection highlight.
+// Writes 12 float3 vertices (6 line segments) into out_verts (must hold 36 floats).
+// Returns true if successful.
+bool hex_terrain_build_highlight(const HexTerrain* ht, const HexHitResult* hit,
+                                  const double world_origin[3], float* out_verts);
 
 #endif

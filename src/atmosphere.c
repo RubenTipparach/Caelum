@@ -51,7 +51,8 @@ void atmosphere_init(Atmosphere* atmos, AtmosphereConfig config) {
 void atmosphere_render(const Atmosphere* atmos, const sg_bindings* fullscreen_bind,
                        HMM_Vec3 camera_pos, HMM_Vec3 sun_dir,
                        HMM_Vec3 cam_right, HMM_Vec3 cam_up, HMM_Vec3 cam_forward,
-                       float tan_half_fov, float aspect) {
+                       float tan_half_fov, float aspect,
+                       float scale_height) {
     atmosphere_vs_params_t vs = {
         .cam_right   = (HMM_Vec4){{ cam_right.X, cam_right.Y, cam_right.Z, tan_half_fov }},
         .cam_up      = (HMM_Vec4){{ cam_up.X, cam_up.Y, cam_up.Z, aspect }},
@@ -65,7 +66,7 @@ void atmosphere_render(const Atmosphere* atmos, const sg_bindings* fullscreen_bi
         .radii = (HMM_Vec4){{
             atmos->config.planet_radius,
             atmos->config.atmosphere_radius,
-            0.0f, 0.0f
+            scale_height, 0.0f
         }},
         .scatter_coeffs = (HMM_Vec4){{
             atmos->config.rayleigh_scale,

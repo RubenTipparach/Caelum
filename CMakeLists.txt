@@ -45,6 +45,7 @@ add_executable(hex-planets
     src/math_utils.c
     src/screenshot.c
     src/crash_handler.c
+    src/config.c
 )
 
 target_include_directories(hex-planets PRIVATE

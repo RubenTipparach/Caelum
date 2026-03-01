@@ -76,20 +76,15 @@ static struct {
 
 bool log_verbose = false;
 
-// Block interaction: raycast from camera and break/place
+// Block interaction: use hex terrain selection from renderer
 static void interact_break(void) {
-    int hit = planet_raycast(&app.planet, app.camera.position, app.camera.forward, 10.0f);
-    if (hit >= 0) {
-        planet_break_cell(&app.planet, hit);
-    }
+    if (!app.renderer.hex_selection.valid) return;
+    hex_terrain_break(&app.renderer.hex_terrain, &app.renderer.hex_selection);
 }
 
 static void interact_place(void) {
-    int hit = planet_raycast(&app.planet, app.camera.position, app.camera.forward, 10.0f);
-    if (hit >= 0) {
-        HMM_Vec3 hit_point = app.planet.cells[hit].center;
-        planet_place_cell(&app.planet, hit, hit_point);
-    }
+    if (!app.renderer.hex_selection.valid) return;
+    hex_terrain_place(&app.renderer.hex_terrain, &app.renderer.hex_selection, VOXEL_STONE);
 }
 
 static void init(void) {
@@ -233,6 +228,7 @@ static void frame(void) {
         sdtx_puts("Alt+P = screenshot\n");
         sdtx_puts("L = toggle LOD debug colors\n");
         sdtx_puts("V = toggle verbose logs\n");
+        sdtx_puts("R = reload config.yaml\n");
 
         sdtx_draw();
         sg_end_pass();
@@ -416,6 +412,24 @@ static void event(const sapp_event* ev) {
     // Toggle profiler overlay with F3
     if (ev->type == SAPP_EVENTTYPE_KEY_DOWN && ev->key_code == SAPP_KEYCODE_F3) {
         app.renderer.show_profiler = !app.renderer.show_profiler;
+        return;
+    }
+
+    // Hot-reload visual config with R key
+    if (ev->type == SAPP_EVENTTYPE_KEY_DOWN && ev->key_code == SAPP_KEYCODE_R) {
+        VisualConfig new_cfg = config_defaults();
+        if (config_load(&new_cfg, "config.yaml")) {
+            app.renderer.visual_config = new_cfg;
+            // Update atmosphere config from new values
+            float surface_r = app.planet.radius +
+                app.planet.sea_level * app.planet.layer_thickness;
+            app.renderer.atmosphere.config.rayleigh_scale = new_cfg.rayleigh_scale;
+            app.renderer.atmosphere.config.mie_scale = new_cfg.mie_scale;
+            app.renderer.atmosphere.config.mie_g = new_cfg.mie_g;
+            app.renderer.atmosphere.config.sun_intensity = new_cfg.sun_intensity;
+            app.renderer.atmosphere.config.atmosphere_radius =
+                surface_r + new_cfg.atmosphere_height;
+        }
         return;
     }
 

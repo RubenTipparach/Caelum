@@ -6,9 +6,14 @@
 #include "util/sokol_debugtext.h"
 #include "planet.glsl.h"
 #include "sky.glsl.h"
+#include "highlight.glsl.h"
+#include "hex_terrain.glsl.h"
 #include <math.h>
 #include <stdlib.h>
 #include <stdio.h>
+
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -81,10 +86,19 @@ void render_init(Renderer* r, Planet* planet, const Camera* cam) {
         .label = "sky-pipeline",
     });
 
+    // ---- Visual config (config.yaml) ----
+    r->visual_config = config_defaults();
+    config_load(&r->visual_config, "config.yaml");
+
     // ---- Atmosphere ----
     printf("[RENDER] render_init: creating atmosphere...\n"); fflush(stdout);
     float surface_r = planet->radius + planet->sea_level * planet->layer_thickness;
     AtmosphereConfig atmos_config = atmosphere_default_config(surface_r);
+    atmos_config.atmosphere_radius = surface_r + r->visual_config.atmosphere_height;
+    atmos_config.rayleigh_scale = r->visual_config.rayleigh_scale;
+    atmos_config.mie_scale = r->visual_config.mie_scale;
+    atmos_config.mie_g = r->visual_config.mie_g;
+    atmos_config.sun_intensity = r->visual_config.sun_intensity;
     atmosphere_init(&r->atmosphere, atmos_config);
 
     // ---- LOD tree ----
@@ -99,10 +113,7 @@ void render_init(Renderer* r, Planet* planet, const Camera* cam) {
                      planet->sea_level, 42, r->lod_tree.jobs);
     printf("[RENDER] render_init: hex terrain done\n"); fflush(stdout);
 
-    // No LOD suppression — hex terrain sits slightly above LOD (ceilf + surface bias)
-    // so the z-buffer naturally occludes LOD where hex exists. This prevents black
-    // holes during chunk generation and ensures seamless border transitions.
-    r->lod_tree.suppress_range = 0.0f;
+    r->lod_tree.suppress_range = 0.0f;  // Updated dynamically each frame
 
     r->pass_action = (sg_pass_action){
         .colors[0] = {
@@ -119,6 +130,164 @@ void render_init(Renderer* r, Planet* planet, const Camera* cam) {
     r->fps_accumulator = 0.0f;
     r->fps_frame_count = 0;
     r->display_fps = 0.0f;
+
+    // ---- Highlight wireframe pipeline ----
+    printf("[RENDER] render_init: creating highlight pipeline...\n"); fflush(stdout);
+    sg_shader highlight_shd = sg_make_shader(highlight_shader_desc(sg_query_backend()));
+    r->highlight_pip = sg_make_pipeline(&(sg_pipeline_desc){
+        .shader = highlight_shd,
+        .layout = {
+            .attrs = {
+                [ATTR_highlight_a_position] = { .format = SG_VERTEXFORMAT_FLOAT3 },
+            }
+        },
+        .primitive_type = SG_PRIMITIVETYPE_LINES,
+        .depth = {
+            .compare = SG_COMPAREFUNC_LESS_EQUAL,
+            .write_enabled = false,
+        },
+        .cull_mode = SG_CULLMODE_NONE,
+        .colors[0] = {
+            .blend = {
+                .enabled = true,
+                .src_factor_rgb = SG_BLENDFACTOR_SRC_ALPHA,
+                .dst_factor_rgb = SG_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
+                .src_factor_alpha = SG_BLENDFACTOR_ONE,
+                .dst_factor_alpha = SG_BLENDFACTOR_ZERO,
+            }
+        },
+        .label = "highlight-pipeline",
+    });
+    r->highlight_buf = sg_make_buffer(&(sg_buffer_desc){
+        .size = 12 * 3 * sizeof(float),  // 12 vertices * 3 floats
+        .usage.vertex_buffer = true,
+        .usage.stream_update = true,
+        .label = "highlight-vertices",
+    });
+    r->hex_selection.valid = false;
+
+    // ---- Hex terrain textured pipeline ----
+    printf("[RENDER] render_init: loading hex terrain textures...\n"); fflush(stdout);
+    {
+        // Load 9 terrain textures and build atlas
+        // Layout: water, sand, dirt, grass, stone, ice, snow, dirt_grass, dirt_snow
+        const char* tex_files[9] = {
+            "assets/textures/water.png",
+            "assets/textures/sand.png",
+            "assets/textures/dirt.png",
+            "assets/textures/grass.png",
+            "assets/textures/rocks.png",
+            "assets/textures/ice.png",
+            "assets/textures/snow.png",
+            "assets/textures/dirt_grass.png",
+            NULL,  // dirt_snow: generated from dirt+snow blend
+        };
+        const int TILE_SIZE = 16;
+        const int NUM_TILES = 9;
+        const int atlas_w = TILE_SIZE * NUM_TILES;
+        const int atlas_h = TILE_SIZE;
+        unsigned char* atlas_data = (unsigned char*)calloc(atlas_w * atlas_h * 4, 1);
+
+        for (int i = 0; i < NUM_TILES; i++) {
+            if (tex_files[i] == NULL) continue;  // skip generated tiles
+            int w, h, channels;
+            unsigned char* img = stbi_load(tex_files[i], &w, &h, &channels, 4);
+            if (img) {
+                // Blit into atlas at column i*TILE_SIZE
+                int src_w = (w < TILE_SIZE) ? w : TILE_SIZE;
+                int src_h = (h < TILE_SIZE) ? h : TILE_SIZE;
+                for (int y = 0; y < src_h; y++) {
+                    for (int x = 0; x < src_w; x++) {
+                        int dst_idx = ((y * atlas_w) + (i * TILE_SIZE + x)) * 4;
+                        int src_idx = (y * w + x) * 4;
+                        atlas_data[dst_idx + 0] = img[src_idx + 0];
+                        atlas_data[dst_idx + 1] = img[src_idx + 1];
+                        atlas_data[dst_idx + 2] = img[src_idx + 2];
+                        atlas_data[dst_idx + 3] = img[src_idx + 3];
+                    }
+                }
+                stbi_image_free(img);
+                printf("[RENDER]   loaded %s (%dx%d)\n", tex_files[i], w, h);
+            } else {
+                printf("[RENDER]   FAILED to load %s: %s\n", tex_files[i], stbi_failure_reason());
+                // Fill with magenta for missing textures
+                for (int y = 0; y < TILE_SIZE; y++) {
+                    for (int x = 0; x < TILE_SIZE; x++) {
+                        int idx = ((y * atlas_w) + (i * TILE_SIZE + x)) * 4;
+                        atlas_data[idx + 0] = 255;
+                        atlas_data[idx + 1] = 0;
+                        atlas_data[idx + 2] = 255;
+                        atlas_data[idx + 3] = 255;
+                    }
+                }
+            }
+        }
+
+        // Generate dirt_snow (tile 8) by blending dirt (tile 2) and snow (tile 6)
+        // Top half is snowy (70% snow), bottom half is dirty (70% dirt)
+        {
+            int dirt_tile = 2;
+            int snow_tile = 6;
+            int out_tile = 8;
+            for (int y = 0; y < TILE_SIZE; y++) {
+                float snow_blend = (float)y / (float)(TILE_SIZE - 1);  // 0 at top, 1 at bottom
+                snow_blend = 1.0f - snow_blend;  // 1 at top (snowy), 0 at bottom (dirty)
+                snow_blend = snow_blend * 0.6f + 0.2f;  // range [0.2, 0.8]
+                for (int x = 0; x < TILE_SIZE; x++) {
+                    int dirt_idx = ((y * atlas_w) + (dirt_tile * TILE_SIZE + x)) * 4;
+                    int snow_idx = ((y * atlas_w) + (snow_tile * TILE_SIZE + x)) * 4;
+                    int out_idx  = ((y * atlas_w) + (out_tile * TILE_SIZE + x)) * 4;
+                    for (int c = 0; c < 4; c++) {
+                        float d = (float)atlas_data[dirt_idx + c];
+                        float s = (float)atlas_data[snow_idx + c];
+                        atlas_data[out_idx + c] = (unsigned char)(d * (1.0f - snow_blend) + s * snow_blend);
+                    }
+                }
+            }
+            printf("[RENDER]   generated dirt_snow (blended dirt+snow)\n");
+        }
+
+        r->hex_atlas_img = sg_make_image(&(sg_image_desc){
+            .width = atlas_w,
+            .height = atlas_h,
+            .pixel_format = SG_PIXELFORMAT_RGBA8,
+            .data.mip_levels[0] = (sg_range){ atlas_data, (size_t)(atlas_w * atlas_h * 4) },
+            .label = "hex-atlas-image",
+        });
+        free(atlas_data);
+
+        r->hex_atlas_view = sg_make_view(&(sg_view_desc){
+            .texture.image = r->hex_atlas_img,
+            .label = "hex-atlas-view",
+        });
+
+        r->hex_atlas_smp = sg_make_sampler(&(sg_sampler_desc){
+            .min_filter = SG_FILTER_NEAREST,
+            .mag_filter = SG_FILTER_NEAREST,
+            .wrap_u = SG_WRAP_CLAMP_TO_EDGE,
+            .wrap_v = SG_WRAP_CLAMP_TO_EDGE,
+            .label = "hex-atlas-sampler",
+        });
+
+        sg_shader hex_shd = sg_make_shader(hex_terrain_shader_desc(sg_query_backend()));
+        r->hex_pip = sg_make_pipeline(&(sg_pipeline_desc){
+            .shader = hex_shd,
+            .layout = {
+                .attrs = {
+                    [ATTR_hex_terrain_a_position] = { .format = SG_VERTEXFORMAT_FLOAT3 },
+                    [ATTR_hex_terrain_a_normal]   = { .format = SG_VERTEXFORMAT_FLOAT3 },
+                    [ATTR_hex_terrain_a_uv]       = { .format = SG_VERTEXFORMAT_FLOAT2 },
+                }
+            },
+            .depth = {
+                .compare = SG_COMPAREFUNC_LESS_EQUAL,
+                .write_enabled = true,
+            },
+            .cull_mode = SG_CULLMODE_BACK,
+            .face_winding = SG_FACEWINDING_CCW,
+            .label = "hex-terrain-pipeline",
+        });
+    }
 
     printf("[RENDER] All pipelines created\n");
     fflush(stdout);
@@ -146,6 +315,26 @@ void render_update_mesh(Renderer* r, Planet* planet, const Camera* cam) {
         uint64_t t4 = stm_now();
         hex_update_ms = stm_ms(stm_diff(t3, t2));
         hex_upload_ms = stm_ms(stm_diff(t4, t3));
+
+        // Suppress LOD patches where hex terrain has coverage (prevents overlap)
+        r->lod_tree.suppress_range = hex_terrain_effective_range(&r->hex_terrain);
+    } else {
+        r->lod_tree.suppress_range = 0.0f;
+    }
+
+    // Hex selection raycast (every frame)
+    r->hex_selection = hex_terrain_raycast(&r->hex_terrain,
+        cam->position, cam->forward, 10.0f);
+
+    // Build wireframe vertices if selection is valid
+    if (r->hex_selection.valid) {
+        float verts[36];  // 12 vertices * 3 floats
+        if (hex_terrain_build_highlight(&r->hex_terrain, &r->hex_selection,
+                                         r->lod_tree.world_origin, verts)) {
+            sg_update_buffer(r->highlight_buf, &(sg_range){ verts, sizeof(verts) });
+        } else {
+            r->hex_selection.valid = false;
+        }
     }
 
     // Accumulate profiler timings
@@ -211,7 +400,8 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
     // ---- 2. Draw atmosphere (fullscreen, additive blend on top of sky) ----
     atmosphere_render(&r->atmosphere, &r->sky_bind,
                       cam->position, r->sun_direction,
-                      cam_S, cam_U, cam_F, tan_half_fov, aspect);
+                      cam_S, cam_U, cam_F, tan_half_fov, aspect,
+                      r->visual_config.scale_height);
 
     // ---- 3. Draw planet terrain ----
     // Log depth: backend-aware Fcoef and z_bias
@@ -257,7 +447,7 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
             r->sun_direction.X,
             r->sun_direction.Y,
             r->sun_direction.Z,
-            0.0f
+            r->visual_config.fog_scale_height,
         }},
         .camera_pos = (HMM_Vec4){{
             cam->position.X,
@@ -272,6 +462,18 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
             r->atmosphere.config.sun_intensity,
         }},
         .lod_debug = (HMM_Vec4){{0.0f, 0.0f, 0.0f, 0.0f}},
+        .dusk_sun_color = (HMM_Vec4){{
+            r->visual_config.dusk_sun_color.X,
+            r->visual_config.dusk_sun_color.Y,
+            r->visual_config.dusk_sun_color.Z,
+            0.0f,
+        }},
+        .day_sun_color = (HMM_Vec4){{
+            r->visual_config.day_sun_color.X,
+            r->visual_config.day_sun_color.Y,
+            r->visual_config.day_sun_color.Z,
+            0.0f,
+        }},
     };
 
     sg_apply_pipeline(r->pip);
@@ -291,9 +493,49 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
         lod_tree_render(&r->lod_tree, r->pip, vp, NULL, NULL);
     }
 
-    // ---- 3b. Draw hex terrain (close-range voxel grid) ----
-    // Uses same pipeline and uniforms as LOD terrain
-    hex_terrain_render(&r->hex_terrain, r->pip);
+    // ---- 3b. Draw hex terrain (close-range voxel grid, textured) ----
+    sg_apply_pipeline(r->hex_pip);
+    {
+        hex_terrain_vs_params_t hex_vs = {
+            .mvp = vp_terrain,
+            .camera_offset = vs_params.camera_offset,
+            .camera_offset_low = vs_params.camera_offset_low,
+            .log_depth = vs_params.log_depth,
+        };
+        hex_terrain_fs_params_t hex_fs = {
+            .sun_direction = fs_params.sun_direction,
+            .camera_pos = fs_params.camera_pos,
+            .atmos_params = fs_params.atmos_params,
+            .lod_debug = fs_params.lod_debug,
+            .dusk_sun_color = fs_params.dusk_sun_color,
+            .day_sun_color = fs_params.day_sun_color,
+        };
+        sg_apply_uniforms(UB_hex_terrain_vs_params, &SG_RANGE(hex_vs));
+        sg_apply_uniforms(UB_hex_terrain_fs_params, &SG_RANGE(hex_fs));
+    }
+    hex_terrain_render(&r->hex_terrain, r->hex_pip,
+                       r->hex_atlas_view, r->hex_atlas_smp);
+
+    // ---- 3c. Draw hex selection wireframe ----
+    if (r->hex_selection.valid) {
+        sg_apply_pipeline(r->highlight_pip);
+
+        highlight_vs_params_t hl_vs = {
+            .mvp = vp_terrain,
+            .camera_offset = vs_params.camera_offset,
+            .camera_offset_low = vs_params.camera_offset_low,
+            .log_depth = vs_params.log_depth,
+        };
+        highlight_fs_params_t hl_fs = {
+            .color = (HMM_Vec4){{1.0f, 1.0f, 1.0f, 1.0f}},
+        };
+        sg_apply_uniforms(UB_highlight_vs_params, &SG_RANGE(hl_vs));
+        sg_apply_uniforms(UB_highlight_fs_params, &SG_RANGE(hl_fs));
+
+        sg_bindings hl_bind = { .vertex_buffers[0] = r->highlight_buf };
+        sg_apply_bindings(&hl_bind);
+        sg_draw(0, 12, 1);
+    }
 
     // ---- Profiler timing ----
     uint64_t render_end = stm_now();
@@ -450,4 +692,22 @@ void render_shutdown(Renderer* r) {
     hex_terrain_destroy(&r->hex_terrain);
     atmosphere_destroy(&r->atmosphere);
     lod_tree_destroy(&r->lod_tree);
+    if (r->highlight_buf.id != SG_INVALID_ID) {
+        sg_destroy_buffer(r->highlight_buf);
+    }
+    if (r->highlight_pip.id != SG_INVALID_ID) {
+        sg_destroy_pipeline(r->highlight_pip);
+    }
+    if (r->hex_pip.id != SG_INVALID_ID) {
+        sg_destroy_pipeline(r->hex_pip);
+    }
+    if (r->hex_atlas_view.id != SG_INVALID_ID) {
+        sg_destroy_view(r->hex_atlas_view);
+    }
+    if (r->hex_atlas_img.id != SG_INVALID_ID) {
+        sg_destroy_image(r->hex_atlas_img);
+    }
+    if (r->hex_atlas_smp.id != SG_INVALID_ID) {
+        sg_destroy_sampler(r->hex_atlas_smp);
+    }
 }

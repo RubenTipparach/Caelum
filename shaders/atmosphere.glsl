@@ -33,7 +33,7 @@ void main() {
 @fs atmosphere_fs
 layout(binding=1) uniform atmosphere_fs_params {
     vec4 sun_direction;     // xyz = normalized sun direction
-    vec4 radii;             // x = planet_radius, y = atmosphere_radius
+    vec4 radii;             // x = planet_radius, y = atmosphere_radius, z = scale_height
     vec4 scatter_coeffs;    // x = rayleigh_scale, y = mie_scale, z = mie_g, w = sun_intensity
 };
 
@@ -50,9 +50,8 @@ out vec4 frag_color;
 // 680nm (red), 550nm (green), 440nm (blue)
 const vec3 wavelengthsInv4 = vec3(5.602, 9.473, 19.644);
 
-// Scale height: determines how quickly density falls off with altitude
-// 0.25 = density concentrated in lower quarter of atmosphere shell
-const float scaleHeight = 0.25;
+// Scale height: set from uniform radii.z at start of main() (configurable via config.yaml)
+float scaleHeight;
 
 // Simple hash for dithering to reduce banding artifacts
 float hash(vec2 p) {
@@ -105,6 +104,7 @@ float computeOpticalDepth(vec3 rayOrigin, vec3 rayDir, float rayLength,
 }
 
 void main() {
+    scaleHeight = radii.z;
     vec3 rayDir = normalize(view_dir);
     vec3 rayOrigin = v_camera_pos;
     float pRadius = radii.x;
