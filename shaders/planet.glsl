@@ -43,10 +43,12 @@ void main() {
 
 @fs planet_fs
 layout(binding=1) uniform planet_fs_params {
-    vec4 sun_direction;     // xyz = normalized sun dir
+    vec4 sun_direction;     // xyz = normalized sun dir, w = fog_scale_height
     vec4 camera_pos;        // xyz = camera world position (for surface_dir computation)
     vec4 atmos_params;      // x = planet_radius, y = atmos_radius, z = rayleigh_scale, w = sun_intensity
     vec4 lod_debug;         // x = LOD depth (0 = off/normal), y = max_depth for color mapping
+    vec4 dusk_sun_color;    // xyz = warm sunset color (from config.yaml)
+    vec4 day_sun_color;     // xyz = neutral daylight color (from config.yaml)
 };
 
 in vec3 fs_normal;
@@ -71,7 +73,7 @@ void main() {
     // Atmospheric sun tinting: when the sun is low on the local horizon,
     // sunlight passes through more atmosphere, scattering out blue → warm orange.
     float dusk_factor = smoothstep(0.0, 0.35, sun_facing);
-    vec3 sunColor = mix(vec3(1.3, 0.45, 0.12), vec3(1.0, 0.98, 0.95), dusk_factor);
+    vec3 sunColor = mix(dusk_sun_color.xyz, day_sun_color.xyz, dusk_factor);
 
     // ---- Normal-based ambient occlusion (tenebris crevice darkening) ----
     // Faces pointing outward (aligned with surface_dir) get full ambient.
@@ -124,7 +126,7 @@ void main() {
     // Physically-based: extinction dims terrain, inscatter adds sky-colored haze.
     // Naturally blue by day, warm orange at dusk, dark at night.
     const vec3 wl4 = vec3(5.602, 9.473, 19.644); // (1/wavelength)^4 for Rayleigh
-    const float fogScaleH = 0.25;
+    float fogScaleH = sun_direction.w;  // from config.yaml via uniform
 
     float pR = atmos_params.x;
     float aR = atmos_params.y;

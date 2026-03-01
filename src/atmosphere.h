@@ -29,7 +29,8 @@ void atmosphere_init(Atmosphere* atmos, AtmosphereConfig config);
 void atmosphere_render(const Atmosphere* atmos, const sg_bindings* fullscreen_bind,
                        HMM_Vec3 camera_pos, HMM_Vec3 sun_dir,
                        HMM_Vec3 cam_right, HMM_Vec3 cam_up, HMM_Vec3 cam_forward,
-                       float tan_half_fov, float aspect);
+                       float tan_half_fov, float aspect,
+                       float scale_height);
 
 void atmosphere_destroy(Atmosphere* atmos);
 

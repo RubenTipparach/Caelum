@@ -1,4 +1,5 @@
 #include "hex_terrain.h"
+#include "hex_vertex.h"
 #include "math_utils.h"
 #include "planet.h"
 #include "log_config.h"
@@ -146,27 +147,54 @@ static VoxelType ht_voxel_type(float height_m) {
     return VOXEL_ICE;
 }
 
-static HMM_Vec3 ht_voxel_color(VoxelType type) {
+// ---- Texture atlas mapping ----
+// Atlas layout: 9 tiles (water, sand, dirt, grass, stone, ice, snow, dirt_grass, dirt_snow)
+#define HEX_ATLAS_TILES 9
+
+// Atlas indices
+#define ATLAS_WATER      0
+#define ATLAS_SAND       1
+#define ATLAS_DIRT       2
+#define ATLAS_GRASS      3
+#define ATLAS_STONE      4
+#define ATLAS_ICE        5
+#define ATLAS_SNOW       6
+#define ATLAS_DIRT_GRASS  7
+#define ATLAS_DIRT_SNOW   8
+
+// Get atlas index for top face of a voxel type
+static int voxel_top_atlas(VoxelType type) {
     switch (type) {
-        case VOXEL_WATER: return (HMM_Vec3){{0.15f, 0.35f, 0.65f}};
-        case VOXEL_SAND:  return (HMM_Vec3){{0.76f, 0.70f, 0.40f}};
-        case VOXEL_DIRT:  return (HMM_Vec3){{0.45f, 0.32f, 0.18f}};
-        case VOXEL_GRASS: return (HMM_Vec3){{0.20f, 0.60f, 0.15f}};
-        case VOXEL_STONE: return (HMM_Vec3){{0.50f, 0.50f, 0.50f}};
-        case VOXEL_ICE:   return (HMM_Vec3){{0.90f, 0.95f, 1.00f}};
-        default:          return (HMM_Vec3){{1.0f, 0.0f, 1.0f}};
+        case VOXEL_WATER: return ATLAS_WATER;
+        case VOXEL_SAND:  return ATLAS_SAND;
+        case VOXEL_DIRT:  return ATLAS_DIRT;
+        case VOXEL_GRASS: return ATLAS_GRASS;
+        case VOXEL_STONE: return ATLAS_STONE;
+        case VOXEL_ICE:   return ATLAS_ICE;
+        default:          return ATLAS_GRASS;
     }
 }
 
-// Color for exposed side walls (dirt/stone below surface)
-static HMM_Vec3 ht_wall_color(float height_m, float wall_y) {
-    float depth_below_surface = height_m - wall_y;
+// Get atlas index for side (wall) face of a voxel type
+// Grass sides use dirt_grass, ice/snow sides use dirt_snow
+static int voxel_side_atlas(VoxelType type) {
+    switch (type) {
+        case VOXEL_GRASS: return ATLAS_DIRT_GRASS;
+        case VOXEL_ICE:   return ATLAS_DIRT_SNOW;
+        default:          return voxel_top_atlas(type);
+    }
+}
+
+// Wall texture by depth below surface (with per-face grass/snow side logic)
+static int ht_wall_atlas(VoxelType surface_type, float surface_h_m, float wall_y_m) {
+    float depth_below_surface = surface_h_m - wall_y_m;
     if (depth_below_surface < 1.0f) {
-        return ht_voxel_color(ht_voxel_type(height_m));
+        // Top layer of wall — use side texture for this surface type
+        return voxel_side_atlas(surface_type);
     } else if (depth_below_surface < 3.0f) {
-        return ht_voxel_color(VOXEL_DIRT);
+        return ATLAS_DIRT;
     } else {
-        return ht_voxel_color(VOXEL_STONE);
+        return ATLAS_STONE;
     }
 }
 
@@ -233,7 +261,7 @@ typedef struct HexMeshJob {
     // Output
     int16_t heights[HEX_CHUNK_SIZE][HEX_CHUNK_SIZE];
     uint8_t types[HEX_CHUNK_SIZE][HEX_CHUNK_SIZE];
-    LodVertex* vertices;
+    HexVertex* vertices;
     int vertex_count;
 
     // Linkage
@@ -241,38 +269,53 @@ typedef struct HexMeshJob {
     volatile int completed;
 } HexMeshJob;
 
-// ---- Emit triangle helper ----
+// ---- Emit triangle helper (textured) ----
 
-static void hex_emit_tri(LodVertex** verts, int* count, int* cap,
+typedef struct { float u, v; } HexUV;
+
+static void hex_emit_tri(HexVertex** verts, int* count, int* cap,
                           HMM_Vec3 p0, HMM_Vec3 p1, HMM_Vec3 p2,
-                          HMM_Vec3 normal, HMM_Vec3 color) {
-    // Ensure correct winding (CCW from normal side)
+                          HMM_Vec3 winding_normal,
+                          HMM_Vec3 shading_normal,
+                          HexUV uv0, HexUV uv1, HexUV uv2) {
+    // Ensure correct winding (CCW from winding_normal side)
     HMM_Vec3 e1 = vec3_sub(p1, p0);
     HMM_Vec3 e2 = vec3_sub(p2, p0);
     HMM_Vec3 face_n = vec3_cross(e1, e2);
-    if (vec3_dot(face_n, normal) < 0.0f) {
+    if (vec3_dot(face_n, winding_normal) < 0.0f) {
         HMM_Vec3 tmp = p1; p1 = p2; p2 = tmp;
+        HexUV utmp = uv1; uv1 = uv2; uv2 = utmp;
     }
 
     if (*count + 3 > *cap) {
         *cap = (*cap) * 2;
-        *verts = (LodVertex*)realloc(*verts, *cap * sizeof(LodVertex));
+        *verts = (HexVertex*)realloc(*verts, *cap * sizeof(HexVertex));
     }
-    LodVertex* v = &(*verts)[*count];
+    HexVertex* v = &(*verts)[*count];
 
     v[0].pos[0] = p0.X; v[0].pos[1] = p0.Y; v[0].pos[2] = p0.Z;
-    v[0].normal[0] = normal.X; v[0].normal[1] = normal.Y; v[0].normal[2] = normal.Z;
-    v[0].color[0] = color.X; v[0].color[1] = color.Y; v[0].color[2] = color.Z;
+    v[0].normal[0] = shading_normal.X; v[0].normal[1] = shading_normal.Y; v[0].normal[2] = shading_normal.Z;
+    v[0].uv[0] = uv0.u; v[0].uv[1] = uv0.v;
 
     v[1].pos[0] = p1.X; v[1].pos[1] = p1.Y; v[1].pos[2] = p1.Z;
-    v[1].normal[0] = normal.X; v[1].normal[1] = normal.Y; v[1].normal[2] = normal.Z;
-    v[1].color[0] = color.X; v[1].color[1] = color.Y; v[1].color[2] = color.Z;
+    v[1].normal[0] = shading_normal.X; v[1].normal[1] = shading_normal.Y; v[1].normal[2] = shading_normal.Z;
+    v[1].uv[0] = uv1.u; v[1].uv[1] = uv1.v;
 
     v[2].pos[0] = p2.X; v[2].pos[1] = p2.Y; v[2].pos[2] = p2.Z;
-    v[2].normal[0] = normal.X; v[2].normal[1] = normal.Y; v[2].normal[2] = normal.Z;
-    v[2].color[0] = color.X; v[2].color[1] = color.Y; v[2].color[2] = color.Z;
+    v[2].normal[0] = shading_normal.X; v[2].normal[1] = shading_normal.Y; v[2].normal[2] = shading_normal.Z;
+    v[2].uv[0] = uv2.u; v[2].uv[1] = uv2.v;
 
     *count += 3;
+}
+
+// Compute atlas UV for a point on a hex top face
+static HexUV hex_top_uv(float vx, float vz, float cx, float cz, int atlas_idx) {
+    float local_u = (vx - cx) / (2.0f * HEX_RADIUS) + 0.5f;
+    float local_v = (vz - cz) / (1.7320508f * HEX_RADIUS) + 0.5f;
+    HexUV uv;
+    uv.u = ((float)atlas_idx + local_u) / (float)HEX_ATLAS_TILES;
+    uv.v = local_v;
+    return uv;
 }
 
 // ---- Core mesh generation for a chunk ----
@@ -320,7 +363,7 @@ static void generate_chunk_mesh(HexMeshJob* job) {
     // Estimate max vertices: each hex can have top (4 tris=12 verts) + 6 walls (2 tris=12 verts each)
     // Worst case: 1024 * (12 + 72) = 86K verts. Typical much less.
     int cap = HEX_CHUNK_SIZE * HEX_CHUNK_SIZE * 24; // conservative initial
-    job->vertices = (LodVertex*)malloc(cap * sizeof(LodVertex));
+    job->vertices = (HexVertex*)malloc(cap * sizeof(HexVertex));
     job->vertex_count = 0;
 
     for (int col = 0; col < HEX_CHUNK_SIZE; col++) {
@@ -358,21 +401,29 @@ static void generate_chunk_mesh(HexMeshJob* job) {
 
             // -- Top face: 4 triangles (fan from vertex 0) --
             VoxelType surface_type = (VoxelType)job->types[col][row];
-            HMM_Vec3 top_color = ht_voxel_color(surface_type);
+            int top_atlas = voxel_top_atlas(surface_type);
 
-            // Normal = local up (pointing outward from planet)
+            // Precompute top face UVs for each hex vertex
+            HexUV top_uvs[6];
+            for (int i = 0; i < 6; i++) {
+                float vx = lx + HEX_RADIUS * HEX_COS[i];
+                float vz = lz + HEX_RADIUS * HEX_SIN[i];
+                top_uvs[i] = hex_top_uv(vx, vz, lx, lz, top_atlas);
+            }
+
+            // Top face: winding and shading normals are both local_up
             hex_emit_tri(&job->vertices, &job->vertex_count, &cap,
                 hex_verts_top[0], hex_verts_top[1], hex_verts_top[2],
-                local_up, top_color);
+                local_up, local_up, top_uvs[0], top_uvs[1], top_uvs[2]);
             hex_emit_tri(&job->vertices, &job->vertex_count, &cap,
                 hex_verts_top[0], hex_verts_top[2], hex_verts_top[3],
-                local_up, top_color);
+                local_up, local_up, top_uvs[0], top_uvs[2], top_uvs[3]);
             hex_emit_tri(&job->vertices, &job->vertex_count, &cap,
                 hex_verts_top[0], hex_verts_top[3], hex_verts_top[4],
-                local_up, top_color);
+                local_up, local_up, top_uvs[0], top_uvs[3], top_uvs[4]);
             hex_emit_tri(&job->vertices, &job->vertex_count, &cap,
                 hex_verts_top[0], hex_verts_top[4], hex_verts_top[5],
-                local_up, top_color);
+                local_up, local_up, top_uvs[0], top_uvs[4], top_uvs[5]);
 
             // -- Side walls: check each of 6 neighbors --
             for (int dir = 0; dir < 6; dir++) {
@@ -441,7 +492,7 @@ static void generate_chunk_mesh(HexMeshJob* job) {
                     HMM_Vec3 p0_top = vec3_scale(d0, top_r_wall);
                     HMM_Vec3 p1_top = vec3_scale(d1, top_r_wall);
 
-                    // Wall normal: outward from hex center (perpendicular to edge, in tangent plane)
+                    // Wall outward direction for correct winding
                     float edge_mid_x = (vx0 + vx1) * 0.5f;
                     float edge_mid_z = (vz0 + vz1) * 0.5f;
                     HMM_Vec3 wall_outward = vec3_normalize(
@@ -456,13 +507,19 @@ static void generate_chunk_mesh(HexMeshJob* job) {
 
                     float wall_y_m = (layer + 0.5f) * HEX_HEIGHT;
                     float surface_h_m = h * HEX_HEIGHT;
-                    HMM_Vec3 wall_col = ht_wall_color(surface_h_m, wall_y_m);
+                    int wall_atlas = ht_wall_atlas(surface_type, surface_h_m, wall_y_m);
 
-                    // Two triangles for the wall quad
+                    // Wall UVs: u along edge [0,1], v=0 at top (image row 0), v=1 at bottom
+                    HexUV wuv00 = { ((float)wall_atlas + 0.0f) / (float)HEX_ATLAS_TILES, 1.0f };  // bottom-left
+                    HexUV wuv10 = { ((float)wall_atlas + 1.0f) / (float)HEX_ATLAS_TILES, 1.0f };  // bottom-right
+                    HexUV wuv01 = { ((float)wall_atlas + 0.0f) / (float)HEX_ATLAS_TILES, 0.0f };  // top-left
+                    HexUV wuv11 = { ((float)wall_atlas + 1.0f) / (float)HEX_ATLAS_TILES, 0.0f };  // top-right
+
+                    // Winding uses wall_outward, shading uses local_up (voxel-style)
                     hex_emit_tri(&job->vertices, &job->vertex_count, &cap,
-                        p0_bot, p1_bot, p1_top, wall_outward, wall_col);
+                        p0_bot, p1_bot, p1_top, wall_outward, local_up, wuv00, wuv10, wuv11);
                     hex_emit_tri(&job->vertices, &job->vertex_count, &cap,
-                        p0_bot, p1_top, p0_top, wall_outward, wall_col);
+                        p0_bot, p1_top, p0_top, wall_outward, local_up, wuv00, wuv11, wuv01);
                 }
             }
         }
@@ -813,7 +870,7 @@ void hex_terrain_upload_meshes(HexTerrain* ht) {
         chunk->gpu_buffer = sg_make_buffer(&(sg_buffer_desc){
             .data = (sg_range){
                 chunk->cpu_vertices,
-                (size_t)chunk->cpu_vertex_count * sizeof(LodVertex)
+                (size_t)chunk->cpu_vertex_count * sizeof(HexVertex)
             },
             .label = "hex-chunk-vertices",
         });
@@ -832,10 +889,13 @@ void hex_terrain_upload_meshes(HexTerrain* ht) {
     }
 }
 
-void hex_terrain_render(HexTerrain* ht, sg_pipeline pip) {
+void hex_terrain_render(HexTerrain* ht, sg_pipeline pip,
+                        sg_view atlas_view, sg_sampler atlas_smp) {
     (void)pip; // Pipeline already applied by caller
 
     sg_bindings bind = {0};
+    bind.views[0] = atlas_view;
+    bind.samplers[0] = atlas_smp;
     int total_verts = 0;
     int rendered = 0;
 
@@ -879,4 +939,179 @@ float hex_terrain_effective_range(const HexTerrain* ht) {
     // Only suppress LOD when we have good hex terrain coverage.
     // Below 80%, LOD renders underneath to prevent black holes.
     return (coverage >= 0.8f) ? HEX_RANGE : 0.0f;
+}
+
+// ---- Hex selection / interaction ----
+
+// Convert tangent-plane pixel position to hex grid coordinates (flat-top, even-q offset).
+// Uses cube-coordinate rounding for exact nearest-hex lookup.
+static void pixel_to_hex(float px, float pz, int* out_col, int* out_row) {
+    // Flat-top hex: pixel to fractional axial coordinates
+    float q_f = (2.0f / 3.0f) * px / HEX_RADIUS;
+    float r_f = (-px / 3.0f + pz * 0.57735027f) / HEX_RADIUS;  // sqrt(3)/3
+    float s_f = -q_f - r_f;
+
+    // Cube-round: round each to nearest int, fix the one with largest error
+    int qi = (int)roundf(q_f);
+    int ri = (int)roundf(r_f);
+    int si = (int)roundf(s_f);
+
+    float dq = fabsf((float)qi - q_f);
+    float dr = fabsf((float)ri - r_f);
+    float ds = fabsf((float)si - s_f);
+
+    if (dq > dr && dq > ds)      qi = -ri - si;
+    else if (dr > ds)             ri = -qi - si;
+    // else: si = -qi - ri (implicit, not needed)
+
+    axial_to_offset(qi, ri, out_col, out_row);
+}
+
+HexHitResult hex_terrain_raycast(const HexTerrain* ht, HMM_Vec3 ray_origin,
+                                  HMM_Vec3 ray_dir, float max_dist) {
+    HexHitResult result = { .valid = false };
+
+    if (!ht->frame_valid) return result;
+
+    // Step along ray in 0.1m increments
+    float step = 0.1f;
+    int prev_gcol = -99999, prev_grow = -99999;
+
+    for (float t = 0.0f; t <= max_dist; t += step) {
+        // World-space point along ray
+        HMM_Vec3 world_pt = vec3_add(ray_origin, vec3_scale(ray_dir, t));
+        float point_r = sqrtf(vec3_dot(world_pt, world_pt));
+
+        // Project to tangent plane for hex grid lookup
+        HMM_Vec3 offset = vec3_sub(world_pt, ht->tangent_origin);
+        float lx = vec3_dot(offset, ht->tangent_east);
+        float lz = vec3_dot(offset, ht->tangent_north);
+
+        // Convert tangent-plane position to hex grid coords
+        int gcol, grow;
+        pixel_to_hex(lx, lz, &gcol, &grow);
+
+        // Skip if same hex as previous step
+        if (gcol == prev_gcol && grow == prev_grow) continue;
+        prev_gcol = gcol;
+        prev_grow = grow;
+
+        // Find chunk containing this hex
+        int cx = (int)floorf((float)gcol / HEX_CHUNK_SIZE);
+        int cz = (int)floorf((float)grow / HEX_CHUNK_SIZE);
+        int local_col = gcol - cx * HEX_CHUNK_SIZE;
+        int local_row = grow - cz * HEX_CHUNK_SIZE;
+
+        if (local_col < 0 || local_col >= HEX_CHUNK_SIZE ||
+            local_row < 0 || local_row >= HEX_CHUNK_SIZE) continue;
+
+        // Find the chunk (must have valid mesh data)
+        int chunk_idx = -1;
+        for (int i = 0; i < HEX_MAX_CHUNKS; i++) {
+            if (ht->chunks[i].active && ht->chunks[i].cx == cx && ht->chunks[i].cz == cz &&
+                ht->chunks[i].gpu_vertex_count > 0) {
+                chunk_idx = i;
+                break;
+            }
+        }
+        if (chunk_idx < 0) continue;
+
+        const HexChunk* chunk = &ht->chunks[chunk_idx];
+        int h = chunk->heights[local_col][local_row];
+
+        // World-space radius comparison: ray point radius vs hex top radius
+        float hex_top_r = ht->planet_radius + (float)h * HEX_HEIGHT + HEX_SURFACE_BIAS;
+        if (point_r <= hex_top_r) {
+            result.valid = true;
+            result.chunk_index = chunk_idx;
+            result.col = local_col;
+            result.row = local_row;
+            result.gcol = gcol;
+            result.grow = grow;
+            result.height = h;
+            result.type = chunk->types[local_col][local_row];
+            return result;
+        }
+    }
+
+    return result;
+}
+
+bool hex_terrain_break(HexTerrain* ht, const HexHitResult* hit) {
+    if (!hit->valid) return false;
+    if (hit->chunk_index < 0 || hit->chunk_index >= HEX_MAX_CHUNKS) return false;
+
+    HexChunk* chunk = &ht->chunks[hit->chunk_index];
+    if (!chunk->active) return false;
+
+    int col = hit->col;
+    int row = hit->row;
+    if (chunk->heights[col][row] <= 0) return false;
+
+    chunk->heights[col][row]--;
+    float new_h_m = (float)chunk->heights[col][row] * HEX_HEIGHT;
+    chunk->types[col][row] = (uint8_t)ht_voxel_type(new_h_m);
+    chunk->dirty = true;
+    return true;
+}
+
+bool hex_terrain_place(HexTerrain* ht, const HexHitResult* hit, uint8_t voxel_type) {
+    if (!hit->valid) return false;
+    if (hit->chunk_index < 0 || hit->chunk_index >= HEX_MAX_CHUNKS) return false;
+
+    HexChunk* chunk = &ht->chunks[hit->chunk_index];
+    if (!chunk->active) return false;
+
+    int col = hit->col;
+    int row = hit->row;
+    if (chunk->heights[col][row] >= HEX_MAX_COLUMN_H - 1) return false;
+
+    chunk->heights[col][row]++;
+    chunk->types[col][row] = voxel_type;
+    chunk->dirty = true;
+    return true;
+}
+
+bool hex_terrain_build_highlight(const HexTerrain* ht, const HexHitResult* hit,
+                                  const double world_origin[3], float* out_verts) {
+    if (!hit->valid || !ht->frame_valid) return false;
+
+    float lx, lz;
+    hex_local_pos(hit->gcol, hit->grow, &lx, &lz);
+
+    // Wireframe sits slightly above hex top face to prevent z-fighting
+    float top_r = ht->planet_radius + (float)hit->height * HEX_HEIGHT + HEX_SURFACE_BIAS + 0.05f;
+
+    // Compute 6 hex vertex world positions
+    HMM_Vec3 hex_v[6];
+    for (int i = 0; i < 6; i++) {
+        float vx = lx + HEX_RADIUS * HEX_COS[i];
+        float vz = lz + HEX_RADIUS * HEX_SIN[i];
+
+        HMM_Vec3 vdir = vec3_normalize(
+            vec3_add(ht->tangent_origin,
+                vec3_add(vec3_scale(ht->tangent_east, vx),
+                         vec3_scale(ht->tangent_north, vz))));
+        hex_v[i] = vec3_scale(vdir, top_r);
+    }
+
+    // Subtract floating origin (same as mesh generation)
+    for (int i = 0; i < 6; i++) {
+        hex_v[i].X -= (float)world_origin[0];
+        hex_v[i].Y -= (float)world_origin[1];
+        hex_v[i].Z -= (float)world_origin[2];
+    }
+
+    // Emit 6 line segments: (v0,v1), (v1,v2), ..., (v5,v0)
+    for (int i = 0; i < 6; i++) {
+        int j = (i + 1) % 6;
+        out_verts[i * 6 + 0] = hex_v[i].X;
+        out_verts[i * 6 + 1] = hex_v[i].Y;
+        out_verts[i * 6 + 2] = hex_v[i].Z;
+        out_verts[i * 6 + 3] = hex_v[j].X;
+        out_verts[i * 6 + 4] = hex_v[j].Y;
+        out_verts[i * 6 + 5] = hex_v[j].Z;
+    }
+
+    return true;
 }
