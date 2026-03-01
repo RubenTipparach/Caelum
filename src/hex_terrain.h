@@ -12,6 +12,9 @@
 #define HEX_RADIUS          1.0f        // Circumradius of each hex (center to vertex) in meters
 #define HEX_HEIGHT          1.0f        // Height of one voxel layer in meters
 #define HEX_RANGE           500.0f      // Activation range from camera in meters
+#define HEX_INNER_RANGE     350.0f      // Full voxel prisms inside this range
+#define HEX_TRANSITION_ON   375.0f      // Switch chunk TO transition mode (hysteresis high)
+#define HEX_TRANSITION_OFF  325.0f      // Revert chunk FROM transition mode (hysteresis low)
 #define HEX_CHUNK_SIZE      32          // Hex columns per chunk side (32x32 grid)
 #define HEX_MAX_CHUNKS      512         // Maximum active chunks
 #define HEX_MAX_COLUMN_H    16384       // Maximum terrain height in layers (int16_t, covers up to 16km)
@@ -32,6 +35,7 @@ typedef struct HexChunk {
     bool active;                // Currently in use
     bool dirty;                 // Needs mesh regeneration
     bool generating;            // Mesh is being generated on worker thread
+    bool is_transition;         // True = smooth surface-only mesh (transition zone)
 
     // Per-column terrain data (offset grid within chunk)
     int16_t heights[HEX_CHUNK_SIZE][HEX_CHUNK_SIZE];   // Terrain height in layers

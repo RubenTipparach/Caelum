@@ -383,6 +383,24 @@ void lod_tree_init(LodTree* tree, float planet_radius, float layer_thickness,
         init_spherical_triangle(&node->tri, v0, v1, v2);
     }
 
+    // Precompute depth-based arc lengths for consistent split/merge thresholds.
+    // Use the average root angular_radius as baseline, halving each depth.
+    // This ensures all patches at the same depth have the same split criterion,
+    // regardless of aperture-4 subdivision asymmetry (corner vs center children).
+    {
+        float avg_root_ar = 0.0f;
+        for (int i = 0; i < LOD_ROOT_COUNT; i++) {
+            avg_root_ar += tree->nodes[tree->root_nodes[i]].tri.angular_radius;
+        }
+        avg_root_ar /= (float)LOD_ROOT_COUNT;
+
+        for (int d = 0; d <= LOD_MAX_DEPTH; d++) {
+            float ar = avg_root_ar;
+            for (int i = 0; i < d; i++) ar *= 0.5f;
+            tree->depth_arc[d] = ar * planet_radius;
+        }
+    }
+
     printf("[LOD] Tree initialized: radius=%.0f, %d root nodes, max_depth=%d, %d workers\n",
         planet_radius, LOD_ROOT_COUNT, LOD_MAX_DEPTH, LOD_NUM_WORKERS);
     fflush(stdout);
@@ -863,20 +881,41 @@ static float patch_distance(const LodTree* tree, const LodNode* node) {
 }
 
 
-// Check if a patch should be split: split when camera is close relative to patch size.
-// Each depth level halves the angular radius, so the patch arc length halves.
+// Distance from camera to patch CENTER (not edge). Used for split/merge decisions
+// so that all patches at the same depth get consistent treatment regardless of
+// aperture-4 subdivision asymmetry (corner vs center children have different angular_radius).
+static float patch_center_distance(const LodTree* tree, const LodNode* node) {
+    float cam_r = sqrtf(vec3_dot(tree->camera_pos, tree->camera_pos));
+    if (cam_r < 1.0f) cam_r = 1.0f;
+    HMM_Vec3 cam_dir = vec3_scale(tree->camera_pos, 1.0f / cam_r);
+    float cos_angle = vec3_dot(cam_dir, node->tri.center);
+    if (cos_angle > 1.0f) cos_angle = 1.0f;
+    if (cos_angle < -1.0f) cos_angle = -1.0f;
+    float angle_to_center = acosf(cos_angle);
+
+    float arc_dist = angle_to_center * tree->planet_radius;
+
+    float max_surface_r = tree->planet_radius + TERRAIN_AMPLITUDE_M;
+    float altitude = cam_r - max_surface_r;
+    if (altitude < 0.0f) altitude = 0.0f;
+
+    return sqrtf(arc_dist * arc_dist + altitude * altitude);
+}
+
+// Split when camera is close relative to the DEPTH-BASED arc length.
+// Using depth_arc[] (precomputed) ensures all patches at the same depth
+// have identical thresholds — no asymmetry from aperture-4 corner vs center children.
 static bool should_split(const LodTree* tree, const LodNode* node) {
     if (node->depth >= LOD_MAX_DEPTH) return false;
-    float dist = patch_distance(tree, node);
-    float patch_arc = node->tri.angular_radius * tree->planet_radius;
+    float dist = patch_center_distance(tree, node);
+    float patch_arc = tree->depth_arc[node->depth];
     return dist < patch_arc * LOD_SPLIT_FACTOR;
 }
 
 // Check if a patch's children should be merged back.
 static bool should_merge(const LodTree* tree, const LodNode* node) {
-    float dist = patch_distance(tree, node);
-    float patch_arc = node->tri.angular_radius * tree->planet_radius;
-    // Merge hysteresis: require 2x the split distance before merging
+    float dist = patch_center_distance(tree, node);
+    float patch_arc = tree->depth_arc[node->depth];
     return dist > patch_arc * LOD_SPLIT_FACTOR * 2.0f;
 }
 
@@ -1026,8 +1065,30 @@ void lod_tree_update(LodTree* tree, HMM_Vec3 camera_pos, HMM_Mat4 view_proj) {
         goto collect_stats;
     }
 
+    // Sort root nodes by distance (nearest first) so closer faces get
+    // priority for the per-frame split budget.
+    int sorted_roots[LOD_ROOT_COUNT];
+    float root_dists[LOD_ROOT_COUNT];
     for (int i = 0; i < LOD_ROOT_COUNT; i++) {
-        update_node(tree, tree->root_nodes[i]);
+        sorted_roots[i] = i;
+        root_dists[i] = patch_center_distance(tree, &tree->nodes[tree->root_nodes[i]]);
+    }
+    // Insertion sort (N=20, always fast)
+    for (int i = 1; i < LOD_ROOT_COUNT; i++) {
+        int key_idx = sorted_roots[i];
+        float key_dist = root_dists[i];
+        int j = i - 1;
+        while (j >= 0 && root_dists[j] > key_dist) {
+            sorted_roots[j + 1] = sorted_roots[j];
+            root_dists[j + 1] = root_dists[j];
+            j--;
+        }
+        sorted_roots[j + 1] = key_idx;
+        root_dists[j + 1] = key_dist;
+    }
+
+    for (int i = 0; i < LOD_ROOT_COUNT; i++) {
+        update_node(tree, tree->root_nodes[sorted_roots[i]]);
     }
 
 collect_stats:
@@ -1059,8 +1120,8 @@ collect_stats:
             tree->level_stats[d].vertex_count += node->gpu_vertex_count;
         }
 
-        // Compute arc distance from camera to patch edge (same metric used for LOD decisions)
-        float dist = patch_distance(tree, node);
+        // Compute center distance (same metric used for LOD split/merge decisions)
+        float dist = patch_center_distance(tree, node);
 
         if (dist < tree->level_stats[d].min_distance)
             tree->level_stats[d].min_distance = dist;

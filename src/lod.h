@@ -95,6 +95,9 @@ typedef struct LodTree {
     } level_stats[LOD_MAX_DEPTH + 1];
     int stats_frame_counter;    // For periodic console printing
 
+    // Depth-based split thresholds (precomputed for consistent LOD ordering)
+    float depth_arc[LOD_MAX_DEPTH + 1];  // Canonical arc length at each depth
+
     // Per-frame budget
     int splits_this_frame;
 
