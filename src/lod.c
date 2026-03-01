@@ -192,104 +192,6 @@ static int sample_terrain_height(fnl_state* continental, fnl_state* mountain,
     return height;
 }
 
-// ---- Test Stone Arch (at spawn for LOD voxel rendering test) ----
-// Boolean subtraction: outer semicircle (R=100m) minus inner semicircle (R=80m).
-// 200m wide × 50m deep, placed at spawn (0,1,0). Base altitude from terrain.
-#define ARCH_R_OUTER    100.0f   // outer semicircle radius (total width 200m, height 100m)
-#define ARCH_R_INNER     80.0f   // inner semicircle radius (opening)
-#define ARCH_HALF_D      25.0f   // half-depth = 25m (total 50m)
-
-// Arch center on unit sphere (right at spawn)
-static HMM_Vec3 arch_unit_center(float planet_radius) {
-    (void)planet_radius;
-    return (HMM_Vec3){{0.0f, 1.0f, 0.0f}};
-}
-
-// Precomputed arch tangent frame (for projecting points to arch-local coords)
-typedef struct {
-    HMM_Vec3 center;     // unit sphere center
-    HMM_Vec3 east, north; // tangent plane axes
-} ArchFrame;
-
-static ArchFrame arch_make_frame(float planet_radius) {
-    ArchFrame f;
-    f.center = arch_unit_center(planet_radius);
-    HMM_Vec3 up = f.center;
-    HMM_Vec3 arb = fabsf(up.Y) < 0.999f ? (HMM_Vec3){{0,1,0}} : (HMM_Vec3){{1,0,0}};
-    f.east  = vec3_normalize(vec3_cross(arb, up));
-    f.north = vec3_cross(up, f.east);
-    return f;
-}
-
-// Project a unit_pos to arch-local 2D coords (lx, lz)
-static void arch_project(const ArchFrame* f, HMM_Vec3 unit_pos, float planet_radius,
-                          float* lx, float* lz) {
-    float d = vec3_dot(unit_pos, f->center);
-    HMM_Vec3 off = vec3_sub(unit_pos, vec3_scale(f->center, d));
-    *lx = vec3_dot(off, f->east)  * planet_radius;
-    *lz = vec3_dot(off, f->north) * planet_radius;
-}
-
-// Query arch solid range at arch-local (lx, lz).
-// arch_base: meters above planet_radius where the arch sits (terrain height at center).
-// Boolean: outer semicircle (R_outer) minus inner semicircle (R_inner).
-// Solid region at column lx:
-//   |lx| > R_outer        → empty (outside arch)
-//   R_inner < |lx| <= R_outer → solid from base to outer circle (pillar)
-//   |lx| <= R_inner        → solid from inner circle top to outer circle top (arch band)
-static void arch_query(float lx, float lz, float arch_base, int* arch_bottom, int* arch_top) {
-    if (fabsf(lz) > ARCH_HALF_D) {
-        *arch_bottom = INT16_MIN; *arch_top = INT16_MIN; return;
-    }
-    float lx2 = lx * lx;
-
-    // Outside outer semicircle?
-    if (lx2 > ARCH_R_OUTER * ARCH_R_OUTER) {
-        *arch_bottom = INT16_MIN; *arch_top = INT16_MIN; return;
-    }
-
-    // Top of arch at this x: outer semicircle
-    float outer_y = sqrtf(ARCH_R_OUTER * ARCH_R_OUTER - lx2);
-    int top = (int)(arch_base + outer_y);
-    int base = (int)arch_base;
-
-    if (lx2 < ARCH_R_INNER * ARCH_R_INNER) {
-        // Inside inner circle: only the band between inner and outer circles
-        float inner_y = sqrtf(ARCH_R_INNER * ARCH_R_INNER - lx2);
-        int bottom = (int)ceilf(arch_base + inner_y);
-        if (bottom >= top) {
-            *arch_bottom = INT16_MIN; *arch_top = INT16_MIN; return;
-        }
-        *arch_bottom = bottom;
-        *arch_top = top;
-    } else {
-        // Between inner and outer radius: full pillar from base to outer circle
-        *arch_bottom = base;
-        *arch_top = top;
-    }
-}
-
-// Compute arch base height (terrain at arch center). Needs noise states.
-static float arch_compute_base(const ArchFrame* f, int seed, float planet_radius) {
-    fnl_state c = create_continental_noise(seed);
-    fnl_state m = create_mountain_noise(seed);
-    fnl_state w = create_warp_noise(seed);
-    fnl_state d = create_detail_noise(seed);
-    float h = sample_terrain_height_m(&c, &m, &w, &d, f->center);
-    return fmaxf(h, TERRAIN_SEA_LEVEL_M) - 50.0f;  // sink 30m into terrain
-}
-
-// Get the maximum height of the arch at a unit sphere position (for coarse LOD + collision).
-// Returns 0 if position is outside arch footprint.
-static float arch_max_height(const ArchFrame* f, HMM_Vec3 unit_pos,
-                              float planet_radius, float arch_base) {
-    float lx, lz;
-    arch_project(f, unit_pos, planet_radius, &lx, &lz);
-    int ab, at;
-    arch_query(lx, lz, arch_base, &ab, &at);
-    return (at != INT16_MIN) ? (float)at : 0.0f;
-}
-
 // Perturb a base color with noise for visual variety
 static HMM_Vec3 perturb_color(HMM_Vec3 base, fnl_state* color_noise, HMM_Vec3 unit_pos) {
     float cn = fnlGetNoise3D(color_noise,
@@ -849,25 +751,8 @@ static void generate_hex_mesh_for_triangle(
     int16_t* hm_heights = (int16_t*)malloc(grid_size * sizeof(int16_t));
     uint8_t* hm_atlas = (uint8_t*)malloc(grid_size * sizeof(uint8_t));
     HMM_Vec3* hm_colors = (HMM_Vec3*)malloc(grid_size * sizeof(HMM_Vec3));
-    // Arch slab data: for columns with floating arch above a gap
-    int16_t* hm_arch_bot = (int16_t*)malloc(grid_size * sizeof(int16_t));
-    int16_t* hm_arch_top = (int16_t*)malloc(grid_size * sizeof(int16_t));
-    uint8_t* hm_is_arch  = (uint8_t*)calloc(grid_size, sizeof(uint8_t));
     for (int i = 0; i < grid_size; i++) {
         hm_heights[i] = INT16_MIN;
-        hm_arch_bot[i] = INT16_MIN;
-        hm_arch_top[i] = INT16_MIN;
-    }
-
-    // Precompute arch tangent frame + position in hex tangent plane
-    ArchFrame arch_f = arch_make_frame(planet_radius);
-    float arch_base = arch_compute_base(&arch_f, seed, planet_radius);
-    float arch_tx, arch_tz;
-    {
-        float acd = vec3_dot(arch_f.center, center);
-        HMM_Vec3 aoff = vec3_sub(arch_f.center, vec3_scale(center, acd));
-        arch_tx = vec3_dot(aoff, east)  * planet_radius;
-        arch_tz = vec3_dot(aoff, north) * planet_radius;
     }
 
     for (int col = col_min; col <= col_max; col++) {
@@ -887,30 +772,9 @@ static void generate_hex_mesh_for_triangle(
 
             int gi = (col - col_min) * grid_rows + (row - row_min);
 
-            // Check arch at this column
-            float lx = hx - arch_tx;
-            float lz = hz - arch_tz;
-            int ab, at;
-            arch_query(lx, lz, arch_base, &ab, &at);
-
-            if (at != INT16_MIN) {
-                // Column is within arch footprint
-                if (h >= ab) {
-                    // Pillar: terrain reaches arch base → extend to arch top
-                    if (at > h) h = at;
-                    hm_is_arch[gi] = 1;
-                } else {
-                    // Gap column: terrain below arch bottom → floating slab
-                    hm_arch_bot[gi] = (int16_t)ab;
-                    hm_arch_top[gi] = (int16_t)at;
-                }
-            }
-
             hm_heights[gi] = (int16_t)h;
-            hm_atlas[gi] = (at != INT16_MIN) ? LOD_ATLAS_STONE : (uint8_t)lod_hex_atlas(h_m);
-            hm_colors[gi] = (at != INT16_MIN)
-                ? perturb_color((HMM_Vec3){{0.5f, 0.5f, 0.5f}}, &cnoise, cdir)  // stone gray
-                : perturb_color(terrain_color_m(h_m), &cnoise, cdir);
+            hm_atlas[gi] = (uint8_t)lod_hex_atlas(h_m);
+            hm_colors[gi] = perturb_color(terrain_color_m(h_m), &cnoise, cdir);
         }
     }
 
@@ -1069,10 +933,10 @@ static void generate_hex_mesh_for_triangle(
                 HMM_Vec3 wall_outward = vec3_normalize(
                     vec3_add(vec3_scale(east, mx), vec3_scale(north, mz)));
 
-                // Cap wall height to limit geometry (skip cap for arch columns)
+                // Cap wall height to limit geometry
                 int wall_bottom = nh;
                 int wall_top = h;
-                if (!hm_is_arch[gi] && wall_top - wall_bottom > LOD_HEX_MAX_WALL)
+                if (wall_top - wall_bottom > LOD_HEX_MAX_WALL)
                     wall_bottom = wall_top - LOD_HEX_MAX_WALL;
 
                 // Emit per-layer wall quads
@@ -1111,132 +975,11 @@ static void generate_hex_mesh_for_triangle(
         }
     }
 
-    // 10. Phase 3: Emit floating arch slabs (columns with gap between terrain and arch)
-    for (int col = col_min; col <= col_max; col++) {
-        for (int row = row_min; row <= row_max; row++) {
-            int gi = (col - col_min) * grid_rows + (row - row_min);
-            if (hm_arch_bot[gi] == INT16_MIN) continue;  // no floating slab
-
-            int slab_bot = hm_arch_bot[gi];
-            int slab_top = hm_arch_top[gi];
-            HMM_Vec3 hex_color = hm_colors[gi];
-            HMM_Vec3 slope_normal = hm_slopes[gi];
-
-            float hx, hz;
-            HEX_POS(col, row, hx, hz);
-
-            HMM_Vec3 cdir = vec3_normalize(
-                vec3_add(center_scaled,
-                    vec3_add(vec3_scale(east, hx), vec3_scale(north, hz))));
-            HMM_Vec3 local_up = cdir;
-            HMM_Vec3 local_down = vec3_scale(cdir, -1.0f);
-
-            // Compute hex corners at slab_top and slab_bot
-            float top_r = planet_radius + (float)slab_top + LOD_HEX_SURFACE_BIAS;
-            float bot_r = planet_radius + (float)slab_bot + LOD_HEX_SURFACE_BIAS;
-
-            HMM_Vec3 hex_dirs_s[6], top_verts[6], bot_verts[6];
-            LodHexUV top_uvs[6], bot_uvs[6];
-            for (int i = 0; i < 6; i++) {
-                float vx = hx + LOD_HEX_RADIUS * LOD_HEX_COS[i];
-                float vz = hz + LOD_HEX_RADIUS * LOD_HEX_SIN[i];
-                hex_dirs_s[i] = vec3_normalize(
-                    vec3_add(center_scaled,
-                        vec3_add(vec3_scale(east, vx), vec3_scale(north, vz))));
-                top_verts[i] = vec3_scale(hex_dirs_s[i], top_r);
-                bot_verts[i] = vec3_scale(hex_dirs_s[i], bot_r);
-                top_uvs[i] = lod_hex_top_uv(vx, vz, hx, hz, LOD_ATLAS_STONE);
-                bot_uvs[i] = lod_hex_top_uv(vx, vz, hx, hz, LOD_ATLAS_STONE);
-            }
-
-            // Top face (upward)
-            for (int i = 0; i < 4; i++) {
-                lod_hex_emit_tri(out_vertices, out_count, &vert_cap,
-                    top_verts[0], top_verts[i + 1], top_verts[i + 2],
-                    local_up, slope_normal,
-                    top_uvs[0], top_uvs[i + 1], top_uvs[i + 2],
-                    hex_color);
-            }
-
-            // Bottom face (downward, reversed winding)
-            for (int i = 0; i < 4; i++) {
-                lod_hex_emit_tri(out_vertices, out_count, &vert_cap,
-                    bot_verts[0], bot_verts[i + 2], bot_verts[i + 1],
-                    local_down, local_down,
-                    bot_uvs[0], bot_uvs[i + 2], bot_uvs[i + 1],
-                    hex_color);
-            }
-
-            // Slab walls: check 6 neighbors
-            for (int dir = 0; dir < 6; dir++) {
-                int ncol, nrow;
-                lod_hex_neighbor(col, row, dir, &ncol, &nrow);
-                if (ncol < col_min || ncol > col_max ||
-                    nrow < row_min || nrow > row_max) continue;
-                int ni = (ncol - col_min) * grid_rows + (nrow - row_min);
-
-                // Neighbor slab range (INT16_MIN = no slab)
-                int n_sbot = (hm_arch_bot[ni] != INT16_MIN) ? hm_arch_bot[ni] : INT16_MAX;
-                int n_stop = (hm_arch_top[ni] != INT16_MIN) ? hm_arch_top[ni] : INT16_MIN;
-
-                // Also check if neighbor is a pillar (terrain >= arch_bot, no gap)
-                // In that case neighbor's solid extends to its hm_heights
-                int n_solid_top = (hm_heights[ni] != INT16_MIN) ? hm_heights[ni] : INT16_MIN;
-
-                // Wall where this slab is exposed (neighbor has no matching solid)
-                int wall_bot = slab_bot;
-                int wall_top = slab_top;
-
-                // If neighbor has a slab at the same range, no wall needed
-                if (hm_arch_bot[ni] != INT16_MIN) {
-                    // Neighbor has slab — only emit wall where ranges differ
-                    if (hm_arch_bot[ni] <= slab_bot && hm_arch_top[ni] >= slab_top)
-                        continue;  // neighbor fully covers
-                } else if (n_solid_top >= slab_top) {
-                    continue;  // neighbor is solid pillar covering this range
-                }
-
-                int edge = LOD_DIR_TO_EDGE[dir];
-                int vi0 = edge;
-                int vi1 = (edge + 1) % 6;
-
-                float emx = (LOD_HEX_COS[vi0] + LOD_HEX_COS[vi1]) * 0.5f * LOD_HEX_RADIUS;
-                float emz = (LOD_HEX_SIN[vi0] + LOD_HEX_SIN[vi1]) * 0.5f * LOD_HEX_RADIUS;
-                HMM_Vec3 wall_out = vec3_normalize(
-                    vec3_add(vec3_scale(east, emx), vec3_scale(north, emz)));
-
-                for (int layer = wall_bot; layer < wall_top; layer++) {
-                    float lr_bot = planet_radius + (float)layer + LOD_HEX_SURFACE_BIAS;
-                    float lr_top = planet_radius + (float)(layer + 1) + LOD_HEX_SURFACE_BIAS;
-                    HMM_Vec3 p0b = vec3_scale(hex_dirs_s[vi0], lr_bot);
-                    HMM_Vec3 p1b = vec3_scale(hex_dirs_s[vi1], lr_bot);
-                    HMM_Vec3 p0t = vec3_scale(hex_dirs_s[vi0], lr_top);
-                    HMM_Vec3 p1t = vec3_scale(hex_dirs_s[vi1], lr_top);
-
-                    LodHexUV wuv_bl = { (float)LOD_ATLAS_STONE / (float)LOD_HEX_ATLAS_TILES, 1.0f };
-                    LodHexUV wuv_br = { ((float)LOD_ATLAS_STONE + 1.0f) / (float)LOD_HEX_ATLAS_TILES, 1.0f };
-                    LodHexUV wuv_tl = { (float)LOD_ATLAS_STONE / (float)LOD_HEX_ATLAS_TILES, 0.0f };
-                    LodHexUV wuv_tr = { ((float)LOD_ATLAS_STONE + 1.0f) / (float)LOD_HEX_ATLAS_TILES, 0.0f };
-
-                    lod_hex_emit_tri(out_vertices, out_count, &vert_cap,
-                        p0b, p1b, p1t, wall_out, wall_out,
-                        wuv_bl, wuv_br, wuv_tr, hex_color);
-                    lod_hex_emit_tri(out_vertices, out_count, &vert_cap,
-                        p0b, p1t, p0t, wall_out, wall_out,
-                        wuv_bl, wuv_tr, wuv_tl, hex_color);
-                }
-            }
-        }
-    }
-
-    // 11. Cleanup
+    // 10. Cleanup
     free(hm_heights);
     free(hm_atlas);
     free(hm_colors);
     free(hm_slopes);
-    free(hm_arch_bot);
-    free(hm_arch_top);
-    free(hm_is_arch);
     #undef HEX_POS
 }
 
@@ -1263,10 +1006,6 @@ static void generate_coarse_mesh_params(
     fnl_state warp = create_warp_noise(seed);
     fnl_state detail = create_detail_noise(seed);
     fnl_state cnoise = create_color_noise(seed);
-
-    // Arch frame for injecting test arch geometry
-    ArchFrame arch_f = arch_make_frame(planet_radius);
-    float arch_base = arch_compute_base(&arch_f, seed, planet_radius);
 
     int max_verts = tess * tess * 6 * 3;
     *out_vertices = (LodVertex*)malloc(max_verts * sizeof(LodVertex));
@@ -1298,13 +1037,6 @@ static void generate_coarse_mesh_params(
             float h_m = sample_terrain_height_m(&continental, &mountain_n, &warp, &detail, p);
             // Clamp to sea level for ocean surface
             float effective_h_m = fmaxf(h_m, TERRAIN_SEA_LEVEL_M);
-
-            // Inject test arch: raise terrain where arch exists
-            float arch_h = arch_max_height(&arch_f, p, planet_radius, arch_base);
-            if (arch_h > effective_h_m) {
-                effective_h_m = arch_h;
-                h_m = arch_h;  // use arch height for color too
-            }
 
             float radius = planet_radius + effective_h_m;
 
@@ -1734,6 +1466,8 @@ static float patch_center_distance(const LodTree* tree, const LodNode* node) {
 // have identical thresholds — no asymmetry from aperture-4 corner vs center children.
 static bool should_split(const LodTree* tree, const LodNode* node) {
     if (node->depth >= LOD_MAX_DEPTH) return false;
+    // Don't split into hex-detail depth when hex terrain covers the area
+    if (node->depth + 1 >= LOD_MAX_DEPTH && tree->suppress_range > 0.0f) return false;
     float dist = patch_center_distance(tree, node);
     float patch_arc = tree->depth_arc[node->depth];
     return dist < patch_arc * tree->split_factor;
@@ -2064,9 +1798,12 @@ typedef struct {
 
 // Draw a single node with the correct pipeline
 static void draw_node(const LodTree* tree, const LodNode* node, RenderState* rs) {
-    (void)tree;
     if (node->state != LOD_ACTIVE || node->gpu_vertex_count == 0 ||
         node->gpu_buffer.id == SG_INVALID_ID)
+        return;
+
+    // Suppress LOD hex-detail patches when hex terrain system is active
+    if (node->is_hex_mesh && tree->suppress_range > 0.0f)
         return;
 
     if (node->is_hex_mesh && rs->hex) {
@@ -2321,12 +2058,6 @@ double lod_tree_terrain_height(const LodTree* tree, HMM_Vec3 world_pos) {
     fnl_state detail = create_detail_noise(tree->seed);
     float h_m = sample_terrain_height_m(&continental, &mountain_n, &warp, &detail, unit);
     float effective_h_m = fmaxf(h_m, TERRAIN_SEA_LEVEL_M);
-
-    // Test arch collision
-    ArchFrame af = arch_make_frame(tree->planet_radius);
-    float arch_base = arch_compute_base(&af, tree->seed, tree->planet_radius);
-    float ah = arch_max_height(&af, unit, tree->planet_radius, arch_base);
-    if (ah > effective_h_m) effective_h_m = ah;
 
     // Add in double to avoid float quantization (6.25cm steps at 800km)
     return (double)tree->planet_radius + (double)effective_h_m;

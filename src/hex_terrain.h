@@ -16,6 +16,8 @@
 #define HEX_TRANSITION_ON   375.0f      // Switch chunk TO transition mode (hysteresis high)
 #define HEX_TRANSITION_OFF  325.0f      // Revert chunk FROM transition mode (hysteresis low)
 #define HEX_CHUNK_SIZE      32          // Hex columns per chunk side (32x32 grid)
+#define HEX_CHUNK_LAYERS    128         // Vertical layers per chunk (128m)
+#define HEX_BASE_PADDING    16          // Layers below min terrain for excavation room
 #define HEX_MAX_CHUNKS      512         // Maximum active chunks
 #define HEX_MAX_COLUMN_H    16384       // Maximum terrain height in layers (int16_t, covers up to 16km)
 #define HEX_MAX_UPLOADS      32         // GPU uploads per frame
@@ -37,9 +39,15 @@ typedef struct HexChunk {
     bool generating;            // Mesh is being generated on worker thread
     bool is_transition;         // True = smooth surface-only mesh (transition zone)
 
-    // Per-column terrain data (offset grid within chunk)
-    int16_t heights[HEX_CHUNK_SIZE][HEX_CHUNK_SIZE];   // Terrain height in layers
-    uint8_t types[HEX_CHUNK_SIZE][HEX_CHUNK_SIZE];     // VoxelType of surface block
+    // 3D voxel data: [col][row][layer] — local layer index
+    // world_layer = local_layer + base_layer
+    // Dynamically allocated when chunk activates (128KB per chunk)
+    uint8_t* voxels;            // HEX_CHUNK_SIZE * HEX_CHUNK_SIZE * HEX_CHUNK_LAYERS
+    int base_layer;             // World layer offset
+
+    // Per-column optimization cache (local layer indices, -1 = all air)
+    int16_t col_min_solid[HEX_CHUNK_SIZE][HEX_CHUNK_SIZE];
+    int16_t col_max_solid[HEX_CHUNK_SIZE][HEX_CHUNK_SIZE];
 
     // GPU mesh
     sg_buffer gpu_buffer;
@@ -51,6 +59,10 @@ typedef struct HexChunk {
 
     void* pending_job;          // HexMeshJob* (opaque)
 } HexChunk;
+
+// Voxel access macro for 3D array (col, row, layer are local)
+#define HEX_VOXEL(voxels, col, row, layer) \
+    ((voxels)[(col) * HEX_CHUNK_SIZE * HEX_CHUNK_LAYERS + (row) * HEX_CHUNK_LAYERS + (layer)])
 
 // ---- Hex terrain system ----
 typedef struct HexTerrain {
@@ -94,8 +106,11 @@ typedef struct HexHitResult {
     int chunk_index;         // Index into ht->chunks[]
     int col, row;            // Local column/row within chunk
     int gcol, grow;          // Global grid coordinates
-    int height;              // Terrain height at hit hex (in layers)
-    uint8_t type;            // VoxelType of surface block
+    int layer;               // World layer of hit voxel
+    uint8_t type;            // VoxelType of hit block
+    int face;                // 0=top, 1=bottom, 2-7=side (dir 0-5)
+    int place_gcol, place_grow;  // Global coords for block placement
+    int place_layer;         // Layer for block placement
 } HexHitResult;
 
 // ---- API ----
@@ -123,24 +138,38 @@ bool hex_terrain_covers_position(const HexTerrain* ht, HMM_Vec3 world_pos);
 float hex_terrain_get_range(void);
 
 // Get effective suppress range based on current mesh coverage.
-// Returns HEX_RANGE when >=80% of active chunks have GPU meshes, 0 otherwise.
-// Use to prevent black holes during chunk generation.
 float hex_terrain_effective_range(const HexTerrain* ht);
 
-// Raycast from camera into hex terrain. Returns hit info.
+// Raycast from camera into hex terrain. Returns hit info with face and placement position.
 HexHitResult hex_terrain_raycast(const HexTerrain* ht, HMM_Vec3 ray_origin,
                                   HMM_Vec3 ray_dir, float max_dist);
 
-// Remove top layer at the given hex. Marks chunk dirty for remeshing.
+// Remove a specific voxel. Marks chunk dirty for remeshing.
 bool hex_terrain_break(HexTerrain* ht, const HexHitResult* hit);
 
-// Place a block on top of the given hex. Marks chunk dirty for remeshing.
+// Place a block at the placement position in hit result. Marks chunk dirty.
 bool hex_terrain_place(HexTerrain* ht, const HexHitResult* hit, uint8_t voxel_type);
 
 // Generate wireframe vertices for a hex selection highlight.
 // Writes 12 float3 vertices (6 line segments) into out_verts (must hold 36 floats).
-// Returns true if successful.
 bool hex_terrain_build_highlight(const HexTerrain* ht, const HexHitResult* hit,
                                   const double world_origin[3], float* out_verts);
+
+// ---- Voxel query API (for collision system) ----
+
+// Get voxel type at global hex coords + world layer. Returns VOXEL_AIR if out of range.
+uint8_t hex_terrain_get_voxel(const HexTerrain* ht, int gcol, int grow, int world_layer);
+
+// Get ground height at a global hex column (world layer of topmost solid with air above).
+// Returns planet_radius + ground_layer * HEX_HEIGHT in meters.
+float hex_terrain_ground_height(const HexTerrain* ht, int gcol, int grow);
+
+// Check if there are 'clearance' layers of air above feet_layer at (gcol, grow).
+bool hex_terrain_has_headroom(const HexTerrain* ht, int gcol, int grow,
+                               int feet_layer, int clearance);
+
+// Convert a world-space position to hex grid coords + layer.
+void hex_terrain_world_to_hex(const HexTerrain* ht, HMM_Vec3 world_pos,
+                               int* out_gcol, int* out_grow, int* out_layer);
 
 #endif
