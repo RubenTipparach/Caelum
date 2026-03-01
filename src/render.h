@@ -90,6 +90,11 @@ typedef struct Renderer {
     sg_buffer highlight_buf;
     HexHitResult hex_selection;
 
+    // Wireframe overlay (LOD debug mode)
+    sg_pipeline lod_wireframe_pip;   // wireframe for LodVertex (stride 36)
+    sg_pipeline hex_wireframe_pip;   // wireframe for HexVertex (stride 32)
+    sg_buffer wireframe_idx;         // shared wireframe index buffer
+
     // Profiler (F3)
     bool show_profiler;
     ProfileStats profile;

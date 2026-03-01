@@ -6,6 +6,7 @@
 #include "HandmadeMath.h"
 #include "sokol_gfx.h"
 #include "job_system.h"
+#include "hex_vertex.h"
 
 // ---- Configuration ----
 #define LOD_MAX_DEPTH       13      // Max subdivision depth
@@ -52,10 +53,13 @@ typedef struct LodNode {
     int gpu_vertex_count;
 
     // CPU mesh data (generated, then uploaded to GPU)
-    LodVertex* cpu_vertices;
+    // For hex meshes (depth >= LOD_MAX_DEPTH), this stores HexVertex* data instead.
+    void* cpu_vertices;
     int cpu_vertex_count;
+    int cpu_vertex_stride;      // sizeof(LodVertex) or sizeof(HexVertex)
 
     bool is_leaf;               // True if this node has no children
+    bool is_hex_mesh;           // True if mesh uses HexVertex format (depth >= LOD_MAX_DEPTH)
     bool wants_split;           // Marked for subdivision
     bool wants_merge;           // Marked for merge
     void* pending_job;          // MeshGenJob* (opaque, defined in lod.c)
@@ -132,9 +136,38 @@ void lod_tree_upload_meshes(LodTree* tree);
 // NULL = no callback.
 typedef void (*LodPreDrawFunc)(int depth, void* user_data);
 
-// Render all active leaf nodes
+// Pipeline uniform block info (opaque to lod.c, applied via sg_apply_uniforms)
+typedef struct LodUniformBlock {
+    int slot;
+    const void* data;
+    size_t size;
+} LodUniformBlock;
+
+// Hex pipeline rendering info for depth-13 nodes
+typedef struct LodHexRenderInfo {
+    sg_pipeline pip;
+    sg_view atlas_view;
+    sg_sampler atlas_smp;
+    LodUniformBlock vs_ub;
+    LodUniformBlock fs_ub;
+} LodHexRenderInfo;
+
+// Render all active leaf nodes.
+// planet_ub: uniform blocks for the planet pipeline (re-applied after hex pipeline switch).
+// hex: pipeline + atlas + uniforms for depth-13 hex mesh nodes. NULL to skip hex nodes.
 void lod_tree_render(LodTree* tree, sg_pipeline pip, HMM_Mat4 vp,
-                     LodPreDrawFunc pre_draw, void* user_data);
+                     LodPreDrawFunc pre_draw, void* user_data,
+                     const LodUniformBlock planet_ub[2],
+                     const LodHexRenderInfo* hex);
+
+// Render wireframe overlay for all active leaf nodes (LOD debug mode).
+// pip_planet: wireframe pipeline for LodVertex (36-byte stride).
+// pip_hex:    wireframe pipeline for HexVertex (32-byte stride).
+// index_buf:  shared wireframe index buffer (triangle edges as lines).
+// ub[2]:      VS + FS uniform blocks for the wireframe shader.
+void lod_tree_render_wireframe(LodTree* tree,
+                                sg_pipeline pip_planet, sg_pipeline pip_hex,
+                                sg_buffer index_buf, const LodUniformBlock ub[2]);
 
 // Find the finest leaf node containing a world position
 

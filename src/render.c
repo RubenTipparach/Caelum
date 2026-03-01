@@ -289,6 +289,84 @@ void render_init(Renderer* r, Planet* planet, const Camera* cam) {
         });
     }
 
+    // ---- Wireframe overlay pipelines (LOD debug mode) ----
+    {
+        sg_shader wire_shd = sg_make_shader(highlight_shader_desc(sg_query_backend()));
+
+        // Pipeline for LodVertex (36-byte stride)
+        r->lod_wireframe_pip = sg_make_pipeline(&(sg_pipeline_desc){
+            .shader = wire_shd,
+            .layout = {
+                .buffers[0] = { .stride = 36 },
+                .attrs = {
+                    [ATTR_highlight_a_position] = { .format = SG_VERTEXFORMAT_FLOAT3 },
+                }
+            },
+            .index_type = SG_INDEXTYPE_UINT32,
+            .primitive_type = SG_PRIMITIVETYPE_LINES,
+            .depth = {
+                .compare = SG_COMPAREFUNC_LESS_EQUAL,
+                .write_enabled = false,
+            },
+            .cull_mode = SG_CULLMODE_NONE,
+            .colors[0] = {
+                .blend = {
+                    .enabled = true,
+                    .src_factor_rgb = SG_BLENDFACTOR_SRC_ALPHA,
+                    .dst_factor_rgb = SG_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
+                    .src_factor_alpha = SG_BLENDFACTOR_ONE,
+                    .dst_factor_alpha = SG_BLENDFACTOR_ZERO,
+                }
+            },
+            .label = "lod-wireframe-pipeline",
+        });
+
+        // Pipeline for HexVertex (32-byte stride)
+        r->hex_wireframe_pip = sg_make_pipeline(&(sg_pipeline_desc){
+            .shader = wire_shd,
+            .layout = {
+                .buffers[0] = { .stride = 32 },
+                .attrs = {
+                    [ATTR_highlight_a_position] = { .format = SG_VERTEXFORMAT_FLOAT3 },
+                }
+            },
+            .index_type = SG_INDEXTYPE_UINT32,
+            .primitive_type = SG_PRIMITIVETYPE_LINES,
+            .depth = {
+                .compare = SG_COMPAREFUNC_LESS_EQUAL,
+                .write_enabled = false,
+            },
+            .cull_mode = SG_CULLMODE_NONE,
+            .colors[0] = {
+                .blend = {
+                    .enabled = true,
+                    .src_factor_rgb = SG_BLENDFACTOR_SRC_ALPHA,
+                    .dst_factor_rgb = SG_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
+                    .src_factor_alpha = SG_BLENDFACTOR_ONE,
+                    .dst_factor_alpha = SG_BLENDFACTOR_ZERO,
+                }
+            },
+            .label = "hex-wireframe-pipeline",
+        });
+
+        // Shared wireframe index buffer: maps triangle lists to line edges.
+        // For triangle (v0,v1,v2): edges (v0,v1), (v1,v2), (v2,v0).
+        #define WIREFRAME_MAX_VERTS 200000  // large enough for hex prisms with walls
+        uint32_t* wire_indices = (uint32_t*)malloc(WIREFRAME_MAX_VERTS * 2 * sizeof(uint32_t));
+        for (int i = 0; i < WIREFRAME_MAX_VERTS; i += 3) {
+            int base = (i / 3) * 6;
+            wire_indices[base + 0] = i;     wire_indices[base + 1] = i + 1;
+            wire_indices[base + 2] = i + 1; wire_indices[base + 3] = i + 2;
+            wire_indices[base + 4] = i + 2; wire_indices[base + 5] = i;
+        }
+        r->wireframe_idx = sg_make_buffer(&(sg_buffer_desc){
+            .usage.index_buffer = true,
+            .data = { wire_indices, WIREFRAME_MAX_VERTS * 2 * sizeof(uint32_t) },
+            .label = "wireframe-indices",
+        });
+        free(wire_indices);
+    }
+
     printf("[RENDER] All pipelines created\n");
     fflush(stdout);
 }
@@ -305,37 +383,10 @@ void render_update_mesh(Renderer* r, Planet* planet, const Camera* cam) {
     lod_tree_upload_meshes(&r->lod_tree);
     uint64_t t2 = stm_now();
 
-    // Update hex terrain (close-range voxel grid).
-    // Only run after LOD tree has built enough patches (avoid competing during loading).
+    // Hex terrain disabled — LOD depth-13 now generates hex grid meshes directly.
+    // Block interactions will be re-added on LOD-13 nodes in a future step.
     double hex_update_ms = 0, hex_upload_ms = 0;
-    if (lod_tree_active_leaves(&r->lod_tree) >= 20) {
-        hex_terrain_update(&r->hex_terrain, cam->position, r->lod_tree.world_origin);
-        uint64_t t3 = stm_now();
-        hex_terrain_upload_meshes(&r->hex_terrain);
-        uint64_t t4 = stm_now();
-        hex_update_ms = stm_ms(stm_diff(t3, t2));
-        hex_upload_ms = stm_ms(stm_diff(t4, t3));
-
-        // Suppress LOD patches where hex terrain has coverage (prevents overlap)
-        r->lod_tree.suppress_range = hex_terrain_effective_range(&r->hex_terrain);
-    } else {
-        r->lod_tree.suppress_range = 0.0f;
-    }
-
-    // Hex selection raycast (every frame)
-    r->hex_selection = hex_terrain_raycast(&r->hex_terrain,
-        cam->position, cam->forward, 10.0f);
-
-    // Build wireframe vertices if selection is valid
-    if (r->hex_selection.valid) {
-        float verts[36];  // 12 vertices * 3 floats
-        if (hex_terrain_build_highlight(&r->hex_terrain, &r->hex_selection,
-                                         r->lod_tree.world_origin, verts)) {
-            sg_update_buffer(r->highlight_buf, &(sg_range){ verts, sizeof(verts) });
-        } else {
-            r->hex_selection.valid = false;
-        }
-    }
+    r->hex_selection.valid = false;
 
     // Accumulate profiler timings
     r->profile.accum_lod_update_ms += (float)stm_ms(stm_diff(t1, t0));
@@ -480,61 +531,60 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
     sg_apply_uniforms(UB_planet_vs_params, &SG_RANGE(vs_params));
     sg_apply_uniforms(UB_planet_fs_params, &SG_RANGE(fs_params));
 
+    // Set up hex terrain render info for depth-13 hex mesh nodes
+    hex_terrain_vs_params_t hex_vs = {
+        .mvp = vp_terrain,
+        .camera_offset = vs_params.camera_offset,
+        .camera_offset_low = vs_params.camera_offset_low,
+        .log_depth = vs_params.log_depth,
+    };
+    hex_terrain_fs_params_t hex_fs = {
+        .sun_direction = fs_params.sun_direction,
+        .camera_pos = fs_params.camera_pos,
+        .atmos_params = fs_params.atmos_params,
+        .lod_debug = fs_params.lod_debug,
+        .dusk_sun_color = fs_params.dusk_sun_color,
+        .day_sun_color = fs_params.day_sun_color,
+    };
+    LodHexRenderInfo hex_info = {
+        .pip = r->hex_pip,
+        .atlas_view = r->hex_atlas_view,
+        .atlas_smp = r->hex_atlas_smp,
+        .vs_ub = { .slot = UB_hex_terrain_vs_params, .data = &hex_vs, .size = sizeof(hex_vs) },
+        .fs_ub = { .slot = UB_hex_terrain_fs_params, .data = &hex_fs, .size = sizeof(hex_fs) },
+    };
+    LodUniformBlock planet_ub[2] = {
+        { .slot = UB_planet_vs_params, .data = &vs_params, .size = sizeof(vs_params) },
+        { .slot = UB_planet_fs_params, .data = &fs_params, .size = sizeof(fs_params) },
+    };
+
     if (r->show_lod_debug) {
-        // LOD debug mode: per-patch callback sets depth-based color
         LodDebugState debug_state = {
             .fs_params = fs_params,
             .max_depth = (float)LOD_MAX_DEPTH,
         };
         lod_tree_render(&r->lod_tree, r->pip, vp,
-                        lod_debug_pre_draw, &debug_state);
+                        lod_debug_pre_draw, &debug_state, planet_ub, &hex_info);
+
+        // Wireframe overlay: draw triangle edges on top of LOD patches
+        highlight_vs_params_t wire_vs = {
+            .mvp = vp_terrain,
+            .camera_offset = vs_params.camera_offset,
+            .camera_offset_low = vs_params.camera_offset_low,
+            .log_depth = vs_params.log_depth,
+        };
+        highlight_fs_params_t wire_fs = {
+            .color = (HMM_Vec4){{0.0f, 0.0f, 0.0f, 0.4f}},
+        };
+        LodUniformBlock wire_ub[2] = {
+            { .slot = UB_highlight_vs_params, .data = &wire_vs, .size = sizeof(wire_vs) },
+            { .slot = UB_highlight_fs_params, .data = &wire_fs, .size = sizeof(wire_fs) },
+        };
+        lod_tree_render_wireframe(&r->lod_tree,
+            r->lod_wireframe_pip, r->hex_wireframe_pip,
+            r->wireframe_idx, wire_ub);
     } else {
-        // Normal mode: uniforms already set, no callback needed
-        lod_tree_render(&r->lod_tree, r->pip, vp, NULL, NULL);
-    }
-
-    // ---- 3b. Draw hex terrain (close-range voxel grid, textured) ----
-    sg_apply_pipeline(r->hex_pip);
-    {
-        hex_terrain_vs_params_t hex_vs = {
-            .mvp = vp_terrain,
-            .camera_offset = vs_params.camera_offset,
-            .camera_offset_low = vs_params.camera_offset_low,
-            .log_depth = vs_params.log_depth,
-        };
-        hex_terrain_fs_params_t hex_fs = {
-            .sun_direction = fs_params.sun_direction,
-            .camera_pos = fs_params.camera_pos,
-            .atmos_params = fs_params.atmos_params,
-            .lod_debug = fs_params.lod_debug,
-            .dusk_sun_color = fs_params.dusk_sun_color,
-            .day_sun_color = fs_params.day_sun_color,
-        };
-        sg_apply_uniforms(UB_hex_terrain_vs_params, &SG_RANGE(hex_vs));
-        sg_apply_uniforms(UB_hex_terrain_fs_params, &SG_RANGE(hex_fs));
-    }
-    hex_terrain_render(&r->hex_terrain, r->hex_pip,
-                       r->hex_atlas_view, r->hex_atlas_smp);
-
-    // ---- 3c. Draw hex selection wireframe ----
-    if (r->hex_selection.valid) {
-        sg_apply_pipeline(r->highlight_pip);
-
-        highlight_vs_params_t hl_vs = {
-            .mvp = vp_terrain,
-            .camera_offset = vs_params.camera_offset,
-            .camera_offset_low = vs_params.camera_offset_low,
-            .log_depth = vs_params.log_depth,
-        };
-        highlight_fs_params_t hl_fs = {
-            .color = (HMM_Vec4){{1.0f, 1.0f, 1.0f, 1.0f}},
-        };
-        sg_apply_uniforms(UB_highlight_vs_params, &SG_RANGE(hl_vs));
-        sg_apply_uniforms(UB_highlight_fs_params, &SG_RANGE(hl_fs));
-
-        sg_bindings hl_bind = { .vertex_buffers[0] = r->highlight_buf };
-        sg_apply_bindings(&hl_bind);
-        sg_draw(0, 12, 1);
+        lod_tree_render(&r->lod_tree, r->pip, vp, NULL, NULL, planet_ub, &hex_info);
     }
 
     // ---- Profiler timing ----
@@ -560,11 +610,11 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
         r->profile.lod_patches = lod_tree_active_leaves(&r->lod_tree);
         r->profile.lod_gpu_verts = r->lod_tree.total_vertex_count;
         r->profile.lod_nodes = r->lod_tree.node_count;
-        r->profile.hex_chunks_active = r->hex_terrain.active_count;
-        r->profile.hex_chunks_meshed = r->hex_terrain.chunks_rendered;
-        r->profile.hex_gpu_verts = r->hex_terrain.total_vertex_count;
-        r->profile.total_triangles = (r->profile.lod_gpu_verts + r->profile.hex_gpu_verts) / 3;
-        r->profile.draw_calls = r->profile.lod_patches + r->profile.hex_chunks_meshed + 2; // +sky+atmos
+        r->profile.hex_chunks_active = 0;
+        r->profile.hex_chunks_meshed = 0;
+        r->profile.hex_gpu_verts = 0;
+        r->profile.total_triangles = r->profile.lod_gpu_verts / 3;
+        r->profile.draw_calls = r->profile.lod_patches + 2; // +sky+atmos
         r->profile.job_pending = job_system_pending(r->lod_tree.jobs);
 
         // Reset accumulators
@@ -692,6 +742,15 @@ void render_shutdown(Renderer* r) {
     hex_terrain_destroy(&r->hex_terrain);
     atmosphere_destroy(&r->atmosphere);
     lod_tree_destroy(&r->lod_tree);
+    if (r->wireframe_idx.id != SG_INVALID_ID) {
+        sg_destroy_buffer(r->wireframe_idx);
+    }
+    if (r->lod_wireframe_pip.id != SG_INVALID_ID) {
+        sg_destroy_pipeline(r->lod_wireframe_pip);
+    }
+    if (r->hex_wireframe_pip.id != SG_INVALID_ID) {
+        sg_destroy_pipeline(r->hex_wireframe_pip);
+    }
     if (r->highlight_buf.id != SG_INVALID_ID) {
         sg_destroy_buffer(r->highlight_buf);
     }
