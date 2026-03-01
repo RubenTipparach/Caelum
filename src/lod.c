@@ -33,8 +33,10 @@ typedef struct MeshGenJob {
     float origin[3];  // Floating origin — subtract from world positions
 
     // Output (written by worker thread)
-    LodVertex* vertices;
+    void* vertices;
     int vertex_count;
+    int vertex_stride;      // sizeof(LodVertex) or sizeof(HexVertex)
+    bool is_hex_mesh;       // True if vertices are HexVertex[]
 
     // Linkage
     int node_index;
@@ -438,6 +440,18 @@ void lod_tree_destroy(LodTree* tree) {
     tree->node_capacity = 0;
 }
 
+// ---- Hex grid constants (for LOD depth-13 hex mesh generation) ----
+#define LOD_HEX_RADIUS      1.0f
+#define LOD_HEX_COL_SPACING (1.5f * LOD_HEX_RADIUS)
+#define LOD_HEX_ROW_SPACING (1.7320508f * LOD_HEX_RADIUS)  // sqrt(3)
+
+static const float LOD_HEX_COS[6] = {
+    1.0f, 0.5f, -0.5f, -1.0f, -0.5f, 0.5f
+};
+static const float LOD_HEX_SIN[6] = {
+    0.0f, 0.8660254f, 0.8660254f, 0.0f, -0.8660254f, -0.8660254f
+};
+
 // ---- Mesh generation ----
 
 // Helper: emit a triangle into the vertex array
@@ -473,6 +487,403 @@ static void lod_emit_tri(LodVertex** verts, int* count, int* cap,
     v[2].color[0] = color.X; v[2].color[1] = color.Y; v[2].color[2] = color.Z;
 
     *count += 3;
+}
+
+// ---- Hex grid mesh generation for depth-13 LOD nodes ----
+
+// Texture atlas mapping (must match hex_terrain.c)
+#define LOD_HEX_ATLAS_TILES 9
+#define LOD_ATLAS_WATER  0
+#define LOD_ATLAS_SAND   1
+#define LOD_ATLAS_GRASS  3
+#define LOD_ATLAS_STONE  4
+#define LOD_ATLAS_ICE    5
+
+static int lod_hex_atlas(float height_m) {
+    float rel = height_m - TERRAIN_SEA_LEVEL_M;
+    if (height_m < TERRAIN_SEA_LEVEL_M) return LOD_ATLAS_WATER;
+    if (rel < 200.0f) return LOD_ATLAS_SAND;
+    if (rel < 1500.0f) return LOD_ATLAS_GRASS;
+    if (rel < 3000.0f) return LOD_ATLAS_STONE;
+    if (rel < 4500.0f) return LOD_ATLAS_STONE;
+    return LOD_ATLAS_ICE;
+}
+
+typedef struct { float u, v; } LodHexUV;
+
+static LodHexUV lod_hex_top_uv(float vx, float vz, float cx, float cz, int atlas_idx) {
+    float local_u = (vx - cx) / (2.0f * LOD_HEX_RADIUS) + 0.5f;
+    float local_v = (vz - cz) / (LOD_HEX_ROW_SPACING) + 0.5f;
+    LodHexUV uv;
+    uv.u = ((float)atlas_idx + local_u) / (float)LOD_HEX_ATLAS_TILES;
+    uv.v = local_v;
+    return uv;
+}
+
+// ---- Hex neighbor lookup (axial coordinate system) ----
+
+static const int LOD_AX_NEIGHBORS[6][2] = {
+    { +1,  0 },   // dir 0: NE
+    { +1, -1 },   // dir 1: SE
+    {  0, -1 },   // dir 2: S
+    { -1,  0 },   // dir 3: SW
+    { -1, +1 },   // dir 4: NW
+    {  0, +1 },   // dir 5: N
+};
+
+// Map neighbor direction to hex edge index (edge i = vertex[i] to vertex[(i+1)%6])
+static const int LOD_DIR_TO_EDGE[6] = {
+    0,  // dir 0 (NE) → edge 0 (v0-v1)
+    5,  // dir 1 (SE) → edge 5 (v5-v0)
+    4,  // dir 2 (S)  → edge 4 (v4-v5)
+    3,  // dir 3 (SW) → edge 3 (v3-v4)
+    2,  // dir 4 (NW) → edge 2 (v2-v3)
+    1,  // dir 5 (N)  → edge 1 (v1-v2)
+};
+
+static void lod_hex_neighbor(int col, int row, int dir, int* ncol, int* nrow) {
+    int q = col;
+    int r = row - (col - (col & 1)) / 2;
+    int nq = q + LOD_AX_NEIGHBORS[dir][0];
+    int nr = r + LOD_AX_NEIGHBORS[dir][1];
+    *ncol = nq;
+    *nrow = nr + (nq - (nq & 1)) / 2;
+}
+
+// ---- Wall atlas helpers ----
+
+#define LOD_ATLAS_DIRT       2
+#define LOD_ATLAS_DIRT_GRASS 7
+#define LOD_ATLAS_DIRT_SNOW  8
+
+#define LOD_HEX_SURFACE_BIAS 0.05f
+#define LOD_HEX_MAX_WALL     32
+
+static int lod_side_atlas(int cap_atlas) {
+    if (cap_atlas == LOD_ATLAS_GRASS) return LOD_ATLAS_DIRT_GRASS;
+    if (cap_atlas == LOD_ATLAS_ICE)   return LOD_ATLAS_DIRT_SNOW;
+    return cap_atlas;
+}
+
+static int lod_wall_atlas(int cap_atlas, float surface_h, float wall_y) {
+    float depth = surface_h - wall_y;
+    if (depth < 1.0f) return lod_side_atlas(cap_atlas);
+    if (depth < 3.0f) return LOD_ATLAS_DIRT;
+    return LOD_ATLAS_STONE;
+}
+
+// Emit a hex triangle into HexVertex array.
+// winding_normal: used for CCW winding check (e.g., wall_outward for walls).
+// shading_normal: stored in vertex for lighting (e.g., local_up for voxel-style).
+static void lod_hex_emit_tri(HexVertex** verts, int* count, int* cap,
+                              HMM_Vec3 p0, HMM_Vec3 p1, HMM_Vec3 p2,
+                              HMM_Vec3 winding_normal, HMM_Vec3 shading_normal,
+                              LodHexUV uv0, LodHexUV uv1, LodHexUV uv2) {
+    HMM_Vec3 e1 = vec3_sub(p1, p0);
+    HMM_Vec3 e2 = vec3_sub(p2, p0);
+    HMM_Vec3 face_n = vec3_cross(e1, e2);
+    if (vec3_dot(face_n, winding_normal) < 0.0f) {
+        HMM_Vec3 tmp = p1; p1 = p2; p2 = tmp;
+        LodHexUV utmp = uv1; uv1 = uv2; uv2 = utmp;
+    }
+
+    if (*count + 3 > *cap) {
+        *cap = (*cap) * 2;
+        *verts = (HexVertex*)realloc(*verts, *cap * sizeof(HexVertex));
+    }
+    HexVertex* v = &(*verts)[*count];
+
+    v[0].pos[0] = p0.X; v[0].pos[1] = p0.Y; v[0].pos[2] = p0.Z;
+    v[0].normal[0] = shading_normal.X; v[0].normal[1] = shading_normal.Y; v[0].normal[2] = shading_normal.Z;
+    v[0].uv[0] = uv0.u; v[0].uv[1] = uv0.v;
+
+    v[1].pos[0] = p1.X; v[1].pos[1] = p1.Y; v[1].pos[2] = p1.Z;
+    v[1].normal[0] = shading_normal.X; v[1].normal[1] = shading_normal.Y; v[1].normal[2] = shading_normal.Z;
+    v[1].uv[0] = uv1.u; v[1].uv[1] = uv1.v;
+
+    v[2].pos[0] = p2.X; v[2].pos[1] = p2.Y; v[2].pos[2] = p2.Z;
+    v[2].normal[0] = shading_normal.X; v[2].normal[1] = shading_normal.Y; v[2].normal[2] = shading_normal.Z;
+    v[2].uv[0] = uv2.u; v[2].uv[1] = uv2.v;
+
+    *count += 3;
+}
+
+// Point-in-triangle test (2D) with margin.
+static bool point_in_triangle_margin(float px, float pz,
+                                      const float tx[3], const float tz[3],
+                                      float margin) {
+    for (int i = 0; i < 3; i++) {
+        int j = (i + 1) % 3;
+        float ex = tx[j] - tx[i];
+        float ez = tz[j] - tz[i];
+        float nx = -ez;
+        float nz = ex;
+        float len = sqrtf(nx * nx + nz * nz);
+        if (len < 1e-8f) continue;
+        nx /= len;
+        nz /= len;
+        float d = (px - tx[i]) * nx + (pz - tz[i]) * nz;
+        if (d < -margin) return false;
+    }
+    return true;
+}
+
+// Generate hex prism mesh filling a spherical triangle.
+// Each hex gets a quantized height (1m steps), flat cap perpendicular to planet
+// radial direction, and vertical walls where adjacent hexes differ in height.
+// Outputs HexVertex[] (pos + normal + uv) for rendering with hex terrain pipeline.
+static void generate_hex_mesh_for_triangle(
+    const SphericalTriangle* tri, float planet_radius, int seed,
+    HexVertex** out_vertices, int* out_count)
+{
+    // 1. Compute local tangent frame at triangle center
+    HMM_Vec3 center = tri->center;
+    HMM_Vec3 world_y = {{0.0f, 1.0f, 0.0f}};
+    if (fabsf(vec3_dot(center, world_y)) > 0.99f)
+        world_y = (HMM_Vec3){{1.0f, 0.0f, 0.0f}};
+    HMM_Vec3 east = vec3_normalize(vec3_cross(world_y, center));
+    HMM_Vec3 north = vec3_normalize(vec3_cross(center, east));
+
+    // 2. Project triangle vertices to 2D tangent plane
+    float tvx[3], tvz[3];
+    HMM_Vec3 verts[3] = { tri->v0, tri->v1, tri->v2 };
+    for (int i = 0; i < 3; i++) {
+        float dot_vc = vec3_dot(verts[i], center);
+        HMM_Vec3 offset = vec3_sub(verts[i], vec3_scale(center, dot_vc));
+        tvx[i] = vec3_dot(offset, east) * planet_radius;
+        tvz[i] = vec3_dot(offset, north) * planet_radius;
+    }
+
+    // 3. Compute bounding box with margin
+    float margin = LOD_HEX_RADIUS * 1.5f;
+    float min_x = fminf(tvx[0], fminf(tvx[1], tvx[2])) - margin;
+    float max_x = fmaxf(tvx[0], fmaxf(tvx[1], tvx[2])) + margin;
+    float min_z = fminf(tvz[0], fminf(tvz[1], tvz[2])) - margin;
+    float max_z = fmaxf(tvz[0], fmaxf(tvz[1], tvz[2])) + margin;
+
+    // 4. Convert to hex grid column/row range
+    int col_min = (int)floorf(min_x / LOD_HEX_COL_SPACING);
+    int col_max = (int)ceilf(max_x / LOD_HEX_COL_SPACING);
+    int row_min = (int)floorf(min_z / LOD_HEX_ROW_SPACING) - 1;
+    int row_max = (int)ceilf(max_z / LOD_HEX_ROW_SPACING) + 1;
+
+    // 5. Create noise states
+    fnl_state noise = create_terrain_noise(seed);
+    fnl_state warp = create_warp_noise(seed);
+    fnl_state detail = create_detail_noise(seed);
+
+    HMM_Vec3 center_scaled = vec3_scale(center, planet_radius);
+
+    // 6. Phase 1: Build height map — sample terrain at hex centers, quantize
+    int grid_cols = col_max - col_min + 1;
+    int grid_rows = row_max - row_min + 1;
+    int grid_size = grid_cols * grid_rows;
+    int16_t* hm_heights = (int16_t*)malloc(grid_size * sizeof(int16_t));
+    uint8_t* hm_atlas = (uint8_t*)malloc(grid_size * sizeof(uint8_t));
+    for (int i = 0; i < grid_size; i++) hm_heights[i] = INT16_MIN;
+
+    for (int col = col_min; col <= col_max; col++) {
+        for (int row = row_min; row <= row_max; row++) {
+            float hx = col * LOD_HEX_COL_SPACING;
+            float hz = ((col & 1) ? (row + 0.5f) : (float)row) * LOD_HEX_ROW_SPACING;
+            if (!point_in_triangle_margin(hx, hz, tvx, tvz, margin))
+                continue;
+
+            HMM_Vec3 cdir = vec3_normalize(
+                vec3_add(center_scaled,
+                    vec3_add(vec3_scale(east, hx), vec3_scale(north, hz))));
+            float h_m = sample_terrain_height_m(&noise, &warp, &detail, cdir);
+            float eff = fmaxf(h_m, TERRAIN_SEA_LEVEL_M);
+            int h = (int)ceilf(eff);  // Quantize to 1m steps (ceil so cap >= smooth surface)
+            if (h < 0) h = 0;
+
+            int gi = (col - col_min) * grid_rows + (row - row_min);
+            hm_heights[gi] = (int16_t)h;
+            hm_atlas[gi] = (uint8_t)lod_hex_atlas(h_m);
+        }
+    }
+
+    // 7. Phase 1.5: Compute terrain slope normals from height map.
+    //    The slope normal encodes the macro terrain orientation so that hexes
+    //    on the shadow side of a mountain are shaded darker (mountain shadow illusion).
+    HMM_Vec3* hm_slopes = (HMM_Vec3*)malloc(grid_size * sizeof(HMM_Vec3));
+    for (int col = col_min; col <= col_max; col++) {
+        for (int row = row_min; row <= row_max; row++) {
+            int gi = (col - col_min) * grid_rows + (row - row_min);
+            if (hm_heights[gi] == INT16_MIN) {
+                hm_slopes[gi] = center;  // fallback
+                continue;
+            }
+
+            float hx = col * LOD_HEX_COL_SPACING;
+            float hz = ((col & 1) ? (row + 0.5f) : (float)row) * LOD_HEX_ROW_SPACING;
+            int h = hm_heights[gi];
+
+            // Accumulate gradient from neighbor height differences
+            float grad_e = 0.0f, grad_n = 0.0f;
+            int ncount = 0;
+            for (int dir = 0; dir < 6; dir++) {
+                int ncol, nrow;
+                lod_hex_neighbor(col, row, dir, &ncol, &nrow);
+                if (ncol < col_min || ncol > col_max ||
+                    nrow < row_min || nrow > row_max) continue;
+                int ni = (ncol - col_min) * grid_rows + (nrow - row_min);
+                if (hm_heights[ni] == INT16_MIN) continue;
+
+                float nhx = ncol * LOD_HEX_COL_SPACING;
+                float nhz = ((ncol & 1) ? (nrow + 0.5f) : (float)nrow) * LOD_HEX_ROW_SPACING;
+                float dx = nhx - hx;
+                float dz = nhz - hz;
+                float dh = (float)(hm_heights[ni] - h);
+                float dist_sq = dx * dx + dz * dz;
+                if (dist_sq < 0.01f) continue;
+                grad_e += dh * dx / dist_sq;
+                grad_n += dh * dz / dist_sq;
+                ncount++;
+            }
+            if (ncount > 0) {
+                grad_e /= ncount;
+                grad_n /= ncount;
+            }
+
+            // Slope normal = local_up tilted by the terrain gradient
+            HMM_Vec3 cdir = vec3_normalize(
+                vec3_add(center_scaled,
+                    vec3_add(vec3_scale(east, hx), vec3_scale(north, hz))));
+            HMM_Vec3 slope = vec3_normalize(
+                vec3_sub(cdir,
+                    vec3_add(vec3_scale(east, grad_e), vec3_scale(north, grad_n))));
+            // Ensure slope still points outward
+            if (vec3_dot(slope, cdir) < 0.1f) slope = cdir;
+            hm_slopes[gi] = slope;
+        }
+    }
+
+    // 8. Allocate output (cap=12 verts + walls ~36 avg per hex)
+    int vert_cap = grid_size * 48;
+    if (vert_cap < 64) vert_cap = 64;
+    *out_vertices = (HexVertex*)malloc(vert_cap * sizeof(HexVertex));
+    *out_count = 0;
+
+    // 9. Phase 2: Generate cap + wall geometry
+    for (int col = col_min; col <= col_max; col++) {
+        for (int row = row_min; row <= row_max; row++) {
+            int gi = (col - col_min) * grid_rows + (row - row_min);
+            if (hm_heights[gi] == INT16_MIN) continue;
+
+            int h = hm_heights[gi];
+            int cap_atlas_idx = hm_atlas[gi];
+            HMM_Vec3 slope_normal = hm_slopes[gi];
+
+            float hx = col * LOD_HEX_COL_SPACING;
+            float hz = ((col & 1) ? (row + 0.5f) : (float)row) * LOD_HEX_ROW_SPACING;
+
+            // Hex center direction = planet radial up
+            HMM_Vec3 cdir = vec3_normalize(
+                vec3_add(center_scaled,
+                    vec3_add(vec3_scale(east, hx), vec3_scale(north, hz))));
+            HMM_Vec3 local_up = cdir;
+
+            // Cap radius: planet_radius + quantized_height + surface bias
+            float cap_r = planet_radius + (float)h + LOD_HEX_SURFACE_BIAS;
+
+            // Compute 6 corner positions — all at the same quantized height
+            HMM_Vec3 hex_verts[6];
+            HMM_Vec3 hex_dirs[6];
+            LodHexUV hex_uvs[6];
+            for (int i = 0; i < 6; i++) {
+                float vx = hx + LOD_HEX_RADIUS * LOD_HEX_COS[i];
+                float vz = hz + LOD_HEX_RADIUS * LOD_HEX_SIN[i];
+                hex_dirs[i] = vec3_normalize(
+                    vec3_add(center_scaled,
+                        vec3_add(vec3_scale(east, vx), vec3_scale(north, vz))));
+                hex_verts[i] = vec3_scale(hex_dirs[i], cap_r);
+                hex_uvs[i] = lod_hex_top_uv(vx, vz, hx, hz, cap_atlas_idx);
+            }
+
+            // Emit 4 cap triangles (fan from vertex 0)
+            // Winding = local_up, shading = slope_normal (terrain shadow illusion)
+            for (int i = 0; i < 4; i++) {
+                lod_hex_emit_tri(out_vertices, out_count, &vert_cap,
+                    hex_verts[0], hex_verts[i + 1], hex_verts[i + 2],
+                    local_up, slope_normal,
+                    hex_uvs[0], hex_uvs[i + 1], hex_uvs[i + 2]);
+            }
+
+            // ---- Walls + boundary skirts ----
+            for (int dir = 0; dir < 6; dir++) {
+                int ncol, nrow;
+                lod_hex_neighbor(col, row, dir, &ncol, &nrow);
+
+                // Look up neighbor height — boundary hexes get a skirt
+                bool boundary = (ncol < col_min || ncol > col_max ||
+                                 nrow < row_min || nrow > row_max);
+                int nh = h;
+                if (!boundary) {
+                    int ni = (ncol - col_min) * grid_rows + (nrow - row_min);
+                    if (hm_heights[ni] == INT16_MIN)
+                        boundary = true;
+                    else
+                        nh = hm_heights[ni];
+                }
+                if (boundary) nh = h - 3;  // boundary skirt: drop 3m to fill seams
+                if (h <= nh) continue;  // neighbor same or taller — no wall
+
+                // Edge vertices for this wall direction
+                int edge = LOD_DIR_TO_EDGE[dir];
+                int vi0 = edge;
+                int vi1 = (edge + 1) % 6;
+
+                // Wall outward direction (hex center → edge midpoint)
+                float mx = (LOD_HEX_COS[vi0] + LOD_HEX_COS[vi1]) * 0.5f * LOD_HEX_RADIUS;
+                float mz = (LOD_HEX_SIN[vi0] + LOD_HEX_SIN[vi1]) * 0.5f * LOD_HEX_RADIUS;
+                HMM_Vec3 wall_outward = vec3_normalize(
+                    vec3_add(vec3_scale(east, mx), vec3_scale(north, mz)));
+
+                // Cap wall height to limit geometry
+                int wall_bottom = nh;
+                int wall_top = h;
+                if (wall_top - wall_bottom > LOD_HEX_MAX_WALL)
+                    wall_bottom = wall_top - LOD_HEX_MAX_WALL;
+
+                // Emit per-layer wall quads
+                // Winding = wall_outward, shading = slope_normal (shadow continuity)
+                for (int layer = wall_bottom; layer < wall_top; layer++) {
+                    float bot_r = planet_radius + (float)layer + LOD_HEX_SURFACE_BIAS;
+                    float top_r = planet_radius + (float)(layer + 1) + LOD_HEX_SURFACE_BIAS;
+
+                    HMM_Vec3 p0_bot = vec3_scale(hex_dirs[vi0], bot_r);
+                    HMM_Vec3 p1_bot = vec3_scale(hex_dirs[vi1], bot_r);
+                    HMM_Vec3 p0_top = vec3_scale(hex_dirs[vi0], top_r);
+                    HMM_Vec3 p1_top = vec3_scale(hex_dirs[vi1], top_r);
+
+                    // Wall texture by depth below surface
+                    float wall_y = (float)layer + 0.5f;
+                    float surface_h = (float)h;
+                    int wall_atlas_idx = lod_wall_atlas(cap_atlas_idx, surface_h, wall_y);
+
+                    LodHexUV wuv_bl = { (float)wall_atlas_idx / (float)LOD_HEX_ATLAS_TILES, 1.0f };
+                    LodHexUV wuv_br = { ((float)wall_atlas_idx + 1.0f) / (float)LOD_HEX_ATLAS_TILES, 1.0f };
+                    LodHexUV wuv_tl = { (float)wall_atlas_idx / (float)LOD_HEX_ATLAS_TILES, 0.0f };
+                    LodHexUV wuv_tr = { ((float)wall_atlas_idx + 1.0f) / (float)LOD_HEX_ATLAS_TILES, 0.0f };
+
+                    lod_hex_emit_tri(out_vertices, out_count, &vert_cap,
+                        p0_bot, p1_bot, p1_top,
+                        wall_outward, slope_normal,
+                        wuv_bl, wuv_br, wuv_tr);
+                    lod_hex_emit_tri(out_vertices, out_count, &vert_cap,
+                        p0_bot, p1_top, p0_top,
+                        wall_outward, slope_normal,
+                        wuv_bl, wuv_tr, wuv_tl);
+                }
+            }
+        }
+    }
+
+    // 10. Cleanup
+    free(hm_heights);
+    free(hm_atlas);
+    free(hm_slopes);
 }
 
 // Generate mesh for a coarse node (tessellated spherical triangle).
@@ -650,11 +1061,14 @@ static void generate_coarse_mesh_params(
 // Apply floating origin offset to all vertex positions in a mesh.
 // Called after mesh generation (normals/winding already computed from world coords).
 // Vertex positions are translated so they're relative to origin, keeping float32 precise.
-static void apply_origin_offset(LodVertex* verts, int count, const float origin[3]) {
+// Works with any vertex format where pos[3] is the first field (LodVertex, HexVertex).
+static void apply_origin_offset(void* verts, int count, int stride, const float origin[3]) {
+    char* base = (char*)verts;
     for (int i = 0; i < count; i++) {
-        verts[i].pos[0] -= origin[0];
-        verts[i].pos[1] -= origin[1];
-        verts[i].pos[2] -= origin[2];
+        float* pos = (float*)(base + i * stride);
+        pos[0] -= origin[0];
+        pos[1] -= origin[1];
+        pos[2] -= origin[2];
     }
 }
 
@@ -662,13 +1076,33 @@ static void apply_origin_offset(LodVertex* verts, int count, const float origin[
 static void mesh_gen_worker(void* data) {
     MeshGenJob* job = (MeshGenJob*)data;
 
-    generate_coarse_mesh_params(
-        &job->tri, job->depth,
-        job->planet_radius, job->layer_thickness, job->sea_level, job->seed,
-        &job->vertices, &job->vertex_count);
+    if (job->depth >= LOD_MAX_DEPTH) {
+        // Hex mesh: output is HexVertex[]
+        HexVertex* hex_verts = NULL;
+        int hex_count = 0;
+        generate_hex_mesh_for_triangle(
+            &job->tri, job->planet_radius, job->seed,
+            &hex_verts, &hex_count);
+        job->vertices = hex_verts;
+        job->vertex_count = hex_count;
+        job->vertex_stride = sizeof(HexVertex);
+        job->is_hex_mesh = true;
+    } else {
+        // Standard LOD mesh: output is LodVertex[]
+        LodVertex* lod_verts = NULL;
+        int lod_count = 0;
+        generate_coarse_mesh_params(
+            &job->tri, job->depth,
+            job->planet_radius, job->layer_thickness, job->sea_level, job->seed,
+            &lod_verts, &lod_count);
+        job->vertices = lod_verts;
+        job->vertex_count = lod_count;
+        job->vertex_stride = sizeof(LodVertex);
+        job->is_hex_mesh = false;
+    }
 
     // Apply floating origin: shift vertex positions so they're near camera
-    apply_origin_offset(job->vertices, job->vertex_count, job->origin);
+    apply_origin_offset(job->vertices, job->vertex_count, job->vertex_stride, job->origin);
 
     // Signal completion (volatile write - safe on x86 with store ordering)
     job->completed = 1;
@@ -676,14 +1110,33 @@ static void mesh_gen_worker(void* data) {
 
 // Synchronous mesh generation (fallback when no job system)
 static void generate_node_mesh(LodTree* tree, LodNode* node) {
-    generate_coarse_mesh_params(
-        &node->tri, node->depth,
-        tree->planet_radius, tree->layer_thickness, tree->sea_level, tree->seed,
-        &node->cpu_vertices, &node->cpu_vertex_count);
+    if (node->depth >= LOD_MAX_DEPTH) {
+        HexVertex* hex_verts = NULL;
+        int hex_count = 0;
+        generate_hex_mesh_for_triangle(
+            &node->tri, tree->planet_radius, tree->seed,
+            &hex_verts, &hex_count);
+        node->cpu_vertices = hex_verts;
+        node->cpu_vertex_count = hex_count;
+        node->cpu_vertex_stride = sizeof(HexVertex);
+        node->is_hex_mesh = true;
+    } else {
+        LodVertex* lod_verts = NULL;
+        int lod_count = 0;
+        generate_coarse_mesh_params(
+            &node->tri, node->depth,
+            tree->planet_radius, tree->layer_thickness, tree->sea_level, tree->seed,
+            &lod_verts, &lod_count);
+        node->cpu_vertices = lod_verts;
+        node->cpu_vertex_count = lod_count;
+        node->cpu_vertex_stride = sizeof(LodVertex);
+        node->is_hex_mesh = false;
+    }
     float origin[3] = {(float)tree->world_origin[0],
                        (float)tree->world_origin[1],
                        (float)tree->world_origin[2]};
-    apply_origin_offset(node->cpu_vertices, node->cpu_vertex_count, origin);
+    apply_origin_offset(node->cpu_vertices, node->cpu_vertex_count,
+                        node->cpu_vertex_stride, origin);
     node->state = LOD_READY;
 }
 
@@ -758,6 +1211,8 @@ static void process_completed_jobs(LodTree* tree) {
         // Transfer mesh data from job to node
         node->cpu_vertices = job->vertices;
         node->cpu_vertex_count = job->vertex_count;
+        node->cpu_vertex_stride = job->vertex_stride;
+        node->is_hex_mesh = job->is_hex_mesh;
         job->vertices = NULL;  // Transfer ownership
 
         node->state = LOD_READY;
@@ -1169,12 +1624,13 @@ void lod_tree_upload_meshes(LodTree* tree) {
             sg_destroy_buffer(node->gpu_buffer);
         }
 
+        int stride = node->cpu_vertex_stride > 0 ? node->cpu_vertex_stride : (int)sizeof(LodVertex);
         node->gpu_buffer = sg_make_buffer(&(sg_buffer_desc){
             .data = (sg_range){
                 node->cpu_vertices,
-                (size_t)node->cpu_vertex_count * sizeof(LodVertex)
+                (size_t)node->cpu_vertex_count * stride
             },
-            .label = "lod-patch-vertices",
+            .label = node->is_hex_mesh ? "lod-hex-vertices" : "lod-patch-vertices",
         });
 
         // Check if buffer creation succeeded (pool may be exhausted)
@@ -1195,36 +1651,68 @@ void lod_tree_upload_meshes(LodTree* tree) {
 
 // ---- Rendering ----
 
+// Internal render state passed through recursion
+typedef struct {
+    sg_bindings bind;
+    sg_bindings hex_bind;
+    sg_pipeline planet_pip;
+    const LodUniformBlock* planet_ub;  // [2]: vs + fs
+    const LodHexRenderInfo* hex;
+    bool hex_active;         // Currently bound pipeline is hex
+    int total_verts;
+    LodPreDrawFunc pre_draw;
+    void* user_data;
+} RenderState;
+
+// Draw a single node with the correct pipeline
+static void draw_node(const LodTree* tree, const LodNode* node, RenderState* rs) {
+    (void)tree;
+    if (node->state != LOD_ACTIVE || node->gpu_vertex_count == 0 ||
+        node->gpu_buffer.id == SG_INVALID_ID)
+        return;
+
+    if (node->is_hex_mesh && rs->hex) {
+        // Switch to hex pipeline if not already active
+        if (!rs->hex_active) {
+            sg_apply_pipeline(rs->hex->pip);
+            sg_apply_uniforms(rs->hex->vs_ub.slot,
+                &(sg_range){rs->hex->vs_ub.data, rs->hex->vs_ub.size});
+            sg_apply_uniforms(rs->hex->fs_ub.slot,
+                &(sg_range){rs->hex->fs_ub.data, rs->hex->fs_ub.size});
+            rs->hex_active = true;
+        }
+        // Skip pre_draw for hex nodes (pre_draw applies planet-specific uniforms)
+        rs->hex_bind.vertex_buffers[0] = node->gpu_buffer;
+        sg_apply_bindings(&rs->hex_bind);
+    } else {
+        // Switch back to planet pipeline if coming from hex
+        if (rs->hex_active) {
+            sg_apply_pipeline(rs->planet_pip);
+            sg_apply_uniforms(rs->planet_ub[0].slot,
+                &(sg_range){rs->planet_ub[0].data, rs->planet_ub[0].size});
+            sg_apply_uniforms(rs->planet_ub[1].slot,
+                &(sg_range){rs->planet_ub[1].data, rs->planet_ub[1].size});
+            rs->hex_active = false;
+        }
+        if (rs->pre_draw) rs->pre_draw(node->depth, rs->user_data);
+        rs->bind.vertex_buffers[0] = node->gpu_buffer;
+        sg_apply_bindings(&rs->bind);
+    }
+    sg_draw(0, node->gpu_vertex_count, 1);
+    rs->total_verts += node->gpu_vertex_count;
+}
+
 // Recursive render: draws ALL active leaf nodes at their respective LOD levels.
 // Internal nodes with active meshes are used as fallback while children load.
-static void render_node(const LodTree* tree, int node_idx,
-                         sg_bindings* bind, int* total_verts,
-                         LodPreDrawFunc pre_draw, void* user_data) {
+static void render_node(const LodTree* tree, int node_idx, RenderState* rs) {
     const LodNode* node = &tree->nodes[node_idx];
 
     if (node->is_leaf) {
-        // Skip patches within hex terrain suppress range
-        if (tree->suppress_range > 0.0f) {
-            float dist = patch_distance(tree, node);
-            if (dist < tree->suppress_range) {
-                return; // Hex terrain covers this area
-            }
-        }
-
-        // Render this leaf if it has an active GPU mesh
-        if (node->state == LOD_ACTIVE && node->gpu_vertex_count > 0 &&
-            node->gpu_buffer.id != SG_INVALID_ID) {
-            if (pre_draw) pre_draw(node->depth, user_data);
-            bind->vertex_buffers[0] = node->gpu_buffer;
-            sg_apply_bindings(bind);
-            sg_draw(0, node->gpu_vertex_count, 1);
-            *total_verts += node->gpu_vertex_count;
-        }
+        draw_node(tree, node, rs);
         return;
     }
 
     // Internal node: check if all children have renderable meshes.
-    // If any child is still loading, render this node's mesh as fallback.
     bool all_children_ready = true;
     for (int i = 0; i < LOD_CHILDREN; i++) {
         int ci = node->children[i];
@@ -1241,45 +1729,129 @@ static void render_node(const LodTree* tree, int node_idx,
 
     if (all_children_ready) {
         for (int i = 0; i < LOD_CHILDREN; i++) {
-            if (node->children[i] >= 0) {
-                render_node(tree, node->children[i], bind, total_verts,
-                           pre_draw, user_data);
-            }
+            if (node->children[i] >= 0)
+                render_node(tree, node->children[i], rs);
         }
     } else {
         if (node->state == LOD_ACTIVE && node->gpu_vertex_count > 0 &&
             node->gpu_buffer.id != SG_INVALID_ID) {
-            if (pre_draw) pre_draw(node->depth, user_data);
-            bind->vertex_buffers[0] = node->gpu_buffer;
-            sg_apply_bindings(bind);
-            sg_draw(0, node->gpu_vertex_count, 1);
-            *total_verts += node->gpu_vertex_count;
+            draw_node(tree, node, rs);
         } else {
             for (int i = 0; i < LOD_CHILDREN; i++) {
-                if (node->children[i] >= 0) {
-                    render_node(tree, node->children[i], bind, total_verts,
-                               pre_draw, user_data);
-                }
+                if (node->children[i] >= 0)
+                    render_node(tree, node->children[i], rs);
             }
         }
     }
 }
 
 void lod_tree_render(LodTree* tree, sg_pipeline pip, HMM_Mat4 vp,
-                     LodPreDrawFunc pre_draw, void* user_data) {
-    (void)pip;
+                     LodPreDrawFunc pre_draw, void* user_data,
+                     const LodUniformBlock planet_ub[2],
+                     const LodHexRenderInfo* hex) {
     (void)vp;
 
-    sg_bindings bind = {0};
-    int total_verts = 0;
+    RenderState rs = {0};
+    rs.bind = (sg_bindings){0};
+    rs.hex_bind = (sg_bindings){0};
+    rs.planet_pip = pip;
+    rs.planet_ub = planet_ub;
+    if (hex) {
+        rs.hex_bind.views[0] = hex->atlas_view;
+        rs.hex_bind.samplers[0] = hex->atlas_smp;
+    }
+    rs.hex = hex;
+    rs.hex_active = false;
+    rs.total_verts = 0;
+    rs.pre_draw = pre_draw;
+    rs.user_data = user_data;
 
-    // Traverse from each root node recursively
     for (int i = 0; i < LOD_ROOT_COUNT; i++) {
-        render_node(tree, tree->root_nodes[i], &bind, &total_verts,
-                   pre_draw, user_data);
+        render_node(tree, tree->root_nodes[i], &rs);
     }
 
-    tree->total_vertex_count = total_verts;
+    tree->total_vertex_count = rs.total_verts;
+}
+
+// ---- Wireframe overlay ----
+
+typedef struct {
+    sg_pipeline pip_planet;
+    sg_pipeline pip_hex;
+    sg_buffer index_buf;
+    const LodUniformBlock* ub;
+    int current_pip;  // 0=none, 1=planet, 2=hex
+} WireState;
+
+static void draw_node_wire(const LodNode* node, WireState* ws) {
+    if (node->state != LOD_ACTIVE || node->gpu_vertex_count == 0 ||
+        node->gpu_buffer.id == SG_INVALID_ID)
+        return;
+
+    int want = node->is_hex_mesh ? 2 : 1;
+    if (want != ws->current_pip) {
+        sg_apply_pipeline(want == 2 ? ws->pip_hex : ws->pip_planet);
+        sg_apply_uniforms(ws->ub[0].slot,
+            &(sg_range){ws->ub[0].data, ws->ub[0].size});
+        sg_apply_uniforms(ws->ub[1].slot,
+            &(sg_range){ws->ub[1].data, ws->ub[1].size});
+        ws->current_pip = want;
+    }
+
+    sg_bindings bind = {0};
+    bind.vertex_buffers[0] = node->gpu_buffer;
+    bind.index_buffer = ws->index_buf;
+    sg_apply_bindings(&bind);
+    sg_draw(0, node->gpu_vertex_count * 2, 1);
+}
+
+static void render_node_wire(const LodTree* tree, int node_idx, WireState* ws) {
+    const LodNode* node = &tree->nodes[node_idx];
+
+    if (node->is_leaf) {
+        draw_node_wire(node, ws);
+        return;
+    }
+
+    bool all_ready = true;
+    for (int i = 0; i < LOD_CHILDREN; i++) {
+        int ci = node->children[i];
+        if (ci < 0) { all_ready = false; break; }
+        const LodNode* child = &tree->nodes[ci];
+        if (child->is_leaf &&
+            (child->state != LOD_ACTIVE || child->gpu_vertex_count == 0 ||
+             child->gpu_buffer.id == SG_INVALID_ID)) {
+            all_ready = false;
+            break;
+        }
+    }
+
+    if (all_ready) {
+        for (int i = 0; i < LOD_CHILDREN; i++)
+            if (node->children[i] >= 0)
+                render_node_wire(tree, node->children[i], ws);
+    } else if (node->state == LOD_ACTIVE && node->gpu_vertex_count > 0 &&
+               node->gpu_buffer.id != SG_INVALID_ID) {
+        draw_node_wire(node, ws);
+    } else {
+        for (int i = 0; i < LOD_CHILDREN; i++)
+            if (node->children[i] >= 0)
+                render_node_wire(tree, node->children[i], ws);
+    }
+}
+
+void lod_tree_render_wireframe(LodTree* tree,
+                                sg_pipeline pip_planet, sg_pipeline pip_hex,
+                                sg_buffer index_buf, const LodUniformBlock ub[2]) {
+    WireState ws = {
+        .pip_planet = pip_planet,
+        .pip_hex = pip_hex,
+        .index_buf = index_buf,
+        .ub = ub,
+        .current_pip = 0,
+    };
+    for (int i = 0; i < LOD_ROOT_COUNT; i++)
+        render_node_wire(tree, tree->root_nodes[i], &ws);
 }
 
 // ---- Floating origin recentering ----

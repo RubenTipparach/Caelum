@@ -4,6 +4,7 @@
 #include <sys/stat.h>
 #ifdef _WIN32
 #include <direct.h>
+#include <windows.h>
 #endif
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
@@ -16,7 +17,7 @@
 #define COBJMACROS
 #include <d3d11.h>
 
-static int screenshot_counter = 0;
+static int screenshot_counter = -1;  // -1 = not initialized
 
 // Ensure screenshots directory exists
 static void ensure_screenshots_dir(void) {
@@ -28,6 +29,25 @@ static void ensure_screenshots_dir(void) {
         mkdir("screenshots", 0755);
         #endif
     }
+}
+
+// Scan screenshots/ for the highest existing number
+static int find_highest_screenshot(void) {
+    int highest = 0;
+#ifdef _WIN32
+    WIN32_FIND_DATAA fd;
+    HANDLE hFind = FindFirstFileA("screenshots\\screenshot_*.png", &fd);
+    if (hFind != INVALID_HANDLE_VALUE) {
+        do {
+            int num = 0;
+            if (sscanf(fd.cFileName, "screenshot_%d.png", &num) == 1) {
+                if (num > highest) highest = num;
+            }
+        } while (FindNextFileA(hFind, &fd));
+        FindClose(hFind);
+    }
+#endif
+    return highest;
 }
 
 void screenshot_capture(void) {
@@ -153,6 +173,11 @@ void screenshot_capture(void) {
 
     // Write PNG to screenshots/ folder
     ensure_screenshots_dir();
+
+    // On first capture, find the highest existing screenshot number
+    if (screenshot_counter < 0) {
+        screenshot_counter = find_highest_screenshot();
+    }
 
     char filename[128];
     screenshot_counter++;
