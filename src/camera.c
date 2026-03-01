@@ -133,7 +133,8 @@ void camera_init(Camera* cam) {
     cam->proj = HMM_M4D(1.0f);
 }
 
-void camera_update(Camera* cam, Planet* planet, const LodTree* lod, float dt) {
+void camera_update(Camera* cam, Planet* planet, const LodTree* lod,
+                   const HexTerrain* hex, float dt) {
     double dd = (double)dt;
 
     // ---- Sync float position from double (authoritative) ----
@@ -270,43 +271,88 @@ void camera_update(Camera* cam, Planet* planet, const LodTree* lod, float dt) {
     if (fwd_len > 0.001f) forward_input = HMM_NormV3(forward_input);
     if (side_len > 0.001f) side_input = HMM_NormV3(side_input);
 
-    HMM_Vec3 full_input = HMM_AddV3(forward_input, side_input);
-    float full_len = HMM_LenV3(full_input);
-    bool has_input = full_len > 0.001f;
-
-    if (has_input) {
-        // Movement direction (float is fine for unit vectors)
-        HMM_Vec3 full_dir = HMM_NormV3(full_input);
-        double step = (double)move_speed * dd;
-        cam->pos_d[0] += (double)full_dir.X * step;
-        cam->pos_d[1] += (double)full_dir.Y * step;
-        cam->pos_d[2] += (double)full_dir.Z * step;
+    // Check if hex terrain covers our position (for voxel-based collision)
+    bool use_hex_collision = (hex && hex->frame_valid && !cam->jetpack_active);
+    if (use_hex_collision) {
+        // Get current hex ground height to determine if we're within hex range
+        int cur_gcol, cur_grow, cur_layer;
+        hex_terrain_world_to_hex(hex, cam->position, &cur_gcol, &cur_grow, &cur_layer);
+        float cur_ground_r = hex_terrain_ground_height(hex, cur_gcol, cur_grow);
+        if (cur_ground_r < 1.0f) use_hex_collision = false; // no chunk loaded here
     }
 
-    // ---- Jetpack / Jump / Gravity ----
-    if (cam->jetpack_active) {
-        float sm = cam->jetpack_speed_mult;
-        if (cam->key_space) {
-            // Thrust up
-            float radial_vel = HMM_DotV3(cam->velocity, cam->local_up);
-            if (radial_vel < JETPACK_MAX_SPEED * sm) {
-                cam->velocity = HMM_AddV3(cam->velocity,
-                    HMM_MulV3F(cam->local_up, JETPACK_THRUST * sm * dt));
+    if (use_hex_collision) {
+        // ---- Hex voxel collision: try movement, check walls, slide ----
+        double old_pos_d[3] = { cam->pos_d[0], cam->pos_d[1], cam->pos_d[2] };
+
+        // Get current ground info
+        int cur_gcol, cur_grow, cur_layer;
+        hex_terrain_world_to_hex(hex, cam->position, &cur_gcol, &cur_grow, &cur_layer);
+        float cur_ground_r = hex_terrain_ground_height(hex, cur_gcol, cur_grow);
+
+        double step = (double)move_speed * dd;
+
+        // Try full movement, then component-wise if blocked
+        HMM_Vec3 move_dirs[3];
+        int num_dirs = 0;
+        HMM_Vec3 full_input = HMM_AddV3(forward_input, side_input);
+        if (HMM_LenV3(full_input) > 0.001f) {
+            move_dirs[num_dirs++] = HMM_NormV3(full_input);
+            // Also prepare component fallbacks for wall sliding
+            if (fwd_len > 0.001f && side_len > 0.001f) {
+                move_dirs[num_dirs++] = forward_input;
+                move_dirs[num_dirs++] = side_input;
             }
-        } else if (cam->key_ctrl) {
-            // Thrust down
-            float radial_vel = HMM_DotV3(cam->velocity, cam->local_up);
-            if (radial_vel > -JETPACK_MAX_SPEED * sm) {
-                cam->velocity = HMM_SubV3(cam->velocity,
-                    HMM_MulV3F(cam->local_up, JETPACK_THRUST * sm * dt));
-            }
-        } else {
-            cam->velocity = HMM_SubV3(cam->velocity,
-                HMM_MulV3F(cam->local_up, cam->gravity * 0.3f * dt));
         }
-        cam->velocity = HMM_MulV3F(cam->velocity, JETPACK_DRAG);
-        cam->on_ground = false;
-    } else {
+
+        bool moved = false;
+        for (int attempt = 0; attempt < num_dirs && !moved; attempt++) {
+            HMM_Vec3 dir = move_dirs[attempt];
+
+            // Proposed new position
+            double test_pos[3] = {
+                old_pos_d[0] + (double)dir.X * step,
+                old_pos_d[1] + (double)dir.Y * step,
+                old_pos_d[2] + (double)dir.Z * step,
+            };
+
+            HMM_Vec3 test_pos_f = (HMM_Vec3){{(float)test_pos[0], (float)test_pos[1], (float)test_pos[2]}};
+            int dest_gcol, dest_grow, dest_layer;
+            hex_terrain_world_to_hex(hex, test_pos_f, &dest_gcol, &dest_grow, &dest_layer);
+            float dest_ground_r = hex_terrain_ground_height(hex, dest_gcol, dest_grow);
+
+            // If no chunk at destination, allow movement (LOD handles it)
+            if (dest_ground_r < 1.0f) {
+                cam->pos_d[0] = test_pos[0];
+                cam->pos_d[1] = test_pos[1];
+                cam->pos_d[2] = test_pos[2];
+                moved = true;
+                break;
+            }
+
+            // Step height check: can we step onto the destination ground?
+            float height_diff = dest_ground_r - cur_ground_r;
+            if (height_diff > AUTO_STEP_HEIGHT) {
+                // Wall too tall to step over — BLOCKED
+                continue;
+            }
+
+            // Headroom check: 2 layers of air above ground at destination
+            int dest_ground_layer = (int)floorf((dest_ground_r - hex->planet_radius) / HEX_HEIGHT);
+            if (!hex_terrain_has_headroom(hex, dest_gcol, dest_grow,
+                                          dest_ground_layer + 1, (int)ceilf(PLAYER_HEIGHT))) {
+                // Ceiling too low — BLOCKED
+                continue;
+            }
+
+            // Movement allowed
+            cam->pos_d[0] = test_pos[0];
+            cam->pos_d[1] = test_pos[1];
+            cam->pos_d[2] = test_pos[2];
+            moved = true;
+        }
+
+        // Jump / gravity (same as before)
         if (cam->key_space && cam->on_ground) {
             cam->velocity = HMM_MulV3F(cam->local_up, JUMP_FORCE);
             cam->on_ground = false;
@@ -314,61 +360,134 @@ void camera_update(Camera* cam, Planet* planet, const LodTree* lod, float dt) {
         if (!cam->on_ground) {
             cam->velocity = HMM_SubV3(cam->velocity, HMM_MulV3F(cam->local_up, cam->gravity * dt));
         }
-    }
 
-    // ---- Apply velocity (double precision) ----
-    if (HMM_LenV3(cam->velocity) > 0.001f) {
-        cam->pos_d[0] += (double)cam->velocity.X * dd;
-        cam->pos_d[1] += (double)cam->velocity.Y * dd;
-        cam->pos_d[2] += (double)cam->velocity.Z * dd;
-    }
+        // Apply velocity (double precision)
+        if (HMM_LenV3(cam->velocity) > 0.001f) {
+            cam->pos_d[0] += (double)cam->velocity.X * dd;
+            cam->pos_d[1] += (double)cam->velocity.Y * dd;
+            cam->pos_d[2] += (double)cam->velocity.Z * dd;
+        }
 
-    // ---- Sync float position for collision queries ----
-    cam->position = (HMM_Vec3){{(float)cam->pos_d[0], (float)cam->pos_d[1], (float)cam->pos_d[2]}};
+        // Sync float position
+        cam->position = (HMM_Vec3){{(float)cam->pos_d[0], (float)cam->pos_d[1], (float)cam->pos_d[2]}};
 
-    // ---- Ground collision (all in double to avoid 6.25cm quantization) ----
-    // Smoothed ground-following eliminates pitch bobbing from terrain micro-noise.
-    // The camera smoothly interpolates toward the true ground height instead of
-    // snapping each frame, preventing the ~11cm/frame bumps from detail noise.
-    if (lod) {
-        static double smoothed_ground_r = 0.0;
-        double ground_r = lod_tree_terrain_height(lod, cam->position);
+        // Ground collision using hex terrain voxel data
+        hex_terrain_world_to_hex(hex, cam->position, &cur_gcol, &cur_grow, &cur_layer);
+        float ground_r = hex_terrain_ground_height(hex, cur_gcol, cur_grow);
+        if (ground_r < 1.0f) {
+            // Fallback to LOD if no hex chunk
+            if (lod) ground_r = (float)lod_tree_terrain_height(lod, cam->position);
+            else ground_r = pos_len;
+        }
+
         double pr = sqrt(cam->pos_d[0]*cam->pos_d[0] +
                          cam->pos_d[1]*cam->pos_d[1] +
                          cam->pos_d[2]*cam->pos_d[2]);
         double feet_r = pr - (double)cam->eye_height;
         float radial_vel = HMM_DotV3(cam->velocity, cam->local_up);
 
-        // Initialize smoothed height on first frame
-        if (smoothed_ground_r == 0.0) smoothed_ground_r = ground_r;
-
-        // Smooth ground height: filter out terrain micro-noise to prevent
-        // view bobbing. 3Hz cutoff = imperceptible smoothing at walk speed.
-        // Always snap DOWN instantly (never float above a cliff edge).
-        if (ground_r < smoothed_ground_r) {
-            smoothed_ground_r = ground_r;  // Snap down immediately
-        } else {
-            double alpha = 1.0 - exp(-3.0 * dd);
-            smoothed_ground_r += (ground_r - smoothed_ground_r) * alpha;
-        }
-
-        if (feet_r <= smoothed_ground_r + (double)GROUND_SNAP_THRESHOLD) {
+        if (feet_r <= (double)ground_r + (double)GROUND_SNAP_THRESHOLD) {
             if (radial_vel <= 0.0f) {
-                double target_r = smoothed_ground_r + (double)cam->eye_height;
+                double target_r = (double)ground_r + (double)cam->eye_height;
                 double scale = target_r / pr;
                 cam->pos_d[0] *= scale;
                 cam->pos_d[1] *= scale;
                 cam->pos_d[2] *= scale;
                 cam->velocity = (HMM_Vec3){{0, 0, 0}};
                 cam->on_ground = true;
-                if (cam->jetpack_active) {
-                    cam->jetpack_active = false;
-                    cam->jetpack_speed_mult = 1.0f;
-                    LOG(PLAYER, "Jetpack OFF (landed)\n");
-                }
             }
         } else {
             cam->on_ground = false;
+        }
+    } else {
+        // ---- No hex collision: jetpack or outside hex range ----
+        HMM_Vec3 full_input = HMM_AddV3(forward_input, side_input);
+        bool has_input = HMM_LenV3(full_input) > 0.001f;
+        if (has_input) {
+            HMM_Vec3 full_dir = HMM_NormV3(full_input);
+            double step = (double)move_speed * dd;
+            cam->pos_d[0] += (double)full_dir.X * step;
+            cam->pos_d[1] += (double)full_dir.Y * step;
+            cam->pos_d[2] += (double)full_dir.Z * step;
+        }
+
+        // Jetpack / Jump / Gravity
+        if (cam->jetpack_active) {
+            float sm = cam->jetpack_speed_mult;
+            if (cam->key_space) {
+                float radial_vel = HMM_DotV3(cam->velocity, cam->local_up);
+                if (radial_vel < JETPACK_MAX_SPEED * sm) {
+                    cam->velocity = HMM_AddV3(cam->velocity,
+                        HMM_MulV3F(cam->local_up, JETPACK_THRUST * sm * dt));
+                }
+            } else if (cam->key_ctrl) {
+                float radial_vel = HMM_DotV3(cam->velocity, cam->local_up);
+                if (radial_vel > -JETPACK_MAX_SPEED * sm) {
+                    cam->velocity = HMM_SubV3(cam->velocity,
+                        HMM_MulV3F(cam->local_up, JETPACK_THRUST * sm * dt));
+                }
+            } else {
+                cam->velocity = HMM_SubV3(cam->velocity,
+                    HMM_MulV3F(cam->local_up, cam->gravity * 0.3f * dt));
+            }
+            cam->velocity = HMM_MulV3F(cam->velocity, JETPACK_DRAG);
+            cam->on_ground = false;
+        } else {
+            if (cam->key_space && cam->on_ground) {
+                cam->velocity = HMM_MulV3F(cam->local_up, JUMP_FORCE);
+                cam->on_ground = false;
+            }
+            if (!cam->on_ground) {
+                cam->velocity = HMM_SubV3(cam->velocity, HMM_MulV3F(cam->local_up, cam->gravity * dt));
+            }
+        }
+
+        // Apply velocity (double precision)
+        if (HMM_LenV3(cam->velocity) > 0.001f) {
+            cam->pos_d[0] += (double)cam->velocity.X * dd;
+            cam->pos_d[1] += (double)cam->velocity.Y * dd;
+            cam->pos_d[2] += (double)cam->velocity.Z * dd;
+        }
+
+        // Sync float position for collision queries
+        cam->position = (HMM_Vec3){{(float)cam->pos_d[0], (float)cam->pos_d[1], (float)cam->pos_d[2]}};
+
+        // Ground collision using LOD terrain height
+        if (lod) {
+            static double smoothed_ground_r = 0.0;
+            double ground_r = lod_tree_terrain_height(lod, cam->position);
+            double pr = sqrt(cam->pos_d[0]*cam->pos_d[0] +
+                             cam->pos_d[1]*cam->pos_d[1] +
+                             cam->pos_d[2]*cam->pos_d[2]);
+            double feet_r = pr - (double)cam->eye_height;
+            float radial_vel = HMM_DotV3(cam->velocity, cam->local_up);
+
+            if (smoothed_ground_r == 0.0) smoothed_ground_r = ground_r;
+            if (ground_r < smoothed_ground_r) {
+                smoothed_ground_r = ground_r;
+            } else {
+                double alpha = 1.0 - exp(-3.0 * dd);
+                smoothed_ground_r += (ground_r - smoothed_ground_r) * alpha;
+            }
+
+            if (feet_r <= smoothed_ground_r + (double)GROUND_SNAP_THRESHOLD) {
+                if (radial_vel <= 0.0f) {
+                    double target_r = smoothed_ground_r + (double)cam->eye_height;
+                    double scale = target_r / pr;
+                    cam->pos_d[0] *= scale;
+                    cam->pos_d[1] *= scale;
+                    cam->pos_d[2] *= scale;
+                    cam->velocity = (HMM_Vec3){{0, 0, 0}};
+                    cam->on_ground = true;
+                    if (cam->jetpack_active) {
+                        cam->jetpack_active = false;
+                        cam->jetpack_speed_mult = 1.0f;
+                        LOG(PLAYER, "Jetpack OFF (landed)\n");
+                    }
+                }
+            } else {
+                cam->on_ground = false;
+            }
         }
     }
 

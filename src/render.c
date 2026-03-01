@@ -353,8 +353,10 @@ void render_init(Renderer* r, Planet* planet, const Camera* cam) {
 
         // Shared wireframe index buffer: maps triangle lists to line edges.
         // For triangle (v0,v1,v2): edges (v0,v1), (v1,v2), (v2,v0).
-        #define WIREFRAME_MAX_VERTS 200000  // large enough for hex prisms with walls
-        uint32_t* wire_indices = (uint32_t*)malloc(WIREFRAME_MAX_VERTS * 2 * sizeof(uint32_t));
+        #define WIREFRAME_MAX_VERTS 199998  // must be multiple of 3 for triangle wireframe
+        #define WIREFRAME_NUM_TRIS  (WIREFRAME_MAX_VERTS / 3)
+        #define WIREFRAME_NUM_IDX   (WIREFRAME_NUM_TRIS * 6)
+        uint32_t* wire_indices = (uint32_t*)malloc(WIREFRAME_NUM_IDX * sizeof(uint32_t));
         for (int i = 0; i < WIREFRAME_MAX_VERTS; i += 3) {
             int base = (i / 3) * 6;
             wire_indices[base + 0] = i;     wire_indices[base + 1] = i + 1;
@@ -363,7 +365,7 @@ void render_init(Renderer* r, Planet* planet, const Camera* cam) {
         }
         r->wireframe_idx = sg_make_buffer(&(sg_buffer_desc){
             .usage.index_buffer = true,
-            .data = { wire_indices, WIREFRAME_MAX_VERTS * 2 * sizeof(uint32_t) },
+            .data = { wire_indices, WIREFRAME_NUM_IDX * sizeof(uint32_t) },
             .label = "wireframe-indices",
         });
         free(wire_indices);
@@ -385,10 +387,21 @@ void render_update_mesh(Renderer* r, Planet* planet, const Camera* cam) {
     lod_tree_upload_meshes(&r->lod_tree);
     uint64_t t2 = stm_now();
 
-    // Hex terrain disabled — LOD depth-13 now generates hex grid meshes directly.
-    // Block interactions will be re-added on LOD-13 nodes in a future step.
-    double hex_update_ms = 0, hex_upload_ms = 0;
-    r->hex_selection.valid = false;
+    // Hex terrain: 3D voxel system (close-range)
+    uint64_t t3 = stm_now();
+    hex_terrain_update(&r->hex_terrain, cam->position, r->lod_tree.world_origin);
+    uint64_t t4 = stm_now();
+    hex_terrain_upload_meshes(&r->hex_terrain);
+    uint64_t t5 = stm_now();
+    double hex_update_ms = stm_ms(stm_diff(t4, t3));
+    double hex_upload_ms = stm_ms(stm_diff(t5, t4));
+
+    // Raycast for block selection (crosshair → hex terrain)
+    r->hex_selection = hex_terrain_raycast(&r->hex_terrain,
+        cam->position, cam->forward, 20.0f);
+
+    // Suppress LOD close-range patches where hex terrain has meshed chunks
+    r->lod_tree.suppress_range = hex_terrain_effective_range(&r->hex_terrain);
 
     // Accumulate profiler timings
     r->profile.accum_lod_update_ms += (float)stm_ms(stm_diff(t1, t0));
@@ -594,6 +607,42 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
         lod_tree_render(&r->lod_tree, r->pip, vp, NULL, NULL, planet_ub, &hex_info);
     }
 
+    // ---- 3b. Draw hex terrain (close-range 3D voxel chunks) ----
+    if (r->hex_terrain.active_count > 0) {
+        sg_apply_pipeline(r->hex_pip);
+        sg_apply_uniforms(UB_hex_terrain_vs_params, &SG_RANGE(hex_vs));
+        sg_apply_uniforms(UB_hex_terrain_fs_params, &SG_RANGE(hex_fs));
+        hex_terrain_render(&r->hex_terrain, r->hex_pip,
+                           r->hex_atlas_view, r->hex_atlas_smp);
+    }
+
+    // ---- 3c. Draw hex selection highlight ----
+    if (r->hex_selection.valid) {
+        float highlight_verts[36];
+        if (hex_terrain_build_highlight(&r->hex_terrain, &r->hex_selection,
+                                         r->lod_tree.world_origin, highlight_verts)) {
+            sg_update_buffer(r->highlight_buf, &(sg_range){
+                highlight_verts, sizeof(highlight_verts)
+            });
+            sg_apply_pipeline(r->highlight_pip);
+            highlight_vs_params_t hl_vs = {
+                .mvp = vp_terrain,
+                .camera_offset = vs_params.camera_offset,
+                .camera_offset_low = vs_params.camera_offset_low,
+                .log_depth = vs_params.log_depth,
+            };
+            highlight_fs_params_t hl_fs = {
+                .color = (HMM_Vec4){{1.0f, 1.0f, 1.0f, 0.8f}},
+            };
+            sg_apply_uniforms(UB_highlight_vs_params, &SG_RANGE(hl_vs));
+            sg_apply_uniforms(UB_highlight_fs_params, &SG_RANGE(hl_fs));
+            sg_bindings hl_bind = {0};
+            hl_bind.vertex_buffers[0] = r->highlight_buf;
+            sg_apply_bindings(&hl_bind);
+            sg_draw(0, 12, 1);
+        }
+    }
+
     // ---- Profiler timing ----
     uint64_t render_end = stm_now();
     r->profile.accum_render_ms += (float)stm_ms(stm_diff(render_end, render_start));
@@ -617,10 +666,10 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
         r->profile.lod_patches = lod_tree_active_leaves(&r->lod_tree);
         r->profile.lod_gpu_verts = r->lod_tree.total_vertex_count;
         r->profile.lod_nodes = r->lod_tree.node_count;
-        r->profile.hex_chunks_active = 0;
-        r->profile.hex_chunks_meshed = 0;
-        r->profile.hex_gpu_verts = 0;
-        r->profile.total_triangles = r->profile.lod_gpu_verts / 3;
+        r->profile.hex_chunks_active = r->hex_terrain.active_count;
+        r->profile.hex_chunks_meshed = r->hex_terrain.chunks_rendered;
+        r->profile.hex_gpu_verts = r->hex_terrain.total_vertex_count;
+        r->profile.total_triangles = (r->profile.lod_gpu_verts + r->profile.hex_gpu_verts) / 3;
         r->profile.draw_calls = r->profile.lod_patches + 2; // +sky+atmos
         r->profile.job_pending = job_system_pending(r->lod_tree.jobs);
 

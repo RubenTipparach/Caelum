@@ -7,6 +7,7 @@
 #include "sokol_app.h"
 #include "planet.h"
 #include "lod.h"
+#include "hex_terrain.h"
 
 typedef struct Camera {
     HMM_Vec3 position;   // float copy for rendering (derived from pos_d each frame)
@@ -43,7 +44,8 @@ typedef struct Camera {
 } Camera;
 
 void camera_init(Camera* cam);
-void camera_update(Camera* cam, Planet* planet, const LodTree* lod, float dt);
+void camera_update(Camera* cam, Planet* planet, const LodTree* lod,
+                   const HexTerrain* hex, float dt);
 void camera_handle_event(Camera* cam, const sapp_event* ev);
 
 #endif

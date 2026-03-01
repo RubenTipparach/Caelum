@@ -304,7 +304,7 @@ static void frame(void) {
         if (app.loading_phase == 3) {
             // Phase 3: one update+upload per frame, tree builds progressively
             app.load_frame_count++;
-            camera_update(&app.camera, &app.planet, &app.renderer.lod_tree, dt);
+            camera_update(&app.camera, &app.planet, &app.renderer.lod_tree, &app.renderer.hex_terrain, dt);
 
             HMM_Mat4 vp = HMM_MulM4(app.camera.proj, app.camera.view);
             lod_tree_update(&app.renderer.lod_tree, app.camera.position, vp);
@@ -342,7 +342,7 @@ static void frame(void) {
     {
         uint64_t t_frame_start = stm_now();
 
-        camera_update(&app.camera, &app.planet, &app.renderer.lod_tree, dt);
+        camera_update(&app.camera, &app.planet, &app.renderer.lod_tree, &app.renderer.hex_terrain, dt);
         uint64_t t_cam = stm_now();
 
         // Feed camera timing into profiler
