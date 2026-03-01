@@ -21,4 +21,4 @@ hex_fade_start: 200               # distance where texture begins fading (meters
 hex_fade_end: 400                # distance where fully flat color (meters)
 
 # === LOD ===
-lod_split_factor: 4.0 # 8.0             # split threshold multiplier (higher = more detail)
+lod_split_factor: 2.0 # 8.0             # split threshold multiplier (higher = more detail)

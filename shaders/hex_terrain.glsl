@@ -15,10 +15,12 @@ layout(binding=0) uniform hex_terrain_vs_params {
 layout(location=0) in vec3 a_position;
 layout(location=1) in vec3 a_normal;
 layout(location=2) in vec2 a_uv;
+layout(location=3) in vec3 a_color;
 
 out vec3 fs_normal;
 out vec2 fs_uv;
 out vec3 fs_cam_rel_pos;
+out vec3 fs_color;
 
 void main() {
     vec3 cam_rel_pos = (a_position - camera_offset.xyz) - camera_offset_low.xyz;
@@ -33,6 +35,7 @@ void main() {
     fs_normal = a_normal;
     fs_uv = a_uv;
     fs_cam_rel_pos = cam_rel_pos;
+    fs_color = a_color;
 }
 @end
 
@@ -44,6 +47,7 @@ layout(binding=1) uniform hex_terrain_fs_params {
     vec4 lod_debug;         // x = LOD depth (0 = off), y = max_depth
     vec4 dusk_sun_color;    // xyz = warm sunset color
     vec4 day_sun_color;     // xyz = neutral daylight color
+    vec4 hex_fade;          // x = fade_start, y = fade_end
 };
 
 layout(binding=0) uniform texture2D hex_atlas_tex;
@@ -52,6 +56,7 @@ layout(binding=0) uniform sampler hex_atlas_smp;
 in vec3 fs_normal;
 in vec2 fs_uv;
 in vec3 fs_cam_rel_pos;
+in vec3 fs_color;
 
 out vec4 frag_color;
 
@@ -65,6 +70,13 @@ void main() {
 
     // Sample texture atlas
     vec3 base_color = texture(sampler2D(hex_atlas_tex, hex_atlas_smp), fs_uv).rgb;
+
+    // Distance fade: blend textured hex into vertex terrain color
+    {
+        float fade_dist = length(fs_cam_rel_pos);
+        float fade = smoothstep(hex_fade.x, hex_fade.y, fade_dist);
+        base_color = mix(base_color, fs_color, fade);
+    }
 
     // Smooth terminator
     float sun_facing = dot(surface_dir, L);

@@ -105,6 +105,7 @@ void render_init(Renderer* r, Planet* planet, const Camera* cam) {
     printf("[RENDER] render_init: creating LOD tree...\n"); fflush(stdout);
     lod_tree_init(&r->lod_tree, planet->radius, planet->layer_thickness,
                   planet->sea_level, 42);
+    r->lod_tree.split_factor = r->visual_config.lod_split_factor;
     printf("[RENDER] render_init: LOD tree done\n"); fflush(stdout);
 
     // ---- Hex terrain (close-range voxel grid) ----
@@ -277,6 +278,7 @@ void render_init(Renderer* r, Planet* planet, const Camera* cam) {
                     [ATTR_hex_terrain_a_position] = { .format = SG_VERTEXFORMAT_FLOAT3 },
                     [ATTR_hex_terrain_a_normal]   = { .format = SG_VERTEXFORMAT_FLOAT3 },
                     [ATTR_hex_terrain_a_uv]       = { .format = SG_VERTEXFORMAT_FLOAT2 },
+                    [ATTR_hex_terrain_a_color]    = { .format = SG_VERTEXFORMAT_FLOAT3 },
                 }
             },
             .depth = {
@@ -321,11 +323,11 @@ void render_init(Renderer* r, Planet* planet, const Camera* cam) {
             .label = "lod-wireframe-pipeline",
         });
 
-        // Pipeline for HexVertex (32-byte stride)
+        // Pipeline for HexVertex (44-byte stride)
         r->hex_wireframe_pip = sg_make_pipeline(&(sg_pipeline_desc){
             .shader = wire_shd,
             .layout = {
-                .buffers[0] = { .stride = 32 },
+                .buffers[0] = { .stride = 44 },
                 .attrs = {
                     [ATTR_highlight_a_position] = { .format = SG_VERTEXFORMAT_FLOAT3 },
                 }
@@ -545,6 +547,11 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
         .lod_debug = fs_params.lod_debug,
         .dusk_sun_color = fs_params.dusk_sun_color,
         .day_sun_color = fs_params.day_sun_color,
+        .hex_fade = (HMM_Vec4){{
+            r->visual_config.hex_fade_start,
+            r->visual_config.hex_fade_end,
+            0.0f, 0.0f,
+        }},
     };
     LodHexRenderInfo hex_info = {
         .pip = r->hex_pip,

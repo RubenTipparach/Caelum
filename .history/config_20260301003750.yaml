@@ -17,8 +17,8 @@ dusk_sun_color: 1.30, 0.45, 0.12   # warm sunset orange
 day_sun_color: 1.00, 0.98, 0.95    # neutral daylight
 
 # === Hex terrain distance fade ===
-hex_fade_start: 200               # distance where texture begins fading (meters)
-hex_fade_end: 400                # distance where fully flat color (meters)
+hex_fade_start: 100               # distance where texture begins fading (meters)
+hex_fade_end: 200                # distance where fully flat color (meters)
 
 # === LOD ===
-lod_split_factor: 4.0 # 8.0             # split threshold multiplier (higher = more detail)
+lod_split_factor: 8.0             # split threshold multiplier (higher = more detail)
