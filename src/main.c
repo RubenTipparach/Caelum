@@ -429,6 +429,8 @@ static void event(const sapp_event* ev) {
             app.renderer.atmosphere.config.sun_intensity = new_cfg.sun_intensity;
             app.renderer.atmosphere.config.atmosphere_radius =
                 surface_r + new_cfg.atmosphere_height;
+            // Update LOD split factor
+            app.renderer.lod_tree.split_factor = new_cfg.lod_split_factor;
         }
         return;
     }

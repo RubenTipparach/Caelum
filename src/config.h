@@ -19,6 +19,13 @@ typedef struct VisualConfig {
     // Dusk tinting
     HMM_Vec3 dusk_sun_color;    // warm sunset color
     HMM_Vec3 day_sun_color;     // neutral daylight color
+
+    // Hex terrain distance fade
+    float hex_fade_start;       // distance where texture begins fading (meters)
+    float hex_fade_end;         // distance where fully flat color (meters)
+
+    // LOD
+    float lod_split_factor;     // split threshold multiplier (higher = more detail)
 } VisualConfig;
 
 // Returns hardcoded defaults (same values currently in the code)

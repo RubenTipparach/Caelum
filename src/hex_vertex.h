@@ -7,6 +7,7 @@ typedef struct HexVertex {
     float pos[3];       // World position (relative to floating origin)
     float normal[3];    // Surface normal
     float uv[2];        // Texture atlas UV
+    float color[3];     // Terrain color (for distance fade to LOD vertex color)
 } HexVertex;
 
 #endif

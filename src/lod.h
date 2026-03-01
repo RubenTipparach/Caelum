@@ -118,6 +118,9 @@ typedef struct LodTree {
     HMM_Vec3 hex_frame_north;    // tangent plane Z axis
     bool hex_frame_valid;
 
+    // Configurable split threshold (defaults to LOD_SPLIT_FACTOR)
+    float split_factor;
+
     // Stats
     int active_leaf_count;
     int total_vertex_count;

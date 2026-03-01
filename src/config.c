@@ -26,6 +26,9 @@ static const ParamEntry param_table[] = {
     { "fog_scale_height",  offsetof(VisualConfig, fog_scale_height),  PARAM_FLOAT },
     { "dusk_sun_color",    offsetof(VisualConfig, dusk_sun_color),    PARAM_VEC3  },
     { "day_sun_color",     offsetof(VisualConfig, day_sun_color),     PARAM_VEC3  },
+    { "hex_fade_start",    offsetof(VisualConfig, hex_fade_start),    PARAM_FLOAT },
+    { "hex_fade_end",      offsetof(VisualConfig, hex_fade_end),      PARAM_FLOAT },
+    { "lod_split_factor",  offsetof(VisualConfig, lod_split_factor),  PARAM_FLOAT },
 };
 
 #define PARAM_COUNT (sizeof(param_table) / sizeof(param_table[0]))
@@ -41,6 +44,9 @@ VisualConfig config_defaults(void) {
         .fog_scale_height  = 0.25f,
         .dusk_sun_color    = {{ 1.3f, 0.45f, 0.12f }},
         .day_sun_color     = {{ 1.0f, 0.98f, 0.95f }},
+        .hex_fade_start    = 600.0f,
+        .hex_fade_end      = 1200.0f,
+        .lod_split_factor  = 8.0f,
     };
 }
 
@@ -154,6 +160,13 @@ bool config_save(const VisualConfig* cfg, const char* path) {
             cfg->dusk_sun_color.X, cfg->dusk_sun_color.Y, cfg->dusk_sun_color.Z);
     fprintf(f, "day_sun_color: %.2f, %.2f, %.2f\n",
             cfg->day_sun_color.X, cfg->day_sun_color.Y, cfg->day_sun_color.Z);
+
+    fprintf(f, "\n# === Hex terrain distance fade ===\n");
+    fprintf(f, "hex_fade_start: %.0f\n", cfg->hex_fade_start);
+    fprintf(f, "hex_fade_end: %.0f\n", cfg->hex_fade_end);
+
+    fprintf(f, "\n# === LOD ===\n");
+    fprintf(f, "lod_split_factor: %.1f\n", cfg->lod_split_factor);
 
     fclose(f);
     printf("[CONFIG] Saved config to '%s'\n", path);

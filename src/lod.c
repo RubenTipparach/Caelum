@@ -364,6 +364,7 @@ void lod_tree_init(LodTree* tree, float planet_radius, float layer_thickness,
     tree->total_vertex_count = 0;
     tree->stats_frame_counter = 0;
     tree->suppress_range = 0.0f;
+    tree->split_factor = LOD_SPLIT_FACTOR;
 
     // Initial capacity
     tree->node_capacity = 256;
@@ -583,7 +584,8 @@ static int lod_wall_atlas(int cap_atlas, float surface_h, float wall_y) {
 static void lod_hex_emit_tri(HexVertex** verts, int* count, int* cap,
                               HMM_Vec3 p0, HMM_Vec3 p1, HMM_Vec3 p2,
                               HMM_Vec3 winding_normal, HMM_Vec3 shading_normal,
-                              LodHexUV uv0, LodHexUV uv1, LodHexUV uv2) {
+                              LodHexUV uv0, LodHexUV uv1, LodHexUV uv2,
+                              HMM_Vec3 color) {
     HMM_Vec3 e1 = vec3_sub(p1, p0);
     HMM_Vec3 e2 = vec3_sub(p2, p0);
     HMM_Vec3 face_n = vec3_cross(e1, e2);
@@ -601,14 +603,17 @@ static void lod_hex_emit_tri(HexVertex** verts, int* count, int* cap,
     v[0].pos[0] = p0.X; v[0].pos[1] = p0.Y; v[0].pos[2] = p0.Z;
     v[0].normal[0] = shading_normal.X; v[0].normal[1] = shading_normal.Y; v[0].normal[2] = shading_normal.Z;
     v[0].uv[0] = uv0.u; v[0].uv[1] = uv0.v;
+    v[0].color[0] = color.X; v[0].color[1] = color.Y; v[0].color[2] = color.Z;
 
     v[1].pos[0] = p1.X; v[1].pos[1] = p1.Y; v[1].pos[2] = p1.Z;
     v[1].normal[0] = shading_normal.X; v[1].normal[1] = shading_normal.Y; v[1].normal[2] = shading_normal.Z;
     v[1].uv[0] = uv1.u; v[1].uv[1] = uv1.v;
+    v[1].color[0] = color.X; v[1].color[1] = color.Y; v[1].color[2] = color.Z;
 
     v[2].pos[0] = p2.X; v[2].pos[1] = p2.Y; v[2].pos[2] = p2.Z;
     v[2].normal[0] = shading_normal.X; v[2].normal[1] = shading_normal.Y; v[2].normal[2] = shading_normal.Z;
     v[2].uv[0] = uv2.u; v[2].uv[1] = uv2.v;
+    v[2].color[0] = color.X; v[2].color[1] = color.Y; v[2].color[2] = color.Z;
 
     *count += 3;
 }
@@ -670,6 +675,7 @@ static void generate_hex_mesh_for_triangle(
     fnl_state noise = create_terrain_noise(seed);
     fnl_state warp = create_warp_noise(seed);
     fnl_state detail = create_detail_noise(seed);
+    fnl_state cnoise = create_color_noise(seed);
 
     HMM_Vec3 center_scaled = vec3_scale(center, planet_radius);
 
@@ -693,6 +699,7 @@ static void generate_hex_mesh_for_triangle(
     int grid_size = grid_cols * grid_rows;
     int16_t* hm_heights = (int16_t*)malloc(grid_size * sizeof(int16_t));
     uint8_t* hm_atlas = (uint8_t*)malloc(grid_size * sizeof(uint8_t));
+    HMM_Vec3* hm_colors = (HMM_Vec3*)malloc(grid_size * sizeof(HMM_Vec3));
     for (int i = 0; i < grid_size; i++) hm_heights[i] = INT16_MIN;
 
     for (int col = col_min; col <= col_max; col++) {
@@ -713,6 +720,7 @@ static void generate_hex_mesh_for_triangle(
             int gi = (col - col_min) * grid_rows + (row - row_min);
             hm_heights[gi] = (int16_t)h;
             hm_atlas[gi] = (uint8_t)lod_hex_atlas(h_m);
+            hm_colors[gi] = perturb_color(terrain_color_m(h_m), &cnoise, cdir);
         }
     }
 
@@ -772,6 +780,27 @@ static void generate_hex_mesh_for_triangle(
         }
     }
 
+    // 7.5. Apply slope-based brightness to vertex colors.
+    //       Steeper slopes get darker, matching how the planet shader's AO + NdotL
+    //       look on smooth LOD terrain. This makes the distance fade seamless.
+    for (int col = col_min; col <= col_max; col++) {
+        for (int row = row_min; row <= row_max; row++) {
+            int gi = (col - col_min) * grid_rows + (row - row_min);
+            if (hm_heights[gi] == INT16_MIN) continue;
+
+            float hx, hz;
+            HEX_POS(col, row, hx, hz);
+            HMM_Vec3 cdir = vec3_normalize(
+                vec3_add(center_scaled,
+                    vec3_add(vec3_scale(east, hx), vec3_scale(north, hz))));
+
+            // Slope vs vertical: steeper = darker (mimics AO + diffuse falloff)
+            float slope_dot = vec3_dot(hm_slopes[gi], cdir);
+            float brightness = 0.45f + 0.55f * fmaxf(0.0f, slope_dot);
+            hm_colors[gi] = vec3_scale(hm_colors[gi], brightness);
+        }
+    }
+
     // 8. Allocate output (cap=12 verts + walls ~36 avg per hex)
     int vert_cap = grid_size * 48;
     if (vert_cap < 64) vert_cap = 64;
@@ -786,6 +815,7 @@ static void generate_hex_mesh_for_triangle(
 
             int h = hm_heights[gi];
             int cap_atlas_idx = hm_atlas[gi];
+            HMM_Vec3 hex_color = hm_colors[gi];
             HMM_Vec3 slope_normal = hm_slopes[gi];
 
             float hx, hz;
@@ -820,7 +850,8 @@ static void generate_hex_mesh_for_triangle(
                 lod_hex_emit_tri(out_vertices, out_count, &vert_cap,
                     hex_verts[0], hex_verts[i + 1], hex_verts[i + 2],
                     local_up, slope_normal,
-                    hex_uvs[0], hex_uvs[i + 1], hex_uvs[i + 2]);
+                    hex_uvs[0], hex_uvs[i + 1], hex_uvs[i + 2],
+                    hex_color);
             }
 
             // ---- Walls: check 6 neighbors ----
@@ -878,11 +909,13 @@ static void generate_hex_mesh_for_triangle(
                     lod_hex_emit_tri(out_vertices, out_count, &vert_cap,
                         p0_bot, p1_bot, p1_top,
                         wall_outward, slope_normal,
-                        wuv_bl, wuv_br, wuv_tr);
+                        wuv_bl, wuv_br, wuv_tr,
+                        hex_color);
                     lod_hex_emit_tri(out_vertices, out_count, &vert_cap,
                         p0_bot, p1_top, p0_top,
                         wall_outward, slope_normal,
-                        wuv_bl, wuv_tr, wuv_tl);
+                        wuv_bl, wuv_tr, wuv_tl,
+                        hex_color);
                 }
             }
         }
@@ -891,6 +924,7 @@ static void generate_hex_mesh_for_triangle(
     // 10. Cleanup
     free(hm_heights);
     free(hm_atlas);
+    free(hm_colors);
     free(hm_slopes);
     #undef HEX_POS
 }
@@ -1378,14 +1412,14 @@ static bool should_split(const LodTree* tree, const LodNode* node) {
     if (node->depth >= LOD_MAX_DEPTH) return false;
     float dist = patch_center_distance(tree, node);
     float patch_arc = tree->depth_arc[node->depth];
-    return dist < patch_arc * LOD_SPLIT_FACTOR;
+    return dist < patch_arc * tree->split_factor;
 }
 
 // Check if a patch's children should be merged back.
 static bool should_merge(const LodTree* tree, const LodNode* node) {
     float dist = patch_center_distance(tree, node);
     float patch_arc = tree->depth_arc[node->depth];
-    return dist > patch_arc * LOD_SPLIT_FACTOR * 2.0f;
+    return dist > patch_arc * tree->split_factor * 2.0f;
 }
 
 // Back-hemisphere culling: skip patches entirely on the far side of the planet.
