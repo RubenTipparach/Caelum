@@ -258,6 +258,9 @@ typedef struct HexMeshJob {
     // Floating origin
     float origin[3];
 
+    // Transition zone flag
+    bool is_transition;
+
     // Output
     int16_t heights[HEX_CHUNK_SIZE][HEX_CHUNK_SIZE];
     uint8_t types[HEX_CHUNK_SIZE][HEX_CHUNK_SIZE];
@@ -370,40 +373,52 @@ static void generate_chunk_mesh(HexMeshJob* job) {
         for (int row = 0; row < HEX_CHUNK_SIZE; row++) {
             int gcol = job->cx * HEX_CHUNK_SIZE + col;
             int grow = job->cz * HEX_CHUNK_SIZE + row;
-            int h = job->heights[col][row];
 
             float lx, lz;
             hex_local_pos(gcol, grow, &lx, &lz);
 
-            // Compute hex center world direction
+            // Compute hex center world direction and local up
             HMM_Vec3 center_dir = vec3_normalize(
                 vec3_add(job->tangent_origin,
                     vec3_add(vec3_scale(job->tangent_east, lx),
                              vec3_scale(job->tangent_north, lz))));
-
-            float top_r = job->planet_radius + h * HEX_HEIGHT + HEX_SURFACE_BIAS;
-
-            // Local up at this hex (radial direction)
             HMM_Vec3 local_up = center_dir;
 
-            // Compute 6 vertex world positions for the top face
-            HMM_Vec3 hex_verts_top[6];
-            for (int i = 0; i < 6; i++) {
-                float vx = lx + HEX_RADIUS * HEX_COS[i];
-                float vz = lz + HEX_RADIUS * HEX_SIN[i];
-
-                HMM_Vec3 vdir = vec3_normalize(
-                    vec3_add(job->tangent_origin,
-                        vec3_add(vec3_scale(job->tangent_east, vx),
-                                 vec3_scale(job->tangent_north, vz))));
-                hex_verts_top[i] = vec3_scale(vdir, top_r);
-            }
-
-            // -- Top face: 4 triangles (fan from vertex 0) --
             VoxelType surface_type = (VoxelType)job->types[col][row];
             int top_atlas = voxel_top_atlas(surface_type);
 
-            // Precompute top face UVs for each hex vertex
+            // Compute 6 vertex world positions for the top face
+            HMM_Vec3 hex_verts_top[6];
+            if (job->is_transition) {
+                // Transition zone: per-vertex noise sampling → smooth surface
+                for (int i = 0; i < 6; i++) {
+                    float vx = lx + HEX_RADIUS * HEX_COS[i];
+                    float vz = lz + HEX_RADIUS * HEX_SIN[i];
+                    HMM_Vec3 vdir = vec3_normalize(
+                        vec3_add(job->tangent_origin,
+                            vec3_add(vec3_scale(job->tangent_east, vx),
+                                     vec3_scale(job->tangent_north, vz))));
+                    float v_h = ht_sample_height_m(&noise, &warp, &detail, vdir);
+                    float v_eff = fmaxf(v_h, TERRAIN_SEA_LEVEL_M);
+                    float v_r = job->planet_radius + v_eff + HEX_SURFACE_BIAS;
+                    hex_verts_top[i] = vec3_scale(vdir, v_r);
+                }
+            } else {
+                // Inner zone: uniform discretized height for all vertices
+                int h = job->heights[col][row];
+                float top_r = job->planet_radius + h * HEX_HEIGHT + HEX_SURFACE_BIAS;
+                for (int i = 0; i < 6; i++) {
+                    float vx = lx + HEX_RADIUS * HEX_COS[i];
+                    float vz = lz + HEX_RADIUS * HEX_SIN[i];
+                    HMM_Vec3 vdir = vec3_normalize(
+                        vec3_add(job->tangent_origin,
+                            vec3_add(vec3_scale(job->tangent_east, vx),
+                                     vec3_scale(job->tangent_north, vz))));
+                    hex_verts_top[i] = vec3_scale(vdir, top_r);
+                }
+            }
+
+            // -- Top face: 4 triangles (fan from vertex 0) --
             HexUV top_uvs[6];
             for (int i = 0; i < 6; i++) {
                 float vx = lx + HEX_RADIUS * HEX_COS[i];
@@ -411,7 +426,6 @@ static void generate_chunk_mesh(HexMeshJob* job) {
                 top_uvs[i] = hex_top_uv(vx, vz, lx, lz, top_atlas);
             }
 
-            // Top face: winding and shading normals are both local_up
             hex_emit_tri(&job->vertices, &job->vertex_count, &cap,
                 hex_verts_top[0], hex_verts_top[1], hex_verts_top[2],
                 local_up, local_up, top_uvs[0], top_uvs[1], top_uvs[2]);
@@ -425,101 +439,105 @@ static void generate_chunk_mesh(HexMeshJob* job) {
                 hex_verts_top[0], hex_verts_top[4], hex_verts_top[5],
                 local_up, local_up, top_uvs[0], top_uvs[4], top_uvs[5]);
 
-            // -- Side walls: check each of 6 neighbors --
-            for (int dir = 0; dir < 6; dir++) {
-                int ncol_g, nrow_g;
-                hex_neighbor(gcol, grow, dir, &ncol_g, &nrow_g);
+            // -- Side walls: only for inner (voxelized) chunks --
+            if (!job->is_transition) {
+                int h = job->heights[col][row];
 
-                // Get neighbor height
-                int ncol_local = ncol_g - job->cx * HEX_CHUNK_SIZE;
-                int nrow_local = nrow_g - job->cz * HEX_CHUNK_SIZE;
+                for (int dir = 0; dir < 6; dir++) {
+                    int ncol_g, nrow_g;
+                    hex_neighbor(gcol, grow, dir, &ncol_g, &nrow_g);
 
-                int nh;
-                if (ncol_local >= 0 && ncol_local < HEX_CHUNK_SIZE &&
-                    nrow_local >= 0 && nrow_local < HEX_CHUNK_SIZE) {
-                    nh = job->heights[ncol_local][nrow_local];
-                } else {
-                    // Neighbor is in another chunk — sample terrain directly
-                    float nlx, nlz;
-                    hex_local_pos(ncol_g, nrow_g, &nlx, &nlz);
+                    // Get neighbor height
+                    int ncol_local = ncol_g - job->cx * HEX_CHUNK_SIZE;
+                    int nrow_local = nrow_g - job->cz * HEX_CHUNK_SIZE;
 
-                    HMM_Vec3 ndir = vec3_normalize(
-                        vec3_add(job->tangent_origin,
-                            vec3_add(vec3_scale(job->tangent_east, nlx),
-                                     vec3_scale(job->tangent_north, nlz))));
-                    float nh_m = ht_sample_height_m(&noise, &warp, &detail, ndir);
-                    float nh_eff = fmaxf(nh_m, TERRAIN_SEA_LEVEL_M);
-                    nh = (int)ceilf(nh_eff / HEX_HEIGHT);
-                    if (nh < 0) nh = 0;
-                }
+                    int nh;
+                    if (ncol_local >= 0 && ncol_local < HEX_CHUNK_SIZE &&
+                        nrow_local >= 0 && nrow_local < HEX_CHUNK_SIZE) {
+                        nh = job->heights[ncol_local][nrow_local];
+                    } else {
+                        // Neighbor is in another chunk — sample terrain directly
+                        float nlx, nlz;
+                        hex_local_pos(ncol_g, nrow_g, &nlx, &nlz);
 
-                // Only emit wall if we're taller than the neighbor
-                if (h <= nh) continue;
-
-                // Wall edge: use DIR_TO_EDGE to get the hex edge facing this neighbor
-                int edge = DIR_TO_EDGE[dir];
-                int vi0 = edge;
-                int vi1 = (edge + 1) % 6;
-
-                // For each exposed layer, emit a wall quad
-                int wall_bottom = nh;
-                int wall_top = h;
-
-                // Limit wall height to avoid excessive geometry
-                if (wall_top - wall_bottom > 32) wall_bottom = wall_top - 32;
-
-                for (int layer = wall_bottom; layer < wall_top; layer++) {
-                    float bot_r = job->planet_radius + layer * HEX_HEIGHT + HEX_SURFACE_BIAS;
-                    float top_r_wall = job->planet_radius + (layer + 1) * HEX_HEIGHT + HEX_SURFACE_BIAS;
-
-                    // Recompute vertex positions at edge for this layer
-                    float vx0 = lx + HEX_RADIUS * HEX_COS[vi0];
-                    float vz0 = lz + HEX_RADIUS * HEX_SIN[vi0];
-                    float vx1 = lx + HEX_RADIUS * HEX_COS[vi1];
-                    float vz1 = lz + HEX_RADIUS * HEX_SIN[vi1];
-
-                    HMM_Vec3 d0 = vec3_normalize(
-                        vec3_add(job->tangent_origin,
-                            vec3_add(vec3_scale(job->tangent_east, vx0),
-                                     vec3_scale(job->tangent_north, vz0))));
-                    HMM_Vec3 d1 = vec3_normalize(
-                        vec3_add(job->tangent_origin,
-                            vec3_add(vec3_scale(job->tangent_east, vx1),
-                                     vec3_scale(job->tangent_north, vz1))));
-
-                    HMM_Vec3 p0_bot = vec3_scale(d0, bot_r);
-                    HMM_Vec3 p1_bot = vec3_scale(d1, bot_r);
-                    HMM_Vec3 p0_top = vec3_scale(d0, top_r_wall);
-                    HMM_Vec3 p1_top = vec3_scale(d1, top_r_wall);
-
-                    // Wall outward direction for correct winding
-                    float edge_mid_x = (vx0 + vx1) * 0.5f;
-                    float edge_mid_z = (vz0 + vz1) * 0.5f;
-                    HMM_Vec3 wall_outward = vec3_normalize(
-                        vec3_sub(
+                        HMM_Vec3 ndir = vec3_normalize(
                             vec3_add(job->tangent_origin,
-                                vec3_add(vec3_scale(job->tangent_east, edge_mid_x),
-                                         vec3_scale(job->tangent_north, edge_mid_z))),
+                                vec3_add(vec3_scale(job->tangent_east, nlx),
+                                         vec3_scale(job->tangent_north, nlz))));
+                        float nh_m = ht_sample_height_m(&noise, &warp, &detail, ndir);
+                        float nh_eff = fmaxf(nh_m, TERRAIN_SEA_LEVEL_M);
+                        nh = (int)ceilf(nh_eff / HEX_HEIGHT);
+                        if (nh < 0) nh = 0;
+                    }
+
+                    // Only emit wall if we're taller than the neighbor
+                    if (h <= nh) continue;
+
+                    // Wall edge: use DIR_TO_EDGE to get the hex edge facing this neighbor
+                    int edge = DIR_TO_EDGE[dir];
+                    int vi0 = edge;
+                    int vi1 = (edge + 1) % 6;
+
+                    // For each exposed layer, emit a wall quad
+                    int wall_bottom = nh;
+                    int wall_top = h;
+
+                    // Limit wall height to avoid excessive geometry
+                    if (wall_top - wall_bottom > 32) wall_bottom = wall_top - 32;
+
+                    for (int layer = wall_bottom; layer < wall_top; layer++) {
+                        float bot_r = job->planet_radius + layer * HEX_HEIGHT + HEX_SURFACE_BIAS;
+                        float top_r_wall = job->planet_radius + (layer + 1) * HEX_HEIGHT + HEX_SURFACE_BIAS;
+
+                        // Recompute vertex positions at edge for this layer
+                        float vx0 = lx + HEX_RADIUS * HEX_COS[vi0];
+                        float vz0 = lz + HEX_RADIUS * HEX_SIN[vi0];
+                        float vx1 = lx + HEX_RADIUS * HEX_COS[vi1];
+                        float vz1 = lz + HEX_RADIUS * HEX_SIN[vi1];
+
+                        HMM_Vec3 d0 = vec3_normalize(
                             vec3_add(job->tangent_origin,
-                                vec3_add(vec3_scale(job->tangent_east, lx),
-                                         vec3_scale(job->tangent_north, lz)))
-                        ));
+                                vec3_add(vec3_scale(job->tangent_east, vx0),
+                                         vec3_scale(job->tangent_north, vz0))));
+                        HMM_Vec3 d1 = vec3_normalize(
+                            vec3_add(job->tangent_origin,
+                                vec3_add(vec3_scale(job->tangent_east, vx1),
+                                         vec3_scale(job->tangent_north, vz1))));
 
-                    float wall_y_m = (layer + 0.5f) * HEX_HEIGHT;
-                    float surface_h_m = h * HEX_HEIGHT;
-                    int wall_atlas = ht_wall_atlas(surface_type, surface_h_m, wall_y_m);
+                        HMM_Vec3 p0_bot = vec3_scale(d0, bot_r);
+                        HMM_Vec3 p1_bot = vec3_scale(d1, bot_r);
+                        HMM_Vec3 p0_top = vec3_scale(d0, top_r_wall);
+                        HMM_Vec3 p1_top = vec3_scale(d1, top_r_wall);
 
-                    // Wall UVs: u along edge [0,1], v=0 at top (image row 0), v=1 at bottom
-                    HexUV wuv00 = { ((float)wall_atlas + 0.0f) / (float)HEX_ATLAS_TILES, 1.0f };  // bottom-left
-                    HexUV wuv10 = { ((float)wall_atlas + 1.0f) / (float)HEX_ATLAS_TILES, 1.0f };  // bottom-right
-                    HexUV wuv01 = { ((float)wall_atlas + 0.0f) / (float)HEX_ATLAS_TILES, 0.0f };  // top-left
-                    HexUV wuv11 = { ((float)wall_atlas + 1.0f) / (float)HEX_ATLAS_TILES, 0.0f };  // top-right
+                        // Wall outward direction for correct winding
+                        float edge_mid_x = (vx0 + vx1) * 0.5f;
+                        float edge_mid_z = (vz0 + vz1) * 0.5f;
+                        HMM_Vec3 wall_outward = vec3_normalize(
+                            vec3_sub(
+                                vec3_add(job->tangent_origin,
+                                    vec3_add(vec3_scale(job->tangent_east, edge_mid_x),
+                                             vec3_scale(job->tangent_north, edge_mid_z))),
+                                vec3_add(job->tangent_origin,
+                                    vec3_add(vec3_scale(job->tangent_east, lx),
+                                             vec3_scale(job->tangent_north, lz)))
+                            ));
 
-                    // Winding uses wall_outward, shading uses local_up (voxel-style)
-                    hex_emit_tri(&job->vertices, &job->vertex_count, &cap,
-                        p0_bot, p1_bot, p1_top, wall_outward, local_up, wuv00, wuv10, wuv11);
-                    hex_emit_tri(&job->vertices, &job->vertex_count, &cap,
-                        p0_bot, p1_top, p0_top, wall_outward, local_up, wuv00, wuv11, wuv01);
+                        float wall_y_m = (layer + 0.5f) * HEX_HEIGHT;
+                        float surface_h_m = h * HEX_HEIGHT;
+                        int wall_atlas = ht_wall_atlas(surface_type, surface_h_m, wall_y_m);
+
+                        // Wall UVs: u along edge [0,1], v=0 at top (image row 0), v=1 at bottom
+                        HexUV wuv00 = { ((float)wall_atlas + 0.0f) / (float)HEX_ATLAS_TILES, 1.0f };  // bottom-left
+                        HexUV wuv10 = { ((float)wall_atlas + 1.0f) / (float)HEX_ATLAS_TILES, 1.0f };  // bottom-right
+                        HexUV wuv01 = { ((float)wall_atlas + 0.0f) / (float)HEX_ATLAS_TILES, 0.0f };  // top-left
+                        HexUV wuv11 = { ((float)wall_atlas + 1.0f) / (float)HEX_ATLAS_TILES, 0.0f };  // top-right
+
+                        // Winding uses wall_outward, shading uses local_up (voxel-style)
+                        hex_emit_tri(&job->vertices, &job->vertex_count, &cap,
+                            p0_bot, p1_bot, p1_top, wall_outward, local_up, wuv00, wuv10, wuv11);
+                        hex_emit_tri(&job->vertices, &job->vertex_count, &cap,
+                            p0_bot, p1_top, p0_top, wall_outward, local_up, wuv00, wuv11, wuv01);
+                    }
                 }
             }
         }
@@ -788,12 +806,24 @@ void hex_terrain_update(HexTerrain* ht, HMM_Vec3 camera_pos,
 
             int idx = find_chunk(ht, cx, cz);
 
+            // Determine if this chunk should be in transition mode (hysteresis)
+            bool want_transition = (dist > HEX_INNER_RANGE);
+
             if (idx >= 0) {
-                // Chunk exists — check if it needs meshing
+                // Chunk exists — check if it needs meshing or transition state changed
                 HexChunk* chunk = &ht->chunks[idx];
                 if (chunk->gpu_vertex_count == 0 && !chunk->generating &&
                     chunk->cpu_vertex_count == 0) {
                     chunk->dirty = true;
+                }
+
+                // Hysteresis: only flip transition state at thresholds
+                if (!chunk->is_transition && dist > HEX_TRANSITION_ON) {
+                    chunk->is_transition = true;
+                    if (!chunk->generating) chunk->dirty = true;
+                } else if (chunk->is_transition && dist < HEX_TRANSITION_OFF) {
+                    chunk->is_transition = false;
+                    if (!chunk->generating) chunk->dirty = true;
                 }
             } else {
                 // New chunk needed — respect per-frame activation limit
@@ -808,6 +838,7 @@ void hex_terrain_update(HexTerrain* ht, HMM_Vec3 camera_pos,
                 chunk->cz = cz;
                 chunk->active = true;
                 chunk->dirty = true;
+                chunk->is_transition = want_transition;
                 chunk->gpu_buffer.id = SG_INVALID_ID;
                 new_activations++;
             }
@@ -829,6 +860,7 @@ void hex_terrain_update(HexTerrain* ht, HMM_Vec3 camera_pos,
                     job->origin[1] = (float)ht->world_origin[1];
                     job->origin[2] = (float)ht->world_origin[2];
                     job->chunk_index = idx;
+                    job->is_transition = chunk->is_transition;
                     job->vertices = NULL;
                     job->vertex_count = 0;
                     job->completed = 0;
@@ -928,17 +960,20 @@ float hex_terrain_get_range(void) {
 }
 
 float hex_terrain_effective_range(const HexTerrain* ht) {
+    // Only suppress LOD within the INNER range (voxelized zone).
+    // Transition zone (HEX_INNER_RANGE..HEX_RANGE) uses smooth heights + surface bias,
+    // so Z-buffer naturally resolves hex-over-LOD without suppression.
     int meshed = 0, total = 0;
     for (int i = 0; i < HEX_MAX_CHUNKS; i++) {
         if (!ht->chunks[i].active) continue;
+        if (ht->chunks[i].is_transition) continue;  // Skip transition chunks
         total++;
         if (ht->chunks[i].gpu_vertex_count > 0) meshed++;
     }
     if (total == 0) return 0.0f;
     float coverage = (float)meshed / (float)total;
-    // Only suppress LOD when we have good hex terrain coverage.
-    // Below 80%, LOD renders underneath to prevent black holes.
-    return (coverage >= 0.8f) ? HEX_RANGE : 0.0f;
+    // Only suppress when inner chunks have good coverage (close to camera, loads fast)
+    return (coverage >= 0.9f) ? HEX_INNER_RANGE : 0.0f;
 }
 
 // ---- Hex selection / interaction ----
