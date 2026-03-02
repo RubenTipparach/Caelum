@@ -275,10 +275,11 @@ void render_init(Renderer* r, Planet* planet, const Camera* cam) {
             .shader = hex_shd,
             .layout = {
                 .attrs = {
-                    [ATTR_hex_terrain_a_position] = { .format = SG_VERTEXFORMAT_FLOAT3 },
-                    [ATTR_hex_terrain_a_normal]   = { .format = SG_VERTEXFORMAT_FLOAT3 },
-                    [ATTR_hex_terrain_a_uv]       = { .format = SG_VERTEXFORMAT_FLOAT2 },
-                    [ATTR_hex_terrain_a_color]    = { .format = SG_VERTEXFORMAT_FLOAT3 },
+                    [ATTR_hex_terrain_a_position]  = { .format = SG_VERTEXFORMAT_FLOAT3 },
+                    [ATTR_hex_terrain_a_normal]    = { .format = SG_VERTEXFORMAT_FLOAT3 },
+                    [ATTR_hex_terrain_a_uv]        = { .format = SG_VERTEXFORMAT_FLOAT2 },
+                    [ATTR_hex_terrain_a_color]     = { .format = SG_VERTEXFORMAT_FLOAT3 },
+                    [ATTR_hex_terrain_a_sky_light] = { .format = SG_VERTEXFORMAT_FLOAT },
                 }
             },
             .depth = {

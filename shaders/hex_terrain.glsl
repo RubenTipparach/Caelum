@@ -16,11 +16,13 @@ layout(location=0) in vec3 a_position;
 layout(location=1) in vec3 a_normal;
 layout(location=2) in vec2 a_uv;
 layout(location=3) in vec3 a_color;
+layout(location=4) in float a_sky_light;
 
 out vec3 fs_normal;
 out vec2 fs_uv;
 out vec3 fs_cam_rel_pos;
 out vec3 fs_color;
+out float fs_sky_light;
 
 void main() {
     vec3 cam_rel_pos = (a_position - camera_offset.xyz) - camera_offset_low.xyz;
@@ -36,6 +38,7 @@ void main() {
     fs_uv = a_uv;
     fs_cam_rel_pos = cam_rel_pos;
     fs_color = a_color;
+    fs_sky_light = a_sky_light;
 }
 @end
 
@@ -57,6 +60,7 @@ in vec3 fs_normal;
 in vec2 fs_uv;
 in vec3 fs_cam_rel_pos;
 in vec3 fs_color;
+in float fs_sky_light;
 
 out vec4 frag_color;
 
@@ -77,6 +81,10 @@ void main() {
         float fade = smoothstep(hex_fade.x, hex_fade.y, fade_dist);
         base_color = mix(base_color, fs_color, fade);
     }
+
+    // Apply tenebris depth-based sky light (darkens underground blocks uniformly)
+    // Applied AFTER texture/vertex blend so both texture and vertex color get darkened
+    base_color *= fs_sky_light;
 
     // Smooth terminator
     float sun_facing = dot(surface_dir, L);
@@ -108,10 +116,7 @@ void main() {
     float spec = pow(max(0.0, dot(N, H)), 32.0);
     terrain_color += sunColor * spec * ocean_mask * 0.4 * sun_brightness;
 
-    // Rim lighting
-    float rim_dot = 1.0 - max(0.0, dot(V, N));
-    float rim = pow(rim_dot, 3.0) * 0.12 * sun_brightness;
-    terrain_color += vec3(0.35, 0.45, 0.6) * rim;
+    // Rim lighting disabled for hex terrain — voxel faces should shade uniformly
 
     // Shadow desaturation
     float shadow_amount = 1.0 - ndotl * sun_brightness;
