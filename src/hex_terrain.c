@@ -225,6 +225,36 @@ static float ht_arch_compute_base(const HtArchFrame* f, int seed) {
     return fmaxf(h, TERRAIN_SEA_LEVEL_M) - 50.0f;
 }
 
+// ---- Public terrain height API (single source of truth for LOD + hex) ----
+
+void hex_terrain_sample_height(int seed, float planet_radius, HMM_Vec3 unit_pos,
+                                float* out_raw_h_m, float* out_effective_h_m) {
+    fnl_state continental = ht_create_continental_noise(seed);
+    fnl_state mountain = ht_create_mountain_noise(seed);
+    fnl_state warp = ht_create_warp_noise(seed);
+    fnl_state detail = ht_create_detail_noise(seed);
+    float h_m = ht_sample_height_m(&continental, &mountain, &warp, &detail, unit_pos);
+    float effective = fmaxf(h_m, TERRAIN_SEA_LEVEL_M);
+
+    // Apply arch (and any future generated structures) as heightmap bump.
+    // LOD can't represent the hollow underside, but the silhouette is correct at distance.
+    HtArchFrame arch_f = ht_arch_make_frame();
+    float arch_base = ht_arch_compute_base(&arch_f, seed);
+    float alx, alz;
+    ht_arch_project(&arch_f, unit_pos, planet_radius, &alx, &alz);
+    if (fabsf(alz) <= ARCH_HALF_D) {
+        float lx2 = alx * alx;
+        if (lx2 <= ARCH_R_OUTER * ARCH_R_OUTER) {
+            float outer_y = sqrtf(ARCH_R_OUTER * ARCH_R_OUTER - lx2);
+            float arch_top = arch_base + outer_y;
+            if (arch_top > effective) effective = arch_top;
+        }
+    }
+
+    if (out_raw_h_m) *out_raw_h_m = h_m;
+    if (out_effective_h_m) *out_effective_h_m = effective;
+}
+
 // Voxel type by height (matches lod.c compute_voxel_type logic)
 static VoxelType ht_voxel_type(float height_m) {
     float rel = height_m - TERRAIN_SEA_LEVEL_M;
@@ -645,6 +675,57 @@ static void generate_chunk_mesh(HexMeshJob* job) {
             float col_h_m = ht_sample_height_m(&continental, &mountain, &warp, &detail, center_dir);
             HMM_Vec3 col_color = ht_terrain_color(col_h_m);
 
+            // Slope shading: compute terrain gradient from neighbor surface heights.
+            // Matches the LOD hex mesh slope shading so the two blend seamlessly.
+            HMM_Vec3 slope_normal = local_up;
+            {
+                int h_center = job->col_max_solid[col][row];
+                // only compute slope if this column has solid voxels
+                if (h_center >= job->col_min_solid[col][row]) {
+                    float grad_e = 0.0f, grad_n = 0.0f;
+
+                    // East-west gradient (col direction)
+                    bool has_e = (col + 1 < HEX_CHUNK_SIZE) &&
+                                 (job->col_min_solid[col+1][row] <= job->col_max_solid[col+1][row]);
+                    bool has_w = (col > 0) &&
+                                 (job->col_min_solid[col-1][row] <= job->col_max_solid[col-1][row]);
+                    if (has_e && has_w) {
+                        grad_e = (float)(job->col_max_solid[col+1][row] - job->col_max_solid[col-1][row])
+                                 / (2.0f * HEX_COL_SPACING);
+                    } else if (has_e) {
+                        grad_e = (float)(job->col_max_solid[col+1][row] - h_center) / HEX_COL_SPACING;
+                    } else if (has_w) {
+                        grad_e = (float)(h_center - job->col_max_solid[col-1][row]) / HEX_COL_SPACING;
+                    }
+
+                    // North-south gradient (row direction)
+                    bool has_n = (row + 1 < HEX_CHUNK_SIZE) &&
+                                 (job->col_min_solid[col][row+1] <= job->col_max_solid[col][row+1]);
+                    bool has_s = (row > 0) &&
+                                 (job->col_min_solid[col][row-1] <= job->col_max_solid[col][row-1]);
+                    if (has_n && has_s) {
+                        grad_n = (float)(job->col_max_solid[col][row+1] - job->col_max_solid[col][row-1])
+                                 / (2.0f * HEX_ROW_SPACING);
+                    } else if (has_n) {
+                        grad_n = (float)(job->col_max_solid[col][row+1] - h_center) / HEX_ROW_SPACING;
+                    } else if (has_s) {
+                        grad_n = (float)(h_center - job->col_max_solid[col][row-1]) / HEX_ROW_SPACING;
+                    }
+
+                    // Slope normal = local_up tilted by terrain gradient
+                    slope_normal = vec3_normalize(
+                        vec3_sub(local_up,
+                            vec3_add(vec3_scale(job->tangent_east, grad_e),
+                                     vec3_scale(job->tangent_north, grad_n))));
+                    if (vec3_dot(slope_normal, local_up) < 0.1f) slope_normal = local_up;
+
+                    // Darken steeper slopes (matches LOD hex mesh brightness formula)
+                    float slope_dot = vec3_dot(slope_normal, local_up);
+                    float brightness = 0.45f + 0.55f * fmaxf(0.0f, slope_dot);
+                    col_color = vec3_scale(col_color, brightness);
+                }
+            }
+
             if (job->is_transition) {
                 // Transition zone: smooth per-vertex surface, top face only (no 3D)
                 int min_s = job->col_min_solid[col][row];
@@ -673,7 +754,7 @@ static void generate_chunk_mesh(HexMeshJob* job) {
                 for (int i = 0; i < 4; i++) {
                     hex_emit_tri(&job->vertices, &job->vertex_count, &cap,
                         hex_verts_top[0], hex_verts_top[i + 1], hex_verts_top[i + 2],
-                        local_up, local_up, top_uvs[0], top_uvs[i + 1], top_uvs[i + 2],
+                        local_up, slope_normal, top_uvs[0], top_uvs[i + 1], top_uvs[i + 2],
                         col_color);
                 }
                 continue;
@@ -736,7 +817,7 @@ static void generate_chunk_mesh(HexMeshJob* job) {
                     for (int i = 0; i < 4; i++) {
                         hex_emit_tri(&job->vertices, &job->vertex_count, &cap,
                             verts[0], verts[i + 1], verts[i + 2],
-                            local_up, local_up, uvs[0], uvs[i + 1], uvs[i + 2],
+                            local_up, slope_normal, uvs[0], uvs[i + 1], uvs[i + 2],
                             col_color);
                     }
                 }
@@ -1227,16 +1308,45 @@ float hex_terrain_get_range(void) {
 }
 
 float hex_terrain_effective_range(const HexTerrain* ht) {
-    int meshed = 0, total = 0;
+    if (!ht->frame_valid) return 0.0f;
+
+    // Find the nearest unmeshed chunk — any hole in coverage means we can't
+    // suppress LOD patches beyond that distance.
+    float min_unmeshed_dist = HEX_RANGE * 2.0f; // sentinel = very far
+    int total = 0, meshed = 0;
+
+    // Camera position in tangent-plane coords (computed once)
+    HMM_Vec3 cam_off = vec3_sub(ht->camera_pos, ht->tangent_origin);
+    float cam_tx = vec3_dot(cam_off, ht->tangent_east);
+    float cam_tz = vec3_dot(cam_off, ht->tangent_north);
+
     for (int i = 0; i < HEX_MAX_CHUNKS; i++) {
         if (!ht->chunks[i].active) continue;
-        if (ht->chunks[i].is_transition) continue;
         total++;
-        if (ht->chunks[i].gpu_vertex_count > 0) meshed++;
+
+        // Chunk center in tangent-plane meters
+        float cx_m = (ht->chunks[i].cx * HEX_CHUNK_SIZE + HEX_CHUNK_SIZE * 0.5f) * HEX_COL_SPACING;
+        float cz_m = (ht->chunks[i].cz * HEX_CHUNK_SIZE + HEX_CHUNK_SIZE * 0.5f) * HEX_ROW_SPACING;
+        float dx = cx_m - cam_tx;
+        float dz = cz_m - cam_tz;
+        float dist = sqrtf(dx * dx + dz * dz);
+
+        if (ht->chunks[i].gpu_vertex_count > 0) {
+            meshed++;
+        } else if (dist < min_unmeshed_dist) {
+            min_unmeshed_dist = dist;
+        }
     }
+
     if (total == 0) return 0.0f;
-    float coverage = (float)meshed / (float)total;
-    return (coverage >= 0.9f) ? HEX_INNER_RANGE : 0.0f;
+
+    // All chunks meshed: suppress the full inner range
+    if (meshed == total) return HEX_INNER_RANGE;
+
+    // Suppress up to the nearest unmeshed chunk minus a safety margin
+    float safe_range = min_unmeshed_dist - HEX_CHUNK_WIDTH * 2.0f;
+    if (safe_range < 100.0f) return 0.0f;  // Too close, don't suppress at all
+    return fminf(safe_range, HEX_INNER_RANGE);
 }
 
 // ---- Raycast (3D voxel-aware) ----
@@ -1492,6 +1602,42 @@ float hex_terrain_ground_height(const HexTerrain* ht, int gcol, int grow) {
     if (max_s < 0) return ht->planet_radius + chunk->base_layer * HEX_HEIGHT;
 
     for (int l = max_s; l >= 0; l--) {
+        if (HEX_VOXEL(chunk->voxels, local_col, local_row, l) != VOXEL_AIR) {
+            uint8_t above = (l + 1 < HEX_CHUNK_LAYERS)
+                ? HEX_VOXEL(chunk->voxels, local_col, local_row, l + 1)
+                : VOXEL_AIR;
+            if (above == VOXEL_AIR) {
+                int world_layer = l + chunk->base_layer;
+                return ht->planet_radius + (world_layer + 1) * HEX_HEIGHT;
+            }
+        }
+    }
+
+    return ht->planet_radius + chunk->base_layer * HEX_HEIGHT;
+}
+
+float hex_terrain_ground_height_below(const HexTerrain* ht, int gcol, int grow,
+                                       int max_world_layer) {
+    int cx = (int)floorf((float)gcol / HEX_CHUNK_SIZE);
+    int cz = (int)floorf((float)grow / HEX_CHUNK_SIZE);
+    int local_col = gcol - cx * HEX_CHUNK_SIZE;
+    int local_row = grow - cz * HEX_CHUNK_SIZE;
+    if (local_col < 0) { local_col += HEX_CHUNK_SIZE; cx--; }
+    if (local_row < 0) { local_row += HEX_CHUNK_SIZE; cz--; }
+
+    int idx = find_chunk_const(ht, cx, cz);
+    if (idx < 0) return 0.0f;
+
+    const HexChunk* chunk = &ht->chunks[idx];
+    if (!chunk->voxels) return 0.0f;
+
+    // Convert max_world_layer to local layer, clamp to chunk range
+    int start_local = max_world_layer - chunk->base_layer;
+    if (start_local >= HEX_CHUNK_LAYERS) start_local = HEX_CHUNK_LAYERS - 1;
+    if (start_local < 0) return ht->planet_radius + chunk->base_layer * HEX_HEIGHT;
+
+    // Scan downward from start_local to find topmost solid with air above
+    for (int l = start_local; l >= 0; l--) {
         if (HEX_VOXEL(chunk->voxels, local_col, local_row, l) != VOXEL_AIR) {
             uint8_t above = (l + 1 < HEX_CHUNK_LAYERS)
                 ? HEX_VOXEL(chunk->voxels, local_col, local_row, l + 1)

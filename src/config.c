@@ -24,6 +24,7 @@ static const ParamEntry param_table[] = {
     { "sun_intensity",     offsetof(VisualConfig, sun_intensity),     PARAM_FLOAT },
     { "scale_height",      offsetof(VisualConfig, scale_height),      PARAM_FLOAT },
     { "fog_scale_height",  offsetof(VisualConfig, fog_scale_height),  PARAM_FLOAT },
+    { "terrain_fog_density", offsetof(VisualConfig, terrain_fog_density), PARAM_FLOAT },
     { "dusk_sun_color",    offsetof(VisualConfig, dusk_sun_color),    PARAM_VEC3  },
     { "day_sun_color",     offsetof(VisualConfig, day_sun_color),     PARAM_VEC3  },
     { "hex_fade_start",    offsetof(VisualConfig, hex_fade_start),    PARAM_FLOAT },
@@ -42,6 +43,7 @@ VisualConfig config_defaults(void) {
         .sun_intensity     = 5.0f,
         .scale_height      = 0.25f,
         .fog_scale_height  = 0.25f,
+        .terrain_fog_density = 10.0f,
         .dusk_sun_color    = {{ 1.3f, 0.45f, 0.12f }},
         .day_sun_color     = {{ 1.0f, 0.98f, 0.95f }},
         .hex_fade_start    = 600.0f,
@@ -154,6 +156,7 @@ bool config_save(const VisualConfig* cfg, const char* path) {
 
     fprintf(f, "\n# === Terrain fog (aerial perspective) ===\n");
     fprintf(f, "fog_scale_height: %.2f\n", cfg->fog_scale_height);
+    fprintf(f, "terrain_fog_density: %.1f\n", cfg->terrain_fog_density);
 
     fprintf(f, "\n# === Dusk tinting ===\n");
     fprintf(f, "dusk_sun_color: %.2f, %.2f, %.2f\n",
