@@ -155,6 +155,14 @@ bool hex_terrain_place(HexTerrain* ht, const HexHitResult* hit, uint8_t voxel_ty
 bool hex_terrain_build_highlight(const HexTerrain* ht, const HexHitResult* hit,
                                   const double world_origin[3], float* out_verts);
 
+// ---- Terrain height sampling (single source of truth for LOD + hex) ----
+
+// Sample terrain height at any point on the unit sphere. No chunks needed.
+// Returns raw noise height (for coloring) and effective height (sea-level clamped + structures).
+// Either output pointer may be NULL if not needed.
+void hex_terrain_sample_height(int seed, float planet_radius, HMM_Vec3 unit_pos,
+                                float* out_raw_h_m, float* out_effective_h_m);
+
 // ---- Voxel query API (for collision system) ----
 
 // Get voxel type at global hex coords + world layer. Returns VOXEL_AIR if out of range.
@@ -163,6 +171,13 @@ uint8_t hex_terrain_get_voxel(const HexTerrain* ht, int gcol, int grow, int worl
 // Get ground height at a global hex column (world layer of topmost solid with air above).
 // Returns planet_radius + ground_layer * HEX_HEIGHT in meters.
 float hex_terrain_ground_height(const HexTerrain* ht, int gcol, int grow);
+
+// Arch/cave-aware ground height: find ground at or below max_world_layer.
+// Scans DOWN from max_world_layer to find topmost solid with air above.
+// Use player's current feet layer + step margin as max_world_layer.
+// Returns 0.0f if no chunk loaded at this position.
+float hex_terrain_ground_height_below(const HexTerrain* ht, int gcol, int grow,
+                                       int max_world_layer);
 
 // Check if there are 'clearance' layers of air above feet_layer at (gcol, grow).
 bool hex_terrain_has_headroom(const HexTerrain* ht, int gcol, int grow,

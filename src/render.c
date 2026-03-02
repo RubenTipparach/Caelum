@@ -284,6 +284,8 @@ void render_init(Renderer* r, Planet* planet, const Camera* cam) {
             .depth = {
                 .compare = SG_COMPAREFUNC_LESS_EQUAL,
                 .write_enabled = true,
+                .bias = -4.0f,             // Small bias: hex wins depth test at LOD overlap boundary
+                .bias_slope_scale = -1.0f,
             },
             .cull_mode = SG_CULLMODE_BACK,
             .face_winding = SG_FACEWINDING_CCW,
@@ -519,12 +521,12 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
             cam->position.X,
             cam->position.Y,
             cam->position.Z,
-            0.0f
+            r->lod_tree.suppress_range,  // hex terrain suppress range (0 = disabled)
         }},
         .atmos_params = (HMM_Vec4){{
             r->atmosphere.config.planet_radius,
             r->atmosphere.config.atmosphere_radius,
-            r->atmosphere.config.rayleigh_scale,
+            r->atmosphere.config.rayleigh_scale * r->visual_config.terrain_fog_density,
             r->atmosphere.config.sun_intensity,
         }},
         .lod_debug = (HMM_Vec4){{0.0f, 0.0f, 0.0f, 0.0f}},

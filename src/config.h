@@ -15,6 +15,7 @@ typedef struct VisualConfig {
 
     // Terrain fog (aerial perspective)
     float fog_scale_height;     // should match scale_height for consistency
+    float terrain_fog_density;  // multiplier for terrain fog (1.0 = same as sky, 10.0 = 10x denser)
 
     // Dusk tinting
     HMM_Vec3 dusk_sun_color;    // warm sunset color

@@ -17,7 +17,7 @@
 #define PLAYER_HEIGHT   2.0f    // Total player height (2m capsule)
 #define PLAYER_RADIUS   0.3f    // Horizontal collision radius (meters)
 #define GROUND_SNAP_THRESHOLD 0.5f  // Snap to ground if within this distance
-#define AUTO_STEP_HEIGHT 0.3f   // Can step up blocks this tall without jumping
+#define AUTO_STEP_HEIGHT 1.0f   // Can step up blocks this tall without jumping (1 hex layer)
 
 // Jetpack constants
 #define JETPACK_THRUST      30.0f   // m/s^2 upward acceleration
@@ -283,12 +283,17 @@ void camera_update(Camera* cam, Planet* planet, const LodTree* lod,
 
     if (use_hex_collision) {
         // ---- Hex voxel collision: try movement, check walls, slide ----
+        // See docs/hex-collision-design.md for physics case documentation.
         double old_pos_d[3] = { cam->pos_d[0], cam->pos_d[1], cam->pos_d[2] };
 
-        // Get current ground info
+        // Get current ground info using player's feet altitude as search ceiling.
+        // This correctly finds ground inside arches/caves (not the roof above).
         int cur_gcol, cur_grow, cur_layer;
         hex_terrain_world_to_hex(hex, cam->position, &cur_gcol, &cur_grow, &cur_layer);
-        float cur_ground_r = hex_terrain_ground_height(hex, cur_gcol, cur_grow);
+        int cur_feet_layer = (int)floorf((pos_len - cam->eye_height - hex->planet_radius) / HEX_HEIGHT);
+        int search_ceiling = cur_feet_layer + (int)ceilf(AUTO_STEP_HEIGHT / HEX_HEIGHT) + 1;
+        float cur_ground_r = hex_terrain_ground_height_below(hex, cur_gcol, cur_grow, search_ceiling);
+        if (cur_ground_r < 1.0f) cur_ground_r = hex_terrain_ground_height(hex, cur_gcol, cur_grow);
 
         double step = (double)move_speed * dd;
 
@@ -319,7 +324,11 @@ void camera_update(Camera* cam, Planet* planet, const LodTree* lod,
             HMM_Vec3 test_pos_f = (HMM_Vec3){{(float)test_pos[0], (float)test_pos[1], (float)test_pos[2]}};
             int dest_gcol, dest_grow, dest_layer;
             hex_terrain_world_to_hex(hex, test_pos_f, &dest_gcol, &dest_grow, &dest_layer);
-            float dest_ground_r = hex_terrain_ground_height(hex, dest_gcol, dest_grow);
+
+            // Find ground at destination, searching down from player's current altitude
+            // + step margin. This lets the player walk under arches/caves.
+            float dest_ground_r = hex_terrain_ground_height_below(
+                hex, dest_gcol, dest_grow, search_ceiling);
 
             // If no chunk at destination, allow movement (LOD handles it)
             if (dest_ground_r < 1.0f) {
@@ -337,7 +346,7 @@ void camera_update(Camera* cam, Planet* planet, const LodTree* lod,
                 continue;
             }
 
-            // Headroom check: 2 layers of air above ground at destination
+            // Headroom check: PLAYER_HEIGHT layers of air above dest ground
             int dest_ground_layer = (int)floorf((dest_ground_r - hex->planet_radius) / HEX_HEIGHT);
             if (!hex_terrain_has_headroom(hex, dest_gcol, dest_grow,
                                           dest_ground_layer + 1, (int)ceilf(PLAYER_HEIGHT))) {
@@ -371,9 +380,20 @@ void camera_update(Camera* cam, Planet* planet, const LodTree* lod,
         // Sync float position
         cam->position = (HMM_Vec3){{(float)cam->pos_d[0], (float)cam->pos_d[1], (float)cam->pos_d[2]}};
 
-        // Ground collision using hex terrain voxel data
+        // Ground collision using hex terrain voxel data (altitude-aware for arches)
         hex_terrain_world_to_hex(hex, cam->position, &cur_gcol, &cur_grow, &cur_layer);
-        float ground_r = hex_terrain_ground_height(hex, cur_gcol, cur_grow);
+        double pr_snap = sqrt(cam->pos_d[0]*cam->pos_d[0] +
+                              cam->pos_d[1]*cam->pos_d[1] +
+                              cam->pos_d[2]*cam->pos_d[2]);
+        int snap_feet_layer = (int)floorf(((float)pr_snap - cam->eye_height - hex->planet_radius) / HEX_HEIGHT);
+
+        // When on ground, allow step-up margin so walking auto-steps.
+        // When airborne, search only at/below feet — don't find surfaces above the player.
+        int snap_ceiling = cam->on_ground
+            ? snap_feet_layer + (int)ceilf(AUTO_STEP_HEIGHT / HEX_HEIGHT) + 1
+            : snap_feet_layer;
+
+        float ground_r = hex_terrain_ground_height_below(hex, cur_gcol, cur_grow, snap_ceiling);
         if (ground_r < 1.0f) {
             // Fallback to LOD if no hex chunk
             if (lod) ground_r = (float)lod_tree_terrain_height(lod, cam->position);
@@ -386,17 +406,29 @@ void camera_update(Camera* cam, Planet* planet, const LodTree* lod,
         double feet_r = pr - (double)cam->eye_height;
         float radial_vel = HMM_DotV3(cam->velocity, cam->local_up);
 
-        if (feet_r <= (double)ground_r + (double)GROUND_SNAP_THRESHOLD) {
-            if (radial_vel <= 0.0f) {
-                double target_r = (double)ground_r + (double)cam->eye_height;
-                double scale = target_r / pr;
-                cam->pos_d[0] *= scale;
-                cam->pos_d[1] *= scale;
-                cam->pos_d[2] *= scale;
-                cam->velocity = (HMM_Vec3){{0, 0, 0}};
-                cam->on_ground = true;
+        // Ceiling collision: if moving upward, check for solid blocks above head
+        if (radial_vel > 0.0f) {
+            int head_layer = snap_feet_layer + (int)ceilf(PLAYER_HEIGHT / HEX_HEIGHT);
+            if (hex_terrain_get_voxel(hex, cur_gcol, cur_grow, head_layer) != 0) {
+                // Hit ceiling — kill upward velocity, start falling
+                HMM_Vec3 up_component = HMM_MulV3F(cam->local_up, radial_vel);
+                cam->velocity = HMM_SubV3(cam->velocity, up_component);
             }
+        }
+
+        if (feet_r <= (double)ground_r) {
+            // Feet at or below ground: snap UP to surface (penetration resolution)
+            double target_r = (double)ground_r + (double)cam->eye_height;
+            double scale = target_r / pr;
+            cam->pos_d[0] *= scale;
+            cam->pos_d[1] *= scale;
+            cam->pos_d[2] *= scale;
+            if (radial_vel <= 0.0f) {
+                cam->velocity = (HMM_Vec3){{0, 0, 0}};
+            }
+            cam->on_ground = true;
         } else {
+            // Feet above ground: freefall (gravity pulls player down naturally)
             cam->on_ground = false;
         }
     } else {

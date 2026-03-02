@@ -1,4 +1,5 @@
 #include "lod.h"
+#include "hex_terrain.h"
 #include "math_utils.h"
 #include "log_config.h"
 
@@ -1001,10 +1002,6 @@ static void generate_coarse_mesh_params(
     if (depth >= 11) tess = 24;
     if (depth >= 12) tess = 32;
 
-    fnl_state continental = create_continental_noise(seed);
-    fnl_state mountain_n = create_mountain_noise(seed);
-    fnl_state warp = create_warp_noise(seed);
-    fnl_state detail = create_detail_noise(seed);
     fnl_state cnoise = create_color_noise(seed);
 
     int max_verts = tess * tess * 6 * 3;
@@ -1034,9 +1031,9 @@ static void generate_coarse_mesh_params(
             );
             p = vec3_normalize(p);
 
-            float h_m = sample_terrain_height_m(&continental, &mountain_n, &warp, &detail, p);
-            // Clamp to sea level for ocean surface
-            float effective_h_m = fmaxf(h_m, TERRAIN_SEA_LEVEL_M);
+            // Single source of truth: hex terrain provides noise + structures (arch etc.)
+            float h_m, effective_h_m;
+            hex_terrain_sample_height(seed, planet_radius, p, &h_m, &effective_h_m);
 
             float radius = planet_radius + effective_h_m;
 
@@ -1466,8 +1463,11 @@ static float patch_center_distance(const LodTree* tree, const LodNode* node) {
 // have identical thresholds — no asymmetry from aperture-4 corner vs center children.
 static bool should_split(const LodTree* tree, const LodNode* node) {
     if (node->depth >= LOD_MAX_DEPTH) return false;
-    // Don't split into hex-detail depth when hex terrain covers the area
-    if (node->depth + 1 >= LOD_MAX_DEPTH && tree->suppress_range > 0.0f) return false;
+
+    // Don't split to hex-voxel depth — hex_terrain system handles close-range detail.
+    // LOD stops at depth 12 (smooth heightmap); hex_terrain overlays on top with depth bias.
+    if (node->depth + 1 >= LOD_MAX_DEPTH) return false;
+
     float dist = patch_center_distance(tree, node);
     float patch_arc = tree->depth_arc[node->depth];
     return dist < patch_arc * tree->split_factor;
@@ -1802,9 +1802,8 @@ static void draw_node(const LodTree* tree, const LodNode* node, RenderState* rs)
         node->gpu_buffer.id == SG_INVALID_ID)
         return;
 
-    // Suppress LOD hex-detail patches when hex terrain system is active
-    if (node->is_hex_mesh && tree->suppress_range > 0.0f)
-        return;
+    // No LOD suppression: LOD always renders everywhere.
+    // Hex terrain renders on top with depth bias — no gaps possible.
 
     if (node->is_hex_mesh && rs->hex) {
         // Switch to hex pipeline if not already active
@@ -2052,12 +2051,8 @@ bool lod_tree_update_origin(LodTree* tree, const double cam_pos_d[3]) {
 
 double lod_tree_terrain_height(const LodTree* tree, HMM_Vec3 world_pos) {
     HMM_Vec3 unit = vec3_normalize(world_pos);
-    fnl_state continental = create_continental_noise(tree->seed);
-    fnl_state mountain_n = create_mountain_noise(tree->seed);
-    fnl_state warp = create_warp_noise(tree->seed);
-    fnl_state detail = create_detail_noise(tree->seed);
-    float h_m = sample_terrain_height_m(&continental, &mountain_n, &warp, &detail, unit);
-    float effective_h_m = fmaxf(h_m, TERRAIN_SEA_LEVEL_M);
+    float effective_h_m;
+    hex_terrain_sample_height(tree->seed, tree->planet_radius, unit, NULL, &effective_h_m);
 
     // Add in double to avoid float quantization (6.25cm steps at 800km)
     return (double)tree->planet_radius + (double)effective_h_m;

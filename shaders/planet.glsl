@@ -44,7 +44,7 @@ void main() {
 @fs planet_fs
 layout(binding=1) uniform planet_fs_params {
     vec4 sun_direction;     // xyz = normalized sun dir, w = fog_scale_height
-    vec4 camera_pos;        // xyz = camera world position (for surface_dir computation)
+    vec4 camera_pos;        // xyz = camera world position, w = hex_suppress_range (0 = disabled)
     vec4 atmos_params;      // x = planet_radius, y = atmos_radius, z = rayleigh_scale, w = sun_intensity
     vec4 lod_debug;         // x = LOD depth (0 = off/normal), y = max_depth for color mapping
     vec4 dusk_sun_color;    // xyz = warm sunset color (from config.yaml)
@@ -58,6 +58,12 @@ in vec3 fs_cam_rel_pos;
 out vec4 frag_color;
 
 void main() {
+    // Discard LOD fragments inside hex terrain range (hex terrain renders its own voxels there)
+    float hex_suppress = camera_pos.w;
+    if (hex_suppress > 0.0 && length(fs_cam_rel_pos) < hex_suppress) {
+        discard;
+    }
+
     vec3 N = normalize(fs_normal);
     vec3 L = normalize(sun_direction.xyz);
     vec3 V = -normalize(fs_cam_rel_pos);  // View direction: fragment toward camera
