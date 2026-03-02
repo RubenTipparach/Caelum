@@ -439,7 +439,7 @@ static void hex_emit_tri(HexVertex** verts, int* count, int* cap,
                           HMM_Vec3 winding_normal,
                           HMM_Vec3 shading_normal,
                           HexUV uv0, HexUV uv1, HexUV uv2,
-                          HMM_Vec3 vtx_color) {
+                          HMM_Vec3 vtx_color, float sky_light) {
     HMM_Vec3 e1 = vec3_sub(p1, p0);
     HMM_Vec3 e2 = vec3_sub(p2, p0);
     HMM_Vec3 face_n = vec3_cross(e1, e2);
@@ -458,6 +458,7 @@ static void hex_emit_tri(HexVertex** verts, int* count, int* cap,
         v[i].color[0] = vtx_color.X;
         v[i].color[1] = vtx_color.Y;
         v[i].color[2] = vtx_color.Z;
+        v[i].sky_light = sky_light;
     }
 
     v[0].pos[0] = p0.X; v[0].pos[1] = p0.Y; v[0].pos[2] = p0.Z;
@@ -671,59 +672,31 @@ static void generate_chunk_mesh(HexMeshJob* job) {
             HMM_Vec3 local_up = center_dir;
             HMM_Vec3 local_down = vec3_scale(center_dir, -1.0f);
 
-            // Compute per-column terrain color for vertex color fade
+            // Compute per-column terrain color (no brightness bake — shader handles lighting)
             float col_h_m = ht_sample_height_m(&continental, &mountain, &warp, &detail, center_dir);
             HMM_Vec3 col_color = ht_terrain_color(col_h_m);
 
-            // Slope shading: compute terrain gradient from neighbor surface heights.
-            // Matches the LOD hex mesh slope shading so the two blend seamlessly.
+            // Compute terrain slope normal from noise at LOD-triangle-scale offsets (~10m).
+            // Used as shading normal so the fragment shader's NdotL + AO match the LOD mesh.
             HMM_Vec3 slope_normal = local_up;
             {
-                int h_center = job->col_max_solid[col][row];
-                // only compute slope if this column has solid voxels
-                if (h_center >= job->col_min_solid[col][row]) {
-                    float grad_e = 0.0f, grad_n = 0.0f;
+                const float d = 10.0f;  // ~LOD depth-12 vertex spacing
+                HMM_Vec3 dir_e = vec3_normalize(vec3_add(job->tangent_origin,
+                    vec3_add(vec3_scale(job->tangent_east, lx + d),
+                             vec3_scale(job->tangent_north, lz))));
+                HMM_Vec3 dir_n = vec3_normalize(vec3_add(job->tangent_origin,
+                    vec3_add(vec3_scale(job->tangent_east, lx),
+                             vec3_scale(job->tangent_north, lz + d))));
+                float h_e = ht_sample_height_m(&continental, &mountain, &warp, &detail, dir_e);
+                float h_n = ht_sample_height_m(&continental, &mountain, &warp, &detail, dir_n);
 
-                    // East-west gradient (col direction)
-                    bool has_e = (col + 1 < HEX_CHUNK_SIZE) &&
-                                 (job->col_min_solid[col+1][row] <= job->col_max_solid[col+1][row]);
-                    bool has_w = (col > 0) &&
-                                 (job->col_min_solid[col-1][row] <= job->col_max_solid[col-1][row]);
-                    if (has_e && has_w) {
-                        grad_e = (float)(job->col_max_solid[col+1][row] - job->col_max_solid[col-1][row])
-                                 / (2.0f * HEX_COL_SPACING);
-                    } else if (has_e) {
-                        grad_e = (float)(job->col_max_solid[col+1][row] - h_center) / HEX_COL_SPACING;
-                    } else if (has_w) {
-                        grad_e = (float)(h_center - job->col_max_solid[col-1][row]) / HEX_COL_SPACING;
-                    }
+                float grad_e = (h_e - col_h_m) / d;
+                float grad_n = (h_n - col_h_m) / d;
 
-                    // North-south gradient (row direction)
-                    bool has_n = (row + 1 < HEX_CHUNK_SIZE) &&
-                                 (job->col_min_solid[col][row+1] <= job->col_max_solid[col][row+1]);
-                    bool has_s = (row > 0) &&
-                                 (job->col_min_solid[col][row-1] <= job->col_max_solid[col][row-1]);
-                    if (has_n && has_s) {
-                        grad_n = (float)(job->col_max_solid[col][row+1] - job->col_max_solid[col][row-1])
-                                 / (2.0f * HEX_ROW_SPACING);
-                    } else if (has_n) {
-                        grad_n = (float)(job->col_max_solid[col][row+1] - h_center) / HEX_ROW_SPACING;
-                    } else if (has_s) {
-                        grad_n = (float)(h_center - job->col_max_solid[col][row-1]) / HEX_ROW_SPACING;
-                    }
-
-                    // Slope normal = local_up tilted by terrain gradient
-                    slope_normal = vec3_normalize(
-                        vec3_sub(local_up,
-                            vec3_add(vec3_scale(job->tangent_east, grad_e),
-                                     vec3_scale(job->tangent_north, grad_n))));
-                    if (vec3_dot(slope_normal, local_up) < 0.1f) slope_normal = local_up;
-
-                    // Darken steeper slopes (matches LOD hex mesh brightness formula)
-                    float slope_dot = vec3_dot(slope_normal, local_up);
-                    float brightness = 0.45f + 0.55f * fmaxf(0.0f, slope_dot);
-                    col_color = vec3_scale(col_color, brightness);
-                }
+                slope_normal = vec3_normalize(vec3_sub(local_up,
+                    vec3_add(vec3_scale(job->tangent_east, grad_e),
+                             vec3_scale(job->tangent_north, grad_n))));
+                if (vec3_dot(slope_normal, local_up) < 0.1f) slope_normal = local_up;
             }
 
             if (job->is_transition) {
@@ -755,7 +728,7 @@ static void generate_chunk_mesh(HexMeshJob* job) {
                     hex_emit_tri(&job->vertices, &job->vertex_count, &cap,
                         hex_verts_top[0], hex_verts_top[i + 1], hex_verts_top[i + 2],
                         local_up, slope_normal, top_uvs[0], top_uvs[i + 1], top_uvs[i + 2],
-                        col_color);
+                        col_color, 1.0f);
                 }
                 continue;
             }
@@ -764,6 +737,11 @@ static void generate_chunk_mesh(HexMeshJob* job) {
             int min_s = job->col_min_solid[col][row];
             int max_s = job->col_max_solid[col][row];
             if (min_s > max_s) continue;
+
+            // Natural surface layer (from noise, not voxel edits).
+            // Blocks below this are underground and get depth-darkened even after digging.
+            float natural_h_m = fmaxf(col_h_m, TERRAIN_SEA_LEVEL_M);
+            int natural_surface_layer = (int)floorf(natural_h_m / HEX_HEIGHT);
 
             // Precompute 6 hex corner directions (reused across layers)
             HMM_Vec3 hex_dirs[6];
@@ -804,6 +782,16 @@ static void generate_chunk_mesh(HexMeshJob* job) {
                 float bot_r = job->planet_radius + world_layer * HEX_HEIGHT + HEX_SURFACE_BIAS;
                 float top_r = bot_r + HEX_HEIGHT;
 
+                // Depth-based sky light (tenebris style):
+                // Uses NATURAL terrain surface (from noise) as reference, not current voxel top.
+                // Blocks below natural surface stay dark even when exposed by digging.
+                int depth_below_surface = natural_surface_layer - world_layer;
+                float layer_sky = 1.0f;
+                if (depth_below_surface > 0) {
+                    layer_sky = powf(0.8f, (float)depth_below_surface);
+                    if (layer_sky < 0.05f) layer_sky = 0.05f;
+                }
+
                 // --- TOP FACE: emit if layer above is AIR ---
                 uint8_t above = job_get_voxel(job, col, row, l + 1);
                 if (above == VOXEL_AIR) {
@@ -818,13 +806,16 @@ static void generate_chunk_mesh(HexMeshJob* job) {
                         hex_emit_tri(&job->vertices, &job->vertex_count, &cap,
                             verts[0], verts[i + 1], verts[i + 2],
                             local_up, slope_normal, uvs[0], uvs[i + 1], uvs[i + 2],
-                            col_color);
+                            col_color, layer_sky);
                     }
                 }
 
                 // --- BOTTOM FACE: emit if layer below is AIR ---
                 uint8_t below = job_get_voxel(job, col, row, l - 1);
                 if (below == VOXEL_AIR) {
+                    // Extra 0.8x penalty for bottom faces (ceilings receive less light)
+                    float bottom_sky = layer_sky * 0.8f;
+                    if (bottom_sky < 0.05f) bottom_sky = 0.05f;
                     int atlas = voxel_bottom_atlas((VoxelType)vtype);
                     HMM_Vec3 verts[6];
                     HexUV uvs[6];
@@ -837,7 +828,7 @@ static void generate_chunk_mesh(HexMeshJob* job) {
                         hex_emit_tri(&job->vertices, &job->vertex_count, &cap,
                             verts[0], verts[i + 2], verts[i + 1],
                             local_down, local_down, uvs[0], uvs[i + 2], uvs[i + 1],
-                            col_color);
+                            col_color, bottom_sky);
                     }
                 }
 
@@ -864,10 +855,10 @@ static void generate_chunk_mesh(HexMeshJob* job) {
 
                     hex_emit_tri(&job->vertices, &job->vertex_count, &cap,
                         p0b, p1b, p1t, wall_outs[dir], local_up, wuv00, wuv10, wuv11,
-                        col_color);
+                        col_color, layer_sky);
                     hex_emit_tri(&job->vertices, &job->vertex_count, &cap,
                         p0b, p1t, p0t, wall_outs[dir], local_up, wuv00, wuv11, wuv01,
-                        col_color);
+                        col_color, layer_sky);
                 }
             }
         }
