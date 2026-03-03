@@ -41,6 +41,7 @@ add_executable(hex-planets
     src/atmosphere.c
     src/lod.c
     src/hex_terrain.c
+    src/voxel_edits.c
     src/job_system.c
     src/math_utils.c
     src/screenshot.c

@@ -7,6 +7,7 @@
 #include "sokol_gfx.h"
 #include "hex_vertex.h"
 #include "job_system.h"
+#include "voxel_edits.h"
 
 // ---- Configuration ----
 #define HEX_RADIUS          1.0f        // Circumradius of each hex (center to vertex) in meters
@@ -16,8 +17,9 @@
 #define HEX_TRANSITION_ON   375.0f      // Switch chunk TO transition mode (hysteresis high)
 #define HEX_TRANSITION_OFF  325.0f      // Revert chunk FROM transition mode (hysteresis low)
 #define HEX_CHUNK_SIZE      32          // Hex columns per chunk side (32x32 grid)
-#define HEX_CHUNK_LAYERS    128         // Vertical layers per chunk (128m)
-#define HEX_BASE_PADDING    16          // Layers below min terrain for excavation room
+#define HEX_CHUNK_LAYERS    256         // Vertical layers per chunk (256m)
+#define HEX_BASE_PADDING    128         // Layers below min terrain for excavation room (~128m digging)
+#define HEX_BEDROCK_LAYERS  3           // Unbreakable bedrock layers at bottom of each chunk
 #define HEX_MAX_CHUNKS      512         // Maximum active chunks
 #define HEX_MAX_COLUMN_H    16384       // Maximum terrain height in layers (int16_t, covers up to 16km)
 #define HEX_MAX_UPLOADS      32         // GPU uploads per frame
@@ -36,9 +38,9 @@ typedef struct HexChunk {
     int cx, cz;                 // Chunk grid coordinates
     bool active;                // Currently in use
     bool dirty;                 // Needs mesh regeneration
+    bool edit_dirty;            // Dirty from player edit (priority remesh)
     bool generating;            // Mesh is being generated on worker thread
     bool is_transition;         // True = smooth surface-only mesh (transition zone)
-
     // 3D voxel data: [col][row][layer] — local layer index
     // world_layer = local_layer + base_layer
     // Dynamically allocated when chunk activates (128KB per chunk)
@@ -56,6 +58,12 @@ typedef struct HexChunk {
     // CPU mesh (generated, then uploaded)
     HexVertex* cpu_vertices;
     int cpu_vertex_count;
+
+    // Physics debug wireframe (hex prism outlines, float3 line vertices)
+    sg_buffer wire_buf;
+    int wire_vertex_count;
+    float* cpu_wire_verts;
+    int cpu_wire_count;
 
     void* pending_job;          // HexMeshJob* (opaque)
 } HexChunk;
@@ -94,6 +102,9 @@ typedef struct HexTerrain {
 
     // Job system (shared with LOD tree)
     JobSystem* jobs;
+
+    // Voxel edit persistence
+    EditCache edits;
 
     // Stats
     int total_vertex_count;
@@ -150,10 +161,21 @@ bool hex_terrain_break(HexTerrain* ht, const HexHitResult* hit);
 // Place a block at the placement position in hit result. Marks chunk dirty.
 bool hex_terrain_place(HexTerrain* ht, const HexHitResult* hit, uint8_t voxel_type);
 
-// Generate wireframe vertices for a hex selection highlight.
-// Writes 12 float3 vertices (6 line segments) into out_verts (must hold 36 floats).
+// Ctrl placement: inverted ray picks the far side face of the selected block.
+// If that side neighbor is solid, falls back to top or bottom.
+void hex_terrain_ctrl_placement(const HexTerrain* ht, HexHitResult* hit,
+                                 HMM_Vec3 camera_pos);
+
+// Generate wireframe vertices for a hex selection highlight (full prism outline).
+// Writes 36 float3 vertices (18 line segments) into out_verts (must hold 108 floats).
 bool hex_terrain_build_highlight(const HexTerrain* ht, const HexHitResult* hit,
                                   const double world_origin[3], float* out_verts);
+
+// Generate LINE vertices for the placement face highlight (green wireframe, slightly inset).
+// Returns the number of float3 vertices written (max 12 line verts for hex, 8 for side quad).
+// out_verts must hold at least 36 floats (12 vertices * 3).
+int hex_terrain_build_placement_face(const HexTerrain* ht, const HexHitResult* hit,
+                                      const double world_origin[3], float* out_verts);
 
 // ---- Terrain height sampling (single source of truth for LOD + hex) ----
 

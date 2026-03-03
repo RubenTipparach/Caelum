@@ -16,6 +16,7 @@ typedef enum {
     VOXEL_GRASS,
     VOXEL_STONE,
     VOXEL_ICE,
+    VOXEL_BEDROCK,  // Unbreakable dark-grey floor at bottom of world
 } VoxelType;
 
 typedef struct HexCell {

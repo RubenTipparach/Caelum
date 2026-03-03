@@ -88,15 +88,20 @@ typedef struct Renderer {
     // Hex selection highlight
     sg_pipeline highlight_pip;
     sg_buffer highlight_buf;
-    HexHitResult hex_selection;
+    sg_pipeline highlight_face_pip;  // Green wireframe for placement face
+    sg_buffer highlight_face_buf;
+    HexHitResult hex_selection;      // Normal raycast (always, for white outline)
+    HexHitResult hex_placement;      // Placement target (ctrl inverts to far side)
+    bool ctrl_mode;                  // Ctrl held: inverted placement direction
 
     // Wireframe overlay (LOD debug mode)
     sg_pipeline lod_wireframe_pip;   // wireframe for LodVertex (stride 36)
     sg_pipeline hex_wireframe_pip;   // wireframe for HexVertex (stride 32)
     sg_buffer wireframe_idx;         // shared wireframe index buffer
 
-    // Profiler (F3)
-    bool show_profiler;
+    // Debug modes
+    bool show_profiler;     // F3: performance overlay
+    bool show_wireframe;    // P: wireframe overlay for physics debug
     ProfileStats profile;
 } Renderer;
 

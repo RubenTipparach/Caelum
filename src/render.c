@@ -160,11 +160,43 @@ void render_init(Renderer* r, Planet* planet, const Camera* cam) {
         .label = "highlight-pipeline",
     });
     r->highlight_buf = sg_make_buffer(&(sg_buffer_desc){
-        .size = 12 * 3 * sizeof(float),  // 12 vertices * 3 floats
+        .size = 36 * 3 * sizeof(float),  // 36 vertices * 3 floats (full hex prism)
         .usage.vertex_buffer = true,
         .usage.stream_update = true,
         .label = "highlight-vertices",
     });
+
+    // ---- Wireframe line pipeline for placement face highlight (green inset) ----
+    r->highlight_face_pip = sg_make_pipeline(&(sg_pipeline_desc){
+        .shader = highlight_shd,
+        .layout = {
+            .attrs = {
+                [ATTR_highlight_a_position] = { .format = SG_VERTEXFORMAT_FLOAT3 },
+            }
+        },
+        .primitive_type = SG_PRIMITIVETYPE_LINES,
+        .depth = {
+            .compare = SG_COMPAREFUNC_ALWAYS,
+            .write_enabled = false,
+        },
+        .colors[0] = {
+            .blend = {
+                .enabled = true,
+                .src_factor_rgb = SG_BLENDFACTOR_SRC_ALPHA,
+                .dst_factor_rgb = SG_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
+                .src_factor_alpha = SG_BLENDFACTOR_ONE,
+                .dst_factor_alpha = SG_BLENDFACTOR_ZERO,
+            }
+        },
+        .label = "highlight-face-pipeline",
+    });
+    r->highlight_face_buf = sg_make_buffer(&(sg_buffer_desc){
+        .size = 12 * 3 * sizeof(float),  // max 12 line verts * 3 floats (hex = 6 segments)
+        .usage.vertex_buffer = true,
+        .usage.stream_update = true,
+        .label = "highlight-face-vertices",
+    });
+
     r->hex_selection.valid = false;
 
     // ---- Hex terrain textured pipeline ----
@@ -403,6 +435,12 @@ void render_update_mesh(Renderer* r, Planet* planet, const Camera* cam) {
     r->hex_selection = hex_terrain_raycast(&r->hex_terrain,
         cam->position, cam->forward, 20.0f);
 
+    // Placement target: same block, ctrl inverts to far side face
+    r->hex_placement = r->hex_selection;
+    if (r->ctrl_mode && r->hex_placement.valid) {
+        hex_terrain_ctrl_placement(&r->hex_terrain, &r->hex_placement, cam->position);
+    }
+
     // Suppress LOD close-range patches where hex terrain has meshed chunks
     r->lod_tree.suppress_range = hex_terrain_effective_range(&r->hex_terrain);
 
@@ -619,11 +657,38 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
                            r->hex_atlas_view, r->hex_atlas_smp);
     }
 
-    // ---- 3c. Draw hex selection highlight ----
+    // ---- 3b+. Physics wireframe overlay (P key): hex prism outlines ----
+    if (r->show_wireframe && r->hex_terrain.active_count > 0) {
+        sg_apply_pipeline(r->highlight_pip);
+        highlight_vs_params_t wire_vs = {
+            .mvp = vp_terrain,
+            .camera_offset = vs_params.camera_offset,
+            .camera_offset_low = vs_params.camera_offset_low,
+            .log_depth = vs_params.log_depth,
+        };
+        highlight_fs_params_t wire_fs = {
+            .color = (HMM_Vec4){{0.0f, 1.0f, 0.0f, 0.5f}},
+        };
+        sg_apply_uniforms(UB_highlight_vs_params, &SG_RANGE(wire_vs));
+        sg_apply_uniforms(UB_highlight_fs_params, &SG_RANGE(wire_fs));
+
+        for (int i = 0; i < HEX_MAX_CHUNKS; i++) {
+            HexChunk* chunk = &r->hex_terrain.chunks[i];
+            if (!chunk->active || chunk->wire_vertex_count == 0 ||
+                chunk->wire_buf.id == SG_INVALID_ID) continue;
+            sg_bindings wb = {0};
+            wb.vertex_buffers[0] = chunk->wire_buf;
+            sg_apply_bindings(&wb);
+            sg_draw(0, chunk->wire_vertex_count, 1);
+        }
+    }
+
+    // ---- 3c. Draw hex selection highlight (full prism outline + green placement face) ----
     if (r->hex_selection.valid) {
-        float highlight_verts[36];
+        float highlight_verts[108];  // 36 verts * 3 floats
         if (hex_terrain_build_highlight(&r->hex_terrain, &r->hex_selection,
                                          r->lod_tree.world_origin, highlight_verts)) {
+            // White wireframe prism outline
             sg_update_buffer(r->highlight_buf, &(sg_range){
                 highlight_verts, sizeof(highlight_verts)
             });
@@ -642,7 +707,29 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
             sg_bindings hl_bind = {0};
             hl_bind.vertex_buffers[0] = r->highlight_buf;
             sg_apply_bindings(&hl_bind);
-            sg_draw(0, 12, 1);
+            sg_draw(0, 36, 1);
+
+            // Green wireframe placement face (uses placement target, not selection)
+            float face_verts[36];  // max 12 verts * 3 floats
+            int face_vert_count = r->hex_placement.valid ?
+                hex_terrain_build_placement_face(
+                    &r->hex_terrain, &r->hex_placement,
+                    r->lod_tree.world_origin, face_verts) : 0;
+            if (face_vert_count > 0) {
+                sg_update_buffer(r->highlight_face_buf, &(sg_range){
+                    face_verts, (size_t)(face_vert_count * 3) * sizeof(float)
+                });
+                sg_apply_pipeline(r->highlight_face_pip);
+                sg_apply_uniforms(UB_highlight_vs_params, &SG_RANGE(hl_vs));
+                highlight_fs_params_t face_fs = {
+                    .color = (HMM_Vec4){{0.0f, 1.0f, 0.0f, 1.0f}},
+                };
+                sg_apply_uniforms(UB_highlight_fs_params, &SG_RANGE(face_fs));
+                sg_bindings face_bind = {0};
+                face_bind.vertex_buffers[0] = r->highlight_face_buf;
+                sg_apply_bindings(&face_bind);
+                sg_draw(0, face_vert_count, 1);
+            }
         }
     }
 
@@ -689,6 +776,30 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
     }
 
     // ---- 4. HUD overlay ----
+
+    // Crosshair dot at screen center (tiny white dot)
+    {
+        // sdtx uses a virtual canvas; set it to full pixel resolution
+        // so we can position the dot precisely at center.
+        // Font 0 chars are 8x8 in the virtual canvas.
+        float cw = sapp_widthf() * 0.5f;   // virtual canvas width
+        float ch = sapp_heightf() * 0.5f;  // virtual canvas height
+        // Each sdtx character cell = 1.0 unit in the virtual canvas
+        // Canvas is cw x ch units, center = (cw/2, ch/2) in canvas units
+        // sdtx_origin sets top-left of text output
+        // To place a '.' at screen center, position origin so the char lands there
+        // Character width = 8 pixels = (8 / sapp_widthf()) * cw canvas units
+        float char_w = 8.0f / sapp_widthf() * cw;
+        float char_h = 8.0f / sapp_heightf() * ch;
+        float cx = cw * 0.5f - char_w * 0.5f;
+        float cy = ch * 0.5f - char_h * 0.5f;
+        sdtx_canvas(cw, ch);
+        sdtx_origin(cx / char_w, cy / char_h);
+        sdtx_font(0);
+        sdtx_color3f(1.0f, 1.0f, 1.0f);
+        sdtx_putc('.');
+    }
+
     sdtx_canvas(sapp_widthf() * 0.5f, sapp_heightf() * 0.5f);
     sdtx_origin(0.5f, 0.5f);
     sdtx_font(0);
@@ -813,8 +924,14 @@ void render_shutdown(Renderer* r) {
     if (r->highlight_buf.id != SG_INVALID_ID) {
         sg_destroy_buffer(r->highlight_buf);
     }
+    if (r->highlight_face_buf.id != SG_INVALID_ID) {
+        sg_destroy_buffer(r->highlight_face_buf);
+    }
     if (r->highlight_pip.id != SG_INVALID_ID) {
         sg_destroy_pipeline(r->highlight_pip);
+    }
+    if (r->highlight_face_pip.id != SG_INVALID_ID) {
+        sg_destroy_pipeline(r->highlight_face_pip);
     }
     if (r->hex_pip.id != SG_INVALID_ID) {
         sg_destroy_pipeline(r->hex_pip);
