@@ -81,15 +81,8 @@ in vec3 fs_cam_rel_pos;
 out vec4 frag_color;
 
 void main() {
-    vec3 N = normalize(fs_normal);
-    vec3 L = normalize(sun_direction.xyz);
-
-    // Simple Lambert diffuse + ambient
-    float ndotl = max(0.0, dot(N, L));
-    vec3 ambient = vec3(0.3);
-    vec3 lit_color = fs_color * (ambient + vec3(0.7) * ndotl);
-
-    frag_color = vec4(lit_color, 1.0);
+    // Unlit — torch is a light source, always bright
+    frag_color = vec4(fs_color, 1.0);
 }
 @end
 

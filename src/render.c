@@ -715,6 +715,7 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
         };
         torch_render(&r->torch_system, vp_terrain,
                      cam_off, cam_off_low,
+                     r->lod_tree.world_origin,
                      vs_params.log_depth.X, vs_params.log_depth.Y, vs_params.log_depth.Z,
                      r->sun_direction);
     }
