@@ -80,8 +80,8 @@ static inline void torch_gen_section(float* out_verts, int* out_count,
     for (int i = 0; i < TORCH_SEGMENTS; i++) {
         int j = (i + 1) % TORCH_SEGMENTS;
         EMIT_VERT(0.0f, top_y, 0.0f,  0.0f, 1.0f, 0.0f, anim);
-        EMIT_VERT(cx[i] * top_radius, top_y, cz[i] * top_radius,  0.0f, 1.0f, 0.0f, anim);
         EMIT_VERT(cx[j] * top_radius, top_y, cz[j] * top_radius,  0.0f, 1.0f, 0.0f, anim);
+        EMIT_VERT(cx[i] * top_radius, top_y, cz[i] * top_radius,  0.0f, 1.0f, 0.0f, anim);
     }
 
     #undef EMIT_VERT

@@ -119,6 +119,7 @@ void torch_remove_chunk(TorchSystem* ts, int chunk_cx, int chunk_cz) {
 
 void torch_render(TorchSystem* ts, HMM_Mat4 vp,
                   const double camera_offset[3], const double camera_offset_low[3],
+                  const double world_origin[3],
                   float fcoef, float far_plane, float z_bias,
                   HMM_Vec3 sun_dir) {
     if (ts->instance_count <= 0) return;
@@ -158,9 +159,9 @@ void torch_render(TorchSystem* ts, HMM_Mat4 vp,
             }},
             .log_depth = {{ fcoef, far_plane, z_bias, 0.0f }},
             .torch_pos = {{
-                inst->world_pos[0],
-                inst->world_pos[1],
-                inst->world_pos[2],
+                inst->world_pos[0] - (float)world_origin[0],
+                inst->world_pos[1] - (float)world_origin[1],
+                inst->world_pos[2] - (float)world_origin[2],
                 inst->time
             }},
             .torch_up = {{

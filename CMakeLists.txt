@@ -99,15 +99,20 @@ endif()
 # Emscripten web build settings
 if(EMSCRIPTEN)
     set(CMAKE_EXECUTABLE_SUFFIX ".html")
-    target_link_options(hex-planets PRIVATE
+    set(EMCC_LINK_OPTS
         -sUSE_WEBGL2=1
         -sALLOW_MEMORY_GROWTH=1
         -sINITIAL_MEMORY=67108864
         -sTOTAL_STACK=8388608
         --shell-file=${CMAKE_SOURCE_DIR}/web/shell.html
         --preload-file=${CMAKE_SOURCE_DIR}/assets/textures@/assets/textures
-        --preload-file=${CMAKE_SOURCE_DIR}/tenebris/dist/textures@/tenebris/dist/textures
     )
+    if(EXISTS ${CMAKE_SOURCE_DIR}/tenebris/dist/textures)
+        list(APPEND EMCC_LINK_OPTS
+            --preload-file=${CMAKE_SOURCE_DIR}/tenebris/dist/textures@/tenebris/dist/textures
+        )
+    endif()
+    target_link_options(hex-planets PRIVATE ${EMCC_LINK_OPTS})
     # Copy output to dist/ after build
     add_custom_command(TARGET hex-planets POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_SOURCE_DIR}/dist
