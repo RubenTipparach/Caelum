@@ -655,16 +655,22 @@ static void lod_hex_emit_tri(HexVertex** verts, int* count, int* cap,
     v[0].normal[0] = shading_normal.X; v[0].normal[1] = shading_normal.Y; v[0].normal[2] = shading_normal.Z;
     v[0].uv[0] = uv0.u; v[0].uv[1] = uv0.v;
     v[0].color[0] = color.X; v[0].color[1] = color.Y; v[0].color[2] = color.Z;
+    v[0].sky_light = 1.0f;
+    v[0].torch_light = 0.0f;
 
     v[1].pos[0] = p1.X; v[1].pos[1] = p1.Y; v[1].pos[2] = p1.Z;
     v[1].normal[0] = shading_normal.X; v[1].normal[1] = shading_normal.Y; v[1].normal[2] = shading_normal.Z;
     v[1].uv[0] = uv1.u; v[1].uv[1] = uv1.v;
     v[1].color[0] = color.X; v[1].color[1] = color.Y; v[1].color[2] = color.Z;
+    v[1].sky_light = 1.0f;
+    v[1].torch_light = 0.0f;
 
     v[2].pos[0] = p2.X; v[2].pos[1] = p2.Y; v[2].pos[2] = p2.Z;
     v[2].normal[0] = shading_normal.X; v[2].normal[1] = shading_normal.Y; v[2].normal[2] = shading_normal.Z;
     v[2].uv[0] = uv2.u; v[2].uv[1] = uv2.v;
     v[2].color[0] = color.X; v[2].color[1] = color.Y; v[2].color[2] = color.Z;
+    v[2].sky_light = 1.0f;
+    v[2].torch_light = 0.0f;
 
     *count += 3;
 }
@@ -835,26 +841,10 @@ static void generate_hex_mesh_for_triangle(
         }
     }
 
-    // 7.5. Apply slope-based brightness to vertex colors.
-    //       Steeper slopes get darker, matching how the planet shader's AO + NdotL
-    //       look on smooth LOD terrain. This makes the distance fade seamless.
-    for (int col = col_min; col <= col_max; col++) {
-        for (int row = row_min; row <= row_max; row++) {
-            int gi = (col - col_min) * grid_rows + (row - row_min);
-            if (hm_heights[gi] == INT16_MIN) continue;
-
-            float hx, hz;
-            HEX_POS(col, row, hx, hz);
-            HMM_Vec3 cdir = vec3_normalize(
-                vec3_add(center_scaled,
-                    vec3_add(vec3_scale(east, hx), vec3_scale(north, hz))));
-
-            // Slope vs vertical: steeper = darker (mimics AO + diffuse falloff)
-            float slope_dot = vec3_dot(hm_slopes[gi], cdir);
-            float brightness = 0.45f + 0.55f * fmaxf(0.0f, slope_dot);
-            hm_colors[gi] = vec3_scale(hm_colors[gi], brightness);
-        }
-    }
+    // 7.5. Slope-based brightness pre-baking removed — the hex_terrain.glsl
+    //       shader handles AO via dot(N, surface_dir) consistently for both LOD
+    //       hex patches and close-range hex terrain chunks. Pre-baking caused
+    //       double-darkening on slopes (pre-bake + shader AO).
 
     // 8. Allocate output (cap=12 verts + walls ~36 avg per hex)
     int vert_cap = grid_size * 48;

@@ -123,7 +123,10 @@ void main() {
     float spec = pow(max(0.0, dot(N, H)), 32.0);
     terrain_color += sunColor * spec * ocean_mask * 0.4 * sun_brightness;
 
-    // Rim lighting disabled for hex terrain — voxel faces should shade uniformly
+    // Rim lighting (matches planet.glsl for seamless LOD boundary)
+    float rim_dot = 1.0 - max(0.0, dot(V, N));
+    float rim = pow(rim_dot, 3.0) * 0.12 * sun_brightness;
+    terrain_color += vec3(0.35, 0.45, 0.6) * rim;
 
     // Torch light: warm orange glow, additive on un-darkened base color
     // Visible even in full darkness (independent of sky light)
