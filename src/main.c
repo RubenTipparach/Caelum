@@ -262,7 +262,11 @@ static void frame(void) {
         sdtx_puts("Space = jump, ESC = unlock\n");
         sdtx_puts("Double-tap Space = jetpack\n");
         sdtx_puts("Scroll wheel = jetpack speed\n");
-        sdtx_puts("Ctrl/C = jetpack descend\n");
+#ifdef __EMSCRIPTEN__
+        sdtx_puts("C = jetpack descend\n");
+#else
+        sdtx_puts("Ctrl = jetpack descend\n");
+#endif
         sdtx_puts("Alt+P = screenshot\n");
         sdtx_puts("L = toggle LOD debug colors\n");
         sdtx_puts("V = toggle verbose logs\n");

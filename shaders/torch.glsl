@@ -19,8 +19,6 @@ layout(location=2) in vec3 a_color;       // Vertex color
 layout(location=3) in float a_anim_weight; // 0 = static, 1 = flame
 
 out vec3 fs_color;
-out vec3 fs_normal;
-out vec3 fs_cam_rel_pos;
 
 void main() {
     float t = torch_pos.w;
@@ -50,7 +48,6 @@ void main() {
 
     // Transform model position to world (model Y-up → surface normal up)
     vec3 world_pos = torch_pos.xyz + right * pos.x + up * pos.y + forward * pos.z;
-    vec3 world_normal = right * a_normal.x + up * a_normal.y + forward * a_normal.z;
 
     // Camera-relative rendering
     vec3 cam_rel_pos = (world_pos - camera_offset.xyz) - camera_offset_low.xyz;
@@ -64,19 +61,11 @@ void main() {
     }
 
     fs_color = a_color;
-    fs_normal = world_normal;
-    fs_cam_rel_pos = cam_rel_pos;
 }
 @end
 
 @fs torch_fs
-layout(binding=1) uniform torch_fs_params {
-    vec4 sun_direction;  // xyz = normalized sun dir
-};
-
 in vec3 fs_color;
-in vec3 fs_normal;
-in vec3 fs_cam_rel_pos;
 
 out vec4 frag_color;
 

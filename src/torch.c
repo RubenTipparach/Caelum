@@ -38,8 +38,7 @@ void torch_init(TorchSystem* ts) {
             .compare = SG_COMPAREFUNC_LESS_EQUAL,
             .write_enabled = true,
         },
-        .cull_mode = SG_CULLMODE_BACK,
-        .face_winding = SG_FACEWINDING_CCW,
+        .cull_mode = SG_CULLMODE_NONE,
         .label = "torch-pipeline",
     });
 
@@ -130,12 +129,6 @@ void torch_render(TorchSystem* ts, HMM_Mat4 vp,
         .vertex_buffers[0] = ts->model_buf,
     };
     sg_apply_bindings(&bind);
-
-    // Fragment shader uniforms (same for all instances)
-    torch_fs_params_t fs_p = {
-        .sun_direction = {{ sun_dir.X, sun_dir.Y, sun_dir.Z, 0.0f }},
-    };
-    sg_apply_uniforms(UB_torch_fs_params, &SG_RANGE(fs_p));
 
     // Draw each torch instance
     for (int i = 0; i < TORCH_MAX_INSTANCES; i++) {
