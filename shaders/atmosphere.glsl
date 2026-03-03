@@ -207,6 +207,27 @@ void main() {
     // Final scattered light
     vec3 color = sunIntensity * (rayleighSum * phaseR + mieSum * phaseM);
 
+    // Sunset warmth: when the sun is near the horizon, the long atmospheric
+    // path scatters away blue light, leaving warm golden/orange tones.
+    // Enhance this effect since the numerical integration can underestimate it.
+    {
+        float sun_height = dot(sunDir, normalize(v_camera_pos));
+        float sunset = smoothstep(0.3, -0.05, sun_height);  // 1.0 at sunset, 0.0 at noon
+        float view_sun = max(0.0, dot(rayDir, sunDir));
+
+        // Warm tint: shift blue toward warm at sunset
+        color *= mix(vec3(1.0), vec3(1.3, 1.0, 0.6), sunset * 0.5);
+
+        // Golden glow near sun at sunset (wide Mie-like contribution)
+        float glow = pow(view_sun, 3.0) * sunset;
+        color += vec3(1.0, 0.65, 0.25) * glow * sunIntensity * 0.12;
+
+        // Horizon band warmth (even away from sun direction)
+        float horizon = 1.0 - abs(dot(rayDir, normalize(v_camera_pos)));
+        horizon = pow(horizon, 3.0);
+        color += vec3(0.8, 0.4, 0.15) * horizon * sunset * sunIntensity * 0.04;
+    }
+
     // Tone mapping (HDR -> LDR)
     color = 1.0 - exp(-color);
 

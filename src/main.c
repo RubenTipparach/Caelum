@@ -330,12 +330,17 @@ static void frame(void) {
             printf("[GAME] PHASE 2: render_init done\n"); fflush(stdout);
 
             // Position camera above the actual terrain at spawn point
-            HMM_Vec3 spawn_dir = (HMM_Vec3){{0.0f, 1.0f, 0.0f}};
+            // Twilight zone, grass biome (lat 68.55, lon -106.52)
+            HMM_Vec3 spawn_dir = HMM_NormV3((HMM_Vec3){{-0.103983f, 0.930767f, -0.350514f}});
             double surface_r = lod_tree_terrain_height(&app.renderer.lod_tree, spawn_dir) + 10.0;
-            app.camera.pos_d[0] = 0.0;
-            app.camera.pos_d[1] = surface_r;
-            app.camera.pos_d[2] = 0.0;
-            app.camera.position = (HMM_Vec3){{0.0f, (float)surface_r, 0.0f}};
+            app.camera.pos_d[0] = (double)spawn_dir.X * surface_r;
+            app.camera.pos_d[1] = (double)spawn_dir.Y * surface_r;
+            app.camera.pos_d[2] = (double)spawn_dir.Z * surface_r;
+            app.camera.position = (HMM_Vec3){{
+                (float)app.camera.pos_d[0],
+                (float)app.camera.pos_d[1],
+                (float)app.camera.pos_d[2]
+            }};
 
             // Set floating origin to spawn position BEFORE any LOD meshes are generated.
             // Without this, the first frame of gameplay would recenter (802km > 50km threshold)

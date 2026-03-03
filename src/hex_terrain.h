@@ -67,6 +67,12 @@ typedef struct HexChunk {
     int cpu_wire_count;
 
     void* pending_job;          // HexMeshJob* (opaque)
+
+    // Boundary torch light for cross-chunk propagation (stored after mesh gen).
+    // [0]=col 0 (west), [1]=col 31 (east), [2]=row 0 (south), [3]=row 31 (north)
+    // Each is HEX_CHUNK_SIZE * HEX_CHUNK_LAYERS bytes, indexed [cell * LAYERS + layer].
+    // NULL if no torch light at that border.
+    uint8_t* border_torch[4];
 } HexChunk;
 
 // Voxel access macro for 3D array (col, row, layer are local)
@@ -106,6 +112,11 @@ typedef struct HexTerrain {
 
     // Voxel edit persistence
     EditCache edits;
+
+    // Initial load coordination: wait for ALL first-gen chunks to complete
+    // before triggering a coordinated second pass with full neighbor data.
+    int initial_gen_pending;     // In-flight first-generation jobs
+    bool initial_load_complete;  // True after coordinated second pass triggered
 
     // Stats
     int total_vertex_count;

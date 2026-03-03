@@ -18,6 +18,23 @@
 #include "FastNoiseLite.h"
 #include "terrain_noise.h"
 
+// Debug logging to both console and file
+#include <stdarg.h>
+static void hex_log(const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    vprintf(fmt, args);
+    va_end(args);
+    fflush(stdout);
+    FILE* f = fopen("hex_debug.log", "a");
+    if (f) {
+        va_start(args, fmt);
+        vfprintf(f, fmt, args);
+        va_end(args);
+        fclose(f);
+    }
+}
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -86,7 +103,8 @@ typedef struct {
 
 static HtArchFrame ht_arch_make_frame(void) {
     HtArchFrame f;
-    f.center = (HMM_Vec3){{0.0f, 1.0f, 0.0f}};
+    // Twilight zone spawn (lat 68.55, lon -106.52)
+    f.center = vec3_normalize((HMM_Vec3){{-0.103983f, 0.930767f, -0.350514f}});
     HMM_Vec3 up = f.center;
     HMM_Vec3 arb = fabsf(up.Y) < 0.999f ? (HMM_Vec3){{0,1,0}} : (HMM_Vec3){{1,0,0}};
     f.east  = vec3_normalize(vec3_cross(arb, up));
@@ -428,10 +446,67 @@ typedef struct HexMeshJob {
 
     int chunk_index;
     volatile int completed;
+    int nb_count;  // number of neighbor voxel sets populated (0-8)
+    bool is_initial_gen;  // true = first-time generation (no pre-existing voxels)
 
     // Edit cache (read-only pointer for edit queries on worker thread)
     const EditCache* edit_cache;
+
+    // Neighbor chunk voxel data for cross-chunk BFS and geometry.
+    // Indexed as [dx+1][dz+1] where dx,dz in {-1,0,1} (center [1][1] is self).
+    // NULL if that neighbor doesn't have voxel data.
+    uint8_t* nb_voxels[3][3];    // malloc'd copies of neighbor voxel arrays
+    int nb_base_layer[3][3];     // neighbor base_layer values
+
+    // Output: boundary torch light values (extracted after BFS for cross-chunk propagation)
+    // [0]=col 0, [1]=col 31, [2]=row 0, [3]=row 31
+    // Each is HEX_CHUNK_SIZE * HEX_CHUNK_LAYERS bytes. NULL if all zeros.
+    uint8_t* out_border_torch[4];
+
+    // Input: neighbor boundary torch light values (facing our chunk edge)
+    // [dx+1][dz+1] = pointer to the neighbor's facing border. NULL if unavailable.
+    // Only populated for cardinal neighbors (dx=0 or dz=0, not both nonzero).
+    uint8_t* nb_border_torch[3][3];
 } HexMeshJob;
+
+// Free all neighbor voxel data and border torch data from a mesh job
+static void free_job_neighbors(HexMeshJob* job) {
+    for (int dx = 0; dx < 3; dx++)
+        for (int dz = 0; dz < 3; dz++) {
+            if (dx == 1 && dz == 1) continue;
+            if (job->nb_voxels[dx][dz]) {
+                free(job->nb_voxels[dx][dz]);
+                job->nb_voxels[dx][dz] = NULL;
+            }
+            if (job->nb_border_torch[dx][dz]) {
+                free(job->nb_border_torch[dx][dz]);
+                job->nb_border_torch[dx][dz] = NULL;
+            }
+        }
+}
+
+// Read a voxel from a neighbor chunk's data.
+// gcol/grow are GLOBAL hex coords. Returns VOXEL_AIR if neighbor data not available.
+static uint8_t job_read_neighbor_voxel(const HexMeshJob* job, int gcol, int grow, int layer) {
+    int ncx = (gcol < 0) ? -(((-gcol - 1) / HEX_CHUNK_SIZE) + 1) : (gcol / HEX_CHUNK_SIZE);
+    int ncz = (grow < 0) ? -(((-grow - 1) / HEX_CHUNK_SIZE) + 1) : (grow / HEX_CHUNK_SIZE);
+    int dx = ncx - job->cx + 1;
+    int dz = ncz - job->cz + 1;
+    if (dx < 0 || dx > 2 || dz < 0 || dz > 2) return VOXEL_AIR;
+    const uint8_t* nb = job->nb_voxels[dx][dz];
+    if (!nb) return VOXEL_AIR;  // neighbor data not available
+
+    int local_col = gcol - ncx * HEX_CHUNK_SIZE;
+    int local_row = grow - ncz * HEX_CHUNK_SIZE;
+    if (local_col < 0 || local_col >= HEX_CHUNK_SIZE ||
+        local_row < 0 || local_row >= HEX_CHUNK_SIZE)
+        return VOXEL_AIR;
+
+    int nb_base = job->nb_base_layer[dx][dz];
+    int local_layer = layer - nb_base;
+    if (local_layer < 0 || local_layer >= HEX_CHUNK_LAYERS) return VOXEL_AIR;
+    return HEX_VOXEL(nb, local_col, local_row, local_layer);
+}
 
 // ---- Unit-sphere → hex grid under job's tangent frame ----
 
@@ -590,7 +665,8 @@ static inline uint8_t job_get_voxel(const HexMeshJob* job, int col, int row, int
     return HEX_VOXEL(job->voxels, col, row, layer);
 }
 
-// Get neighbor voxel, handling cross-chunk boundaries by re-sampling noise
+// Get neighbor voxel, handling cross-chunk boundaries.
+// Uses actual neighbor chunk voxel data when available, falls back to noise.
 static uint8_t job_get_neighbor_voxel(const HexMeshJob* job,
                                        fnl_state* continental, fnl_state* mountain,
                                        fnl_state* warp, fnl_state* detail,
@@ -609,7 +685,20 @@ static uint8_t job_get_neighbor_voxel(const HexMeshJob* job,
         return HEX_VOXEL(job->voxels, local_col, local_row, layer);
     }
 
-    // Cross-chunk boundary: re-sample terrain from noise
+    // Cross-chunk boundary: try actual neighbor data first
+    int world_layer = layer + job->base_layer;
+    uint8_t nb = job_read_neighbor_voxel(job, ncol_g, nrow_g, world_layer);
+    // job_read_neighbor_voxel returns VOXEL_AIR if neighbor data is NULL.
+    // If we have actual neighbor data, trust it completely.
+    int ncx = (ncol_g < 0) ? -(((-ncol_g - 1) / HEX_CHUNK_SIZE) + 1) : (ncol_g / HEX_CHUNK_SIZE);
+    int ncz = (nrow_g < 0) ? -(((-nrow_g - 1) / HEX_CHUNK_SIZE) + 1) : (nrow_g / HEX_CHUNK_SIZE);
+    int dx = ncx - job->cx + 1;
+    int dz = ncz - job->cz + 1;
+    if (dx >= 0 && dx <= 2 && dz >= 0 && dz <= 2 && job->nb_voxels[dx][dz]) {
+        return nb;  // Actual neighbor data available — use it
+    }
+
+    // Fallback: re-sample terrain from noise (neighbor chunk not loaded)
     float nlx, nlz;
     hex_local_pos(ncol_g, nrow_g, &nlx, &nlz);
     HMM_Vec3 ndir = vec3_normalize(
@@ -620,37 +709,25 @@ static uint8_t job_get_neighbor_voxel(const HexMeshJob* job,
     float nh_eff = fmaxf(nh_m, TERRAIN_SEA_LEVEL_M);
     int surface_layer = (int)ceilf(nh_eff / HEX_HEIGHT);
 
-    int world_layer = layer + job->base_layer;
-
     // Check arch at this neighbor too
     float alx, alz;
     ht_arch_project(&job->arch_frame, vec3_normalize(ndir), job->planet_radius, &alx, &alz);
     int ab, at;
     ht_arch_query(alx, alz, job->arch_base, &ab, &at);
 
-    // Be conservative near any surface boundary to prevent missing faces.
-    // The noise approximation can disagree with actual voxel data by ±1 layer.
-    // Returning VOXEL_AIR forces face emission (safe: worst case = hidden extra face).
     int margin = 2;
 
-    // Near arch surfaces: conservative
     if (ab != INT16_MIN) {
         if (world_layer >= ab - margin && world_layer <= at + margin) {
-            // Near arch boundary — could be inside or outside the shell
             if (world_layer >= ab && world_layer <= at)
-                return VOXEL_STONE;  // definitely inside arch shell
-            return VOXEL_AIR;  // near arch edge, be safe
+                return VOXEL_STONE;
+            return VOXEL_AIR;
         }
     }
 
-    // Near terrain surface: conservative
     if (world_layer >= surface_layer - margin && world_layer <= surface_layer + margin)
         return VOXEL_AIR;
-
-    // Well below surface: definitely solid
     if (world_layer < surface_layer - margin) return VOXEL_STONE;
-
-    // Well above surface: definitely air
     return VOXEL_AIR;
 }
 
@@ -733,12 +810,87 @@ static void compute_sky_light(HexMeshJob* job,
         }
     }
 
+    // Allocate BFS queue (needed for both Pass 1b seeding and Pass 3 BFS)
+    int* queue = (int*)malloc(SKY_BFS_CAP * sizeof(int));
+    int qhead = 0, qtail = 0;
+
+    // ---- Pass 1b: Cross-chunk sky column seeding ----
+    // For boundary cells in our chunk, check cross-chunk hex neighbors.
+    // If a neighbor cell is sky-exposed (open sky column above), seed our
+    // boundary cell with SKY_MAX-1 so sky light flows across chunk boundaries.
+    for (int col = 0; col < HEX_CHUNK_SIZE; col++) {
+        for (int row = 0; row < HEX_CHUNK_SIZE; row++) {
+            // Only process boundary cells (edges of the chunk grid)
+            if (col > 0 && col < HEX_CHUNK_SIZE - 1 &&
+                row > 0 && row < HEX_CHUNK_SIZE - 1) continue;
+
+            int gcol = job->cx * HEX_CHUNK_SIZE + col;
+            int grow = job->cz * HEX_CHUNK_SIZE + row;
+
+            for (int dir = 0; dir < 6; dir++) {
+                int ncol_g, nrow_g;
+                hex_neighbor(gcol, grow, dir, &ncol_g, &nrow_g);
+                int nc = ncol_g - job->cx * HEX_CHUNK_SIZE;
+                int nr = nrow_g - job->cz * HEX_CHUNK_SIZE;
+
+                // Only process cross-chunk neighbors
+                if (nc >= 0 && nc < HEX_CHUNK_SIZE &&
+                    nr >= 0 && nr < HEX_CHUNK_SIZE) continue;
+
+                // Find neighbor chunk data
+                int ncx = (ncol_g < 0) ? -(((-ncol_g - 1) / HEX_CHUNK_SIZE) + 1) : (ncol_g / HEX_CHUNK_SIZE);
+                int ncz = (nrow_g < 0) ? -(((-nrow_g - 1) / HEX_CHUNK_SIZE) + 1) : (nrow_g / HEX_CHUNK_SIZE);
+                int dx = ncx - job->cx + 1;
+                int dz = ncz - job->cz + 1;
+                if (dx < 0 || dx > 2 || dz < 0 || dz > 2) continue;
+                const uint8_t* nb = job->nb_voxels[dx][dz];
+                if (!nb) continue;
+
+                int nb_base = job->nb_base_layer[dx][dz];
+                int lc = ncol_g - ncx * HEX_CHUNK_SIZE;
+                int lr = nrow_g - ncz * HEX_CHUNK_SIZE;
+                if (lc < 0 || lc >= HEX_CHUNK_SIZE || lr < 0 || lr >= HEX_CHUNK_SIZE) continue;
+
+                // Find max solid in the neighbor column (scan from top)
+                int nb_max_solid = -1;
+                for (int sl = HEX_CHUNK_LAYERS - 1; sl >= 0; sl--) {
+                    if (!is_transparent(HEX_VOXEL(nb, lc, lr, sl))) {
+                        nb_max_solid = sl;
+                        break;
+                    }
+                }
+
+                // Seed our boundary cell from neighbor sky-lit layers (above max solid)
+                int sky_start = nb_max_solid + 1;
+                if (sky_start < 0) sky_start = 0;
+                for (int nl = sky_start; nl < HEX_CHUNK_LAYERS; nl++) {
+                    int world_layer = nl + nb_base;
+                    int local_layer = world_layer - job->base_layer;
+                    if (local_layer < 0 || local_layer >= HEX_CHUNK_LAYERS) continue;
+                    if (!is_transparent(HEX_VOXEL(job->voxels, col, row, local_layer))) continue;
+
+                    uint8_t seed_val = SKY_MAX - 1;
+                    if (seed_val > SKY_VOXEL(sky, col, row, local_layer)) {
+                        SKY_VOXEL(sky, col, row, local_layer) = seed_val;
+                        if (qtail < SKY_BFS_CAP) {
+                            queue[qtail++] = col * HEX_CHUNK_SIZE * HEX_CHUNK_LAYERS
+                                           + row * HEX_CHUNK_LAYERS + local_layer;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (qtail > 0) {
+        hex_log("[SKY_BFS] chunk(%d,%d) Pass 1b: %d cross-chunk sky seeds\n",
+                job->cx, job->cz, qtail);
+    }
+
     // ---- Pass 2: Seed BFS queue ----
     // Any sky-lit air block adjacent to a non-sky-lit air block is a seed.
     // Also seed from sky-lit blocks adjacent to columns with higher terrain
     // (cross-chunk boundary awareness).
-    int* queue = (int*)malloc(SKY_BFS_CAP * sizeof(int));
-    int qhead = 0, qtail = 0;
 
     for (int col = 0; col < HEX_CHUNK_SIZE; col++) {
         for (int row = 0; row < HEX_CHUNK_SIZE; row++) {
@@ -835,7 +987,7 @@ static void compute_sky_light(HexMeshJob* job,
             }
         }
 
-        // 6 lateral hex neighbors (in-chunk only)
+        // 6 lateral hex neighbors (cross-chunk aware)
         int gcol = job->cx * HEX_CHUNK_SIZE + c;
         int grow = job->cz * HEX_CHUNK_SIZE + r;
         for (int dir = 0; dir < 6; dir++) {
@@ -844,16 +996,46 @@ static void compute_sky_light(HexMeshJob* job,
             int nc = ncol_g - job->cx * HEX_CHUNK_SIZE;
             int nr_local = nrow_g - job->cz * HEX_CHUNK_SIZE;
 
-            if (nc < 0 || nc >= HEX_CHUNK_SIZE || nr_local < 0 || nr_local >= HEX_CHUNK_SIZE)
-                continue;
-            if (!is_transparent(HEX_VOXEL(job->voxels, nc, nr_local, l))) continue;
+            if (nc >= 0 && nc < HEX_CHUNK_SIZE && nr_local >= 0 && nr_local < HEX_CHUNK_SIZE) {
+                // In-chunk neighbor: normal BFS
+                if (!is_transparent(HEX_VOXEL(job->voxels, nc, nr_local, l))) continue;
+                uint8_t new_light = current - 1;
+                if (new_light > SKY_VOXEL(sky, nc, nr_local, l)) {
+                    SKY_VOXEL(sky, nc, nr_local, l) = new_light;
+                    if (qtail < SKY_BFS_CAP) {
+                        queue[qtail++] = nc * HEX_CHUNK_SIZE * HEX_CHUNK_LAYERS
+                                       + nr_local * HEX_CHUNK_LAYERS + l;
+                    }
+                }
+            } else {
+                // Cross-chunk neighbor: check if transparent via actual neighbor data,
+                // then bounce light back to the originating in-chunk cell's other neighbors.
+                // This allows light to "pass through" the boundary.
+                int world_layer = l + job->base_layer;
+                uint8_t nb_voxel = job_read_neighbor_voxel(job, ncol_g, nrow_g, world_layer);
+                if (!is_transparent(nb_voxel)) continue;
 
-            uint8_t new_light = current - 1;
-            if (new_light > SKY_VOXEL(sky, nc, nr_local, l)) {
-                SKY_VOXEL(sky, nc, nr_local, l) = new_light;
-                if (qtail < SKY_BFS_CAP) {
-                    queue[qtail++] = nc * HEX_CHUNK_SIZE * HEX_CHUNK_LAYERS
-                                   + nr_local * HEX_CHUNK_LAYERS + l;
+                // The cross-chunk cell is transparent — propagate light to
+                // in-chunk cells adjacent to the cross-chunk cell.
+                // Use -1 cost (same as normal propagation) to avoid visible
+                // seams at chunk boundaries.
+                uint8_t new_light = current - 1;
+                if (new_light < 1) continue;
+                for (int rdir = 0; rdir < 6; rdir++) {
+                    int rcol_g, rrow_g;
+                    hex_neighbor(ncol_g, nrow_g, rdir, &rcol_g, &rrow_g);
+                    int rc = rcol_g - job->cx * HEX_CHUNK_SIZE;
+                    int rr = rrow_g - job->cz * HEX_CHUNK_SIZE;
+                    if (rc < 0 || rc >= HEX_CHUNK_SIZE || rr < 0 || rr >= HEX_CHUNK_SIZE) continue;
+                    if (rc == c && rr == r) continue;  // skip self
+                    if (!is_transparent(HEX_VOXEL(job->voxels, rc, rr, l))) continue;
+                    if (new_light > SKY_VOXEL(sky, rc, rr, l)) {
+                        SKY_VOXEL(sky, rc, rr, l) = new_light;
+                        if (qtail < SKY_BFS_CAP) {
+                            queue[qtail++] = rc * HEX_CHUNK_SIZE * HEX_CHUNK_LAYERS
+                                           + rr * HEX_CHUNK_LAYERS + l;
+                        }
+                    }
                 }
             }
         }
@@ -873,7 +1055,7 @@ static float read_sky_light(const HexMeshJob* job, int col, int row, int layer) 
 
 // ---- Torch BFS lighting ----
 
-#define TORCH_LIGHT_MAX   15
+#define TORCH_LIGHT_MAX   8
 #define TORCH_BFS_CAP     SKY_BFS_CAP
 #define TORCH_VOXEL(map, col, row, layer) \
     ((map)[(col) * HEX_CHUNK_SIZE * HEX_CHUNK_LAYERS + (row) * HEX_CHUNK_LAYERS + (layer)])
@@ -904,6 +1086,65 @@ static void compute_torch_light(HexMeshJob* job) {
         }
     }
 
+    // Seed from cross-chunk torches: scan neighbor chunk border strips for VOXEL_TORCH.
+    // Only scan the TORCH_LIGHT_MAX-wide border region facing our chunk.
+    int cross_torch_seeds = 0;
+    for (int dx = -1; dx <= 1; dx++) {
+        for (int dz = -1; dz <= 1; dz++) {
+            if (dx == 0 && dz == 0) continue;
+            const uint8_t* nb = job->nb_voxels[dx + 1][dz + 1];
+            if (!nb) continue;
+            int nb_base = job->nb_base_layer[dx + 1][dz + 1];
+            int ncx = job->cx + dx;
+            int ncz = job->cz + dz;
+            // Determine scan range: only border region within torch range
+            int c_lo = 0, c_hi = HEX_CHUNK_SIZE;
+            int r_lo = 0, r_hi = HEX_CHUNK_SIZE;
+            if (dx == -1) c_lo = HEX_CHUNK_SIZE - TORCH_LIGHT_MAX;  // right edge of left neighbor
+            if (dx ==  1) c_hi = TORCH_LIGHT_MAX;                    // left edge of right neighbor
+            if (dz == -1) r_lo = HEX_CHUNK_SIZE - TORCH_LIGHT_MAX;
+            if (dz ==  1) r_hi = TORCH_LIGHT_MAX;
+            if (c_lo < 0) c_lo = 0;
+            if (r_lo < 0) r_lo = 0;
+
+            for (int nc = c_lo; nc < c_hi; nc++) {
+                for (int nr = r_lo; nr < r_hi; nr++) {
+                    for (int nl = 0; nl < HEX_CHUNK_LAYERS; nl++) {
+                        if (HEX_VOXEL(nb, nc, nr, nl) != VOXEL_TORCH) continue;
+                        int torch_gcol = ncx * HEX_CHUNK_SIZE + nc;
+                        int torch_grow = ncz * HEX_CHUNK_SIZE + nr;
+                        int torch_wl = nl + nb_base;
+                        // Seed in-chunk cells adjacent to this torch
+                        for (int tdir = 0; tdir < 6; tdir++) {
+                            int adj_g, adj_r;
+                            hex_neighbor(torch_gcol, torch_grow, tdir, &adj_g, &adj_r);
+                            int lc = adj_g - job->cx * HEX_CHUNK_SIZE;
+                            int lr = adj_r - job->cz * HEX_CHUNK_SIZE;
+                            if (lc < 0 || lc >= HEX_CHUNK_SIZE || lr < 0 || lr >= HEX_CHUNK_SIZE) continue;
+                            int ll = torch_wl - job->base_layer;
+                            if (ll < 0 || ll >= HEX_CHUNK_LAYERS) continue;
+                            if (!is_transparent(HEX_VOXEL(job->voxels, lc, lr, ll))) continue;
+                            uint8_t seed_val = TORCH_LIGHT_MAX - 1;
+                            if (seed_val > TORCH_VOXEL(torch, lc, lr, ll)) {
+                                TORCH_VOXEL(torch, lc, lr, ll) = seed_val;
+                                cross_torch_seeds++;
+                                if (qtail < TORCH_BFS_CAP) {
+                                    queue[qtail++] = lc * HEX_CHUNK_SIZE * HEX_CHUNK_LAYERS
+                                                   + lr * HEX_CHUNK_LAYERS + ll;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (cross_torch_seeds > 0 || qtail > 0) {
+        hex_log("[TORCH_BFS] chunk(%d,%d) local_torches=%d cross_chunk_seeds=%d\n",
+                job->cx, job->cz, qtail - cross_torch_seeds, cross_torch_seeds);
+    }
+
     // BFS flood-fill (same structure as sky light Pass 3, but no sky-column rule)
     while (qhead < qtail) {
         int idx = queue[qhead++];
@@ -932,7 +1173,7 @@ static void compute_torch_light(HexMeshJob* job) {
             }
         }
 
-        // 6 lateral hex neighbors (in-chunk only)
+        // 6 lateral hex neighbors (cross-chunk aware)
         int gcol = job->cx * HEX_CHUNK_SIZE + c;
         int grow = job->cz * HEX_CHUNK_SIZE + r;
         for (int dir = 0; dir < 6; dir++) {
@@ -941,17 +1182,182 @@ static void compute_torch_light(HexMeshJob* job) {
             int nc = ncol_g - job->cx * HEX_CHUNK_SIZE;
             int nr_local = nrow_g - job->cz * HEX_CHUNK_SIZE;
 
-            if (nc < 0 || nc >= HEX_CHUNK_SIZE || nr_local < 0 || nr_local >= HEX_CHUNK_SIZE)
-                continue;
-            uint8_t nv = HEX_VOXEL(job->voxels, nc, nr_local, l);
-            if (!is_transparent(nv)) continue;
+            if (nc >= 0 && nc < HEX_CHUNK_SIZE && nr_local >= 0 && nr_local < HEX_CHUNK_SIZE) {
+                // In-chunk neighbor
+                uint8_t nv = HEX_VOXEL(job->voxels, nc, nr_local, l);
+                if (!is_transparent(nv)) continue;
+                uint8_t new_light = current - 1;
+                if (new_light > TORCH_VOXEL(torch, nc, nr_local, l)) {
+                    TORCH_VOXEL(torch, nc, nr_local, l) = new_light;
+                    if (qtail < TORCH_BFS_CAP) {
+                        queue[qtail++] = nc * HEX_CHUNK_SIZE * HEX_CHUNK_LAYERS
+                                       + nr_local * HEX_CHUNK_LAYERS + l;
+                    }
+                }
+            } else {
+                // Cross-chunk: propagate through transparent neighbor at -1 cost
+                int world_layer = l + job->base_layer;
+                uint8_t nb_voxel = job_read_neighbor_voxel(job, ncol_g, nrow_g, world_layer);
+                if (!is_transparent(nb_voxel)) continue;
+                uint8_t new_light = current - 1;
+                if (new_light < 1) continue;
+                for (int rdir = 0; rdir < 6; rdir++) {
+                    int rcol_g, rrow_g;
+                    hex_neighbor(ncol_g, nrow_g, rdir, &rcol_g, &rrow_g);
+                    int rc = rcol_g - job->cx * HEX_CHUNK_SIZE;
+                    int rr = rrow_g - job->cz * HEX_CHUNK_SIZE;
+                    if (rc < 0 || rc >= HEX_CHUNK_SIZE || rr < 0 || rr >= HEX_CHUNK_SIZE) continue;
+                    if (rc == c && rr == r) continue;
+                    if (!is_transparent(HEX_VOXEL(job->voxels, rc, rr, l))) continue;
+                    if (new_light > TORCH_VOXEL(torch, rc, rr, l)) {
+                        TORCH_VOXEL(torch, rc, rr, l) = new_light;
+                        if (qtail < TORCH_BFS_CAP) {
+                            queue[qtail++] = rc * HEX_CHUNK_SIZE * HEX_CHUNK_LAYERS
+                                           + rr * HEX_CHUNK_LAYERS + l;
+                        }
+                    }
+                }
+            }
+        }
+    }
 
+    // Seed from neighbor boundary torch values (propagate light across chunk borders).
+    // On the second pass, neighbor chunks have computed their BFS and stored border values.
+    // We read the facing border and seed our edge cells with value - 1.
+    // IMPORTANT: border values use the SOURCE chunk's local layer indexing.
+    // We must convert via base_layer offset to our local layer space.
+    {
+        int border_seeds = 0;
+        // Cardinal neighbors only: dx or dz is 0 (not both nonzero)
+        static const int cardinal[4][2] = {{0,-1},{0,1},{-1,0},{1,0}}; // S,N,W,E
+        for (int ci = 0; ci < 4; ci++) {
+            int dx = cardinal[ci][0], dz = cardinal[ci][1];
+            const uint8_t* nb_border = job->nb_border_torch[dx+1][dz+1];
+            if (!nb_border) continue;
+
+            // Layer offset: convert source local layer → our local layer
+            int nb_base = job->nb_base_layer[dx+1][dz+1];
+            int layer_off = nb_base - job->base_layer;
+
+            for (int cell = 0; cell < HEX_CHUNK_SIZE; cell++) {
+                for (int src_l = 0; src_l < HEX_CHUNK_LAYERS; src_l++) {
+                    uint8_t nb_val = nb_border[cell * HEX_CHUNK_LAYERS + src_l];
+                    if (nb_val <= 1) continue;
+                    uint8_t seed_val = nb_val - 1;
+
+                    // Convert source layer to our local layer
+                    int l = src_l + layer_off;
+                    if (l < 0 || l >= HEX_CHUNK_LAYERS) continue;
+
+                    // Map to our edge cell
+                    int c, r;
+                    if (dx == -1) { c = 0; r = cell; }                // west neighbor → our col 0
+                    else if (dx == 1) { c = HEX_CHUNK_SIZE - 1; r = cell; } // east → our col 31
+                    else if (dz == -1) { c = cell; r = 0; }           // south → our row 0
+                    else { c = cell; r = HEX_CHUNK_SIZE - 1; }        // north → our row 31
+
+                    if (!is_transparent(HEX_VOXEL(job->voxels, c, r, l))) continue;
+                    if (seed_val > TORCH_VOXEL(torch, c, r, l)) {
+                        TORCH_VOXEL(torch, c, r, l) = seed_val;
+                        border_seeds++;
+                        if (qtail < TORCH_BFS_CAP) {
+                            queue[qtail++] = c * HEX_CHUNK_SIZE * HEX_CHUNK_LAYERS
+                                           + r * HEX_CHUNK_LAYERS + l;
+                        }
+                    }
+                }
+            }
+        }
+        if (border_seeds > 0) {
+            hex_log("[TORCH_BORDER] chunk(%d,%d) seeded %d cells from neighbor borders\n",
+                    job->cx, job->cz, border_seeds);
+        } else {
+            // Debug: check if any neighbor had border data at all
+            for (int ci = 0; ci < 4; ci++) {
+                int dx = cardinal[ci][0], dz = cardinal[ci][1];
+                const uint8_t* nb_border = job->nb_border_torch[dx+1][dz+1];
+                if (nb_border) {
+                    int nb_base = job->nb_base_layer[dx+1][dz+1];
+                    int layer_off = nb_base - job->base_layer;
+                    int nb_nonzero = 0;
+                    for (int i = 0; i < HEX_CHUNK_SIZE * HEX_CHUNK_LAYERS; i++)
+                        if (nb_border[i] > 0) nb_nonzero++;
+                    hex_log("[TORCH_BORDER_DBG] chunk(%d,%d) nb(%d,%d) has %d nonzero border cells, layer_off=%d (nb_base=%d, our_base=%d)\n",
+                            job->cx, job->cz, dx, dz, nb_nonzero, layer_off, nb_base, job->base_layer);
+                }
+            }
+        }
+    }
+
+    // Re-run BFS from border seeds (they were added to the queue above)
+    while (qhead < qtail) {
+        int idx = queue[qhead++];
+        int c   = idx / (HEX_CHUNK_SIZE * HEX_CHUNK_LAYERS);
+        int rem = idx % (HEX_CHUNK_SIZE * HEX_CHUNK_LAYERS);
+        int r   = rem / HEX_CHUNK_LAYERS;
+        int l   = rem % HEX_CHUNK_LAYERS;
+
+        uint8_t current = TORCH_VOXEL(torch, c, r, l);
+        if (current <= 1) continue;
+
+        for (int dv = -1; dv <= 1; dv += 2) {
+            int nl = l + dv;
+            if (nl < 0 || nl >= HEX_CHUNK_LAYERS) continue;
+            if (!is_transparent(HEX_VOXEL(job->voxels, c, r, nl))) continue;
+            uint8_t new_light = current - 1;
+            if (new_light > TORCH_VOXEL(torch, c, r, nl)) {
+                TORCH_VOXEL(torch, c, r, nl) = new_light;
+                if (qtail < TORCH_BFS_CAP)
+                    queue[qtail++] = c * HEX_CHUNK_SIZE * HEX_CHUNK_LAYERS
+                                   + r * HEX_CHUNK_LAYERS + nl;
+            }
+        }
+        int gcol = job->cx * HEX_CHUNK_SIZE + c;
+        int grow = job->cz * HEX_CHUNK_SIZE + r;
+        for (int dir = 0; dir < 6; dir++) {
+            int ncol_g, nrow_g;
+            hex_neighbor(gcol, grow, dir, &ncol_g, &nrow_g);
+            int nc = ncol_g - job->cx * HEX_CHUNK_SIZE;
+            int nr_local = nrow_g - job->cz * HEX_CHUNK_SIZE;
+            if (nc < 0 || nc >= HEX_CHUNK_SIZE || nr_local < 0 || nr_local >= HEX_CHUNK_SIZE) continue;
+            if (!is_transparent(HEX_VOXEL(job->voxels, nc, nr_local, l))) continue;
             uint8_t new_light = current - 1;
             if (new_light > TORCH_VOXEL(torch, nc, nr_local, l)) {
                 TORCH_VOXEL(torch, nc, nr_local, l) = new_light;
-                if (qtail < TORCH_BFS_CAP) {
+                if (qtail < TORCH_BFS_CAP)
                     queue[qtail++] = nc * HEX_CHUNK_SIZE * HEX_CHUNK_LAYERS
                                    + nr_local * HEX_CHUNK_LAYERS + l;
+            }
+        }
+    }
+
+    // Extract boundary torch values for cross-chunk propagation
+    {
+        size_t border_size = (size_t)HEX_CHUNK_SIZE * HEX_CHUNK_LAYERS;
+        for (int b = 0; b < 4; b++) {
+            bool has_light = false;
+            // Check if any border cell has torch light
+            for (int cell = 0; cell < HEX_CHUNK_SIZE && !has_light; cell++) {
+                for (int l = 0; l < HEX_CHUNK_LAYERS && !has_light; l++) {
+                    int c, r;
+                    if (b == 0) { c = 0; r = cell; }
+                    else if (b == 1) { c = HEX_CHUNK_SIZE - 1; r = cell; }
+                    else if (b == 2) { c = cell; r = 0; }
+                    else { c = cell; r = HEX_CHUNK_SIZE - 1; }
+                    if (TORCH_VOXEL(torch, c, r, l) > 0) has_light = true;
+                }
+            }
+            if (has_light) {
+                job->out_border_torch[b] = (uint8_t*)malloc(border_size);
+                for (int cell = 0; cell < HEX_CHUNK_SIZE; cell++) {
+                    int c, r;
+                    if (b == 0) { c = 0; r = cell; }
+                    else if (b == 1) { c = HEX_CHUNK_SIZE - 1; r = cell; }
+                    else if (b == 2) { c = cell; r = 0; }
+                    else { c = cell; r = HEX_CHUNK_SIZE - 1; }
+                    memcpy(&job->out_border_torch[b][cell * HEX_CHUNK_LAYERS],
+                           &torch[c * HEX_CHUNK_SIZE * HEX_CHUNK_LAYERS + r * HEX_CHUNK_LAYERS],
+                           HEX_CHUNK_LAYERS);
                 }
             }
         }
@@ -965,6 +1371,82 @@ static float read_torch_light(const HexMeshJob* job, int col, int row, int layer
     if (layer < 0 || layer >= HEX_CHUNK_LAYERS) return 0.0f;
     if (col < 0 || col >= HEX_CHUNK_SIZE || row < 0 || row >= HEX_CHUNK_SIZE) return 0.0f;
     return (float)TORCH_VOXEL(job->torch_map, col, row, layer) / (float)TORCH_LIGHT_MAX;
+}
+
+// Estimate sky light for a cross-chunk air block by scanning neighbor voxel column.
+// gcol/grow are global hex coords, world_layer is the absolute layer.
+static float estimate_nb_sky(const HexMeshJob* job, int gcol, int grow, int world_layer) {
+    int ncx = (gcol < 0) ? -(((-gcol - 1) / HEX_CHUNK_SIZE) + 1) : (gcol / HEX_CHUNK_SIZE);
+    int ncz = (grow < 0) ? -(((-grow - 1) / HEX_CHUNK_SIZE) + 1) : (grow / HEX_CHUNK_SIZE);
+    int dx = ncx - job->cx + 1;
+    int dz = ncz - job->cz + 1;
+    if (dx < 0 || dx > 2 || dz < 0 || dz > 2) return 1.0f;
+    const uint8_t* nb = job->nb_voxels[dx][dz];
+    if (!nb) return 1.0f;
+
+    int nb_base = job->nb_base_layer[dx][dz];
+    int lc = gcol - ncx * HEX_CHUNK_SIZE;
+    int lr = grow - ncz * HEX_CHUNK_SIZE;
+    int ll = world_layer - nb_base;
+    if (lc < 0 || lc >= HEX_CHUNK_SIZE || lr < 0 || lr >= HEX_CHUNK_SIZE) return 1.0f;
+    if (ll < 0 || ll >= HEX_CHUNK_LAYERS) return 1.0f;
+
+    // Scan upward from this cell: if all air above → sky column → full light
+    for (int sl = ll; sl < HEX_CHUNK_LAYERS; sl++) {
+        if (!is_transparent(HEX_VOXEL(nb, lc, lr, sl))) {
+            // Covered by solid: light can only arrive laterally.
+            // Use conservative dim value — accurate BFS is only in our own chunk.
+            return 0.15f;
+        }
+    }
+    return 1.0f;  // open sky column
+}
+
+// Estimate torch light for a cross-chunk air block by scanning nearby cells for torches.
+static float estimate_nb_torch(const HexMeshJob* job, int gcol, int grow, int world_layer) {
+    int ncx = (gcol < 0) ? -(((-gcol - 1) / HEX_CHUNK_SIZE) + 1) : (gcol / HEX_CHUNK_SIZE);
+    int ncz = (grow < 0) ? -(((-grow - 1) / HEX_CHUNK_SIZE) + 1) : (grow / HEX_CHUNK_SIZE);
+    int dx = ncx - job->cx + 1;
+    int dz = ncz - job->cz + 1;
+    if (dx < 0 || dx > 2 || dz < 0 || dz > 2) return 0.0f;
+    const uint8_t* nb = job->nb_voxels[dx][dz];
+    if (!nb) return 0.0f;
+
+    int nb_base = job->nb_base_layer[dx][dz];
+    int lc = gcol - ncx * HEX_CHUNK_SIZE;
+    int lr = grow - ncz * HEX_CHUNK_SIZE;
+    int ll = world_layer - nb_base;
+    if (lc < 0 || lc >= HEX_CHUNK_SIZE || lr < 0 || lr >= HEX_CHUNK_SIZE) return 0.0f;
+    if (ll < 0 || ll >= HEX_CHUNK_LAYERS) return 0.0f;
+
+    // Check if the cell itself is a torch
+    if (HEX_VOXEL(nb, lc, lr, ll) == VOXEL_TORCH)
+        return 1.0f;
+
+    // Check immediate neighbors (6 lateral + 2 vertical) for torches
+    float best = 0.0f;
+    for (int dv = -1; dv <= 1; dv++) {
+        int sl = ll + dv;
+        if (sl < 0 || sl >= HEX_CHUNK_LAYERS) continue;
+        if (HEX_VOXEL(nb, lc, lr, sl) == VOXEL_TORCH) {
+            float v = (float)(TORCH_LIGHT_MAX - 1) / (float)TORCH_LIGHT_MAX;
+            if (v > best) best = v;
+        }
+    }
+    // Check lateral neighbors within the same neighbor chunk
+    int ng_gcol = gcol, ng_grow = grow;
+    for (int dir = 0; dir < 6; dir++) {
+        int hcol, hrow;
+        hex_neighbor(ng_gcol, ng_grow, dir, &hcol, &hrow);
+        int hlc = hcol - ncx * HEX_CHUNK_SIZE;
+        int hlr = hrow - ncz * HEX_CHUNK_SIZE;
+        if (hlc < 0 || hlc >= HEX_CHUNK_SIZE || hlr < 0 || hlr >= HEX_CHUNK_SIZE) continue;
+        if (ll >= 0 && ll < HEX_CHUNK_LAYERS && HEX_VOXEL(nb, hlc, hlr, ll) == VOXEL_TORCH) {
+            float v = (float)(TORCH_LIGHT_MAX - 1) / (float)TORCH_LIGHT_MAX;
+            if (v > best) best = v;
+        }
+    }
+    return best;
 }
 
 // ---- Timing helper (thread-safe) ----
@@ -1156,6 +1638,100 @@ static void generate_chunk_mesh(HexMeshJob* job) {
     compute_sky_light(job, &continental, &mountain, &warp, &detail);
     // Phase 2e: BFS torch light propagation
     compute_torch_light(job);
+
+    // Log torch light grid around any torch in this chunk (single atomic write)
+    if (job->torch_map) {
+        for (int tc = 0; tc < HEX_CHUNK_SIZE; tc++) {
+            for (int tr = 0; tr < HEX_CHUNK_SIZE; tr++) {
+                int min_s = job->col_min_solid[tc][tr];
+                int max_s = job->col_max_solid[tc][tr];
+                for (int tl = min_s; tl <= max_s; tl++) {
+                    if (HEX_VOXEL(job->voxels, tc, tr, tl) == VOXEL_TORCH) {
+                        int gcol_t = job->cx * HEX_CHUNK_SIZE + tc;
+                        int grow_t = job->cz * HEX_CHUNK_SIZE + tr;
+                        // Build entire grid into buffer, then write atomically
+                        char buf[4096];
+                        int pos = 0;
+                        pos += snprintf(buf + pos, sizeof(buf) - pos,
+                            "\n[TORCH_GRID] chunk(%d,%d) torch@local(%d,%d) global(%d,%d) layer=%d nb=%d\n",
+                            job->cx, job->cz, tc, tr, gcol_t, grow_t, tl + job->base_layer, job->nb_count);
+                        pos += snprintf(buf + pos, sizeof(buf) - pos, "     ");
+                        for (int c = tc - 8; c <= tc + 8; c++)
+                            pos += snprintf(buf + pos, sizeof(buf) - pos, " %3d", c);
+                        pos += snprintf(buf + pos, sizeof(buf) - pos, "\n");
+                        for (int r = tr - 8; r <= tr + 8; r++) {
+                            pos += snprintf(buf + pos, sizeof(buf) - pos, "r%3d:", r);
+                            for (int c = tc - 8; c <= tc + 8; c++) {
+                                if (c >= 0 && c < HEX_CHUNK_SIZE && r >= 0 && r < HEX_CHUNK_SIZE) {
+                                    int val = TORCH_VOXEL(job->torch_map, c, r, tl);
+                                    pos += snprintf(buf + pos, sizeof(buf) - pos, " %3d", val);
+                                } else {
+                                    pos += snprintf(buf + pos, sizeof(buf) - pos, "   .");
+                                }
+                                if (pos >= (int)sizeof(buf) - 20) break;
+                            }
+                            pos += snprintf(buf + pos, sizeof(buf) - pos, "\n");
+                            if (pos >= (int)sizeof(buf) - 100) break;
+                        }
+                        hex_log("%s", buf);
+                        goto done_torch_log;
+                    }
+                }
+            }
+        }
+        done_torch_log:;
+
+        // Also log grid for chunks that received border seeds but have NO local torch
+        // (shows cross-chunk propagation into neighbor chunks)
+        bool has_local_torch = false;
+        for (int tc2 = 0; tc2 < HEX_CHUNK_SIZE && !has_local_torch; tc2++)
+            for (int tr2 = 0; tr2 < HEX_CHUNK_SIZE && !has_local_torch; tr2++) {
+                int min_s = job->col_min_solid[tc2][tr2];
+                int max_s = job->col_max_solid[tc2][tr2];
+                for (int tl2 = min_s; tl2 <= max_s; tl2++)
+                    if (HEX_VOXEL(job->voxels, tc2, tr2, tl2) == VOXEL_TORCH) { has_local_torch = true; break; }
+            }
+        if (!has_local_torch) {
+            // Find the brightest torch-lit cell to center the grid on
+            int best_c = -1, best_r = -1, best_l = -1, best_v = 0;
+            for (int c = 0; c < HEX_CHUNK_SIZE; c++)
+                for (int r = 0; r < HEX_CHUNK_SIZE; r++) {
+                    int min_s = job->col_min_solid[c][r];
+                    int max_s = job->col_max_solid[c][r];
+                    for (int l = min_s; l <= max_s; l++) {
+                        int v = TORCH_VOXEL(job->torch_map, c, r, l);
+                        if (v > best_v) { best_v = v; best_c = c; best_r = r; best_l = l; }
+                    }
+                }
+            if (best_v > 0) {
+                char buf[4096];
+                int pos = 0;
+                pos += snprintf(buf + pos, sizeof(buf) - pos,
+                    "\n[TORCH_RECV] chunk(%d,%d) brightest=%d @local(%d,%d) layer=%d nb=%d\n",
+                    job->cx, job->cz, best_v, best_c, best_r, best_l + job->base_layer, job->nb_count);
+                pos += snprintf(buf + pos, sizeof(buf) - pos, "     ");
+                for (int c = best_c - 8; c <= best_c + 8; c++)
+                    pos += snprintf(buf + pos, sizeof(buf) - pos, " %3d", c);
+                pos += snprintf(buf + pos, sizeof(buf) - pos, "\n");
+                for (int r = best_r - 8; r <= best_r + 8; r++) {
+                    pos += snprintf(buf + pos, sizeof(buf) - pos, "r%3d:", r);
+                    for (int c = best_c - 8; c <= best_c + 8; c++) {
+                        if (c >= 0 && c < HEX_CHUNK_SIZE && r >= 0 && r < HEX_CHUNK_SIZE) {
+                            pos += snprintf(buf + pos, sizeof(buf) - pos, " %3d",
+                                TORCH_VOXEL(job->torch_map, c, r, best_l));
+                        } else {
+                            pos += snprintf(buf + pos, sizeof(buf) - pos, "   .");
+                        }
+                        if (pos >= (int)sizeof(buf) - 20) break;
+                    }
+                    pos += snprintf(buf + pos, sizeof(buf) - pos, "\n");
+                    if (pos >= (int)sizeof(buf) - 100) break;
+                }
+                hex_log("%s", buf);
+            }
+        }
+    }
+
     double t_skylight = timer_ms();
 
     // Phase 3: Generate mesh geometry
@@ -1337,8 +1913,8 @@ static void generate_chunk_mesh(HexMeshJob* job) {
                     if (!is_transparent(nv)) continue;
 
                     // Column sky light from the air block the side faces into
-                    float face_sky = 1.0f;  // default for cross-chunk
-                    float face_torch = 0.0f;
+                    float face_sky;
+                    float face_torch;
                     {
                         int ncol_g, nrow_g;
                         hex_neighbor(job->cx * HEX_CHUNK_SIZE + col,
@@ -1349,6 +1925,11 @@ static void generate_chunk_mesh(HexMeshJob* job) {
                             nr_local >= 0 && nr_local < HEX_CHUNK_SIZE) {
                             face_sky = read_sky_light(job, nc, nr_local, l);
                             face_torch = read_torch_light(job, nc, nr_local, l);
+                        } else {
+                            // Cross-chunk: estimate from neighbor voxel data
+                            int world_layer = l + job->base_layer;
+                            face_sky = estimate_nb_sky(job, ncol_g, nrow_g, world_layer);
+                            face_torch = estimate_nb_torch(job, ncol_g, nrow_g, world_layer);
                         }
                     }
                     if (face_sky < 0.05f) face_sky = 0.05f;
@@ -1480,7 +2061,7 @@ static void generate_chunk_mesh(HexMeshJob* job) {
         job->wire_verts[i + 2] -= job->origin[2];
     }
 
-    // Free light maps (only needed during mesh gen, not after)
+    // Free light maps and neighbor data (only needed during mesh gen, not after)
     if (job->sky_map) {
         free(job->sky_map);
         job->sky_map = NULL;
@@ -1489,6 +2070,7 @@ static void generate_chunk_mesh(HexMeshJob* job) {
         free(job->torch_map);
         job->torch_map = NULL;
     }
+    free_job_neighbors(job);
 
     double t_end = timer_ms();
 
@@ -1535,6 +2117,8 @@ static void sweep_orphans(void) {
             if (job->sky_map) free(job->sky_map);
             if (job->torch_map) free(job->torch_map);
             if (job->wire_verts) free(job->wire_verts);
+            for (int b = 0; b < 4; b++) { if (job->out_border_torch[b]) free(job->out_border_torch[b]); }
+            free_job_neighbors(job);
             free(job);
         } else {
             s_orphaned_jobs[write++] = s_orphaned_jobs[i];
@@ -1570,6 +2154,51 @@ static int find_free_chunk(HexTerrain* ht) {
     return -1;
 }
 
+// Copy neighbor chunk voxel data into a mesh job for cross-chunk BFS and geometry.
+// Called on the main thread before job submission.
+static void populate_job_neighbors(const HexTerrain* ht, HexMeshJob* job) {
+    size_t voxel_size = (size_t)HEX_CHUNK_SIZE * HEX_CHUNK_SIZE * HEX_CHUNK_LAYERS;
+    size_t border_size = (size_t)HEX_CHUNK_SIZE * HEX_CHUNK_LAYERS;
+    int nb_count = 0;
+    for (int dx = -1; dx <= 1; dx++) {
+        for (int dz = -1; dz <= 1; dz++) {
+            if (dx == 0 && dz == 0) continue;
+            int ncx = job->cx + dx;
+            int ncz = job->cz + dz;
+            int ni = find_chunk_const(ht, ncx, ncz);
+            if (ni >= 0 && ht->chunks[ni].voxels) {
+                job->nb_voxels[dx + 1][dz + 1] = (uint8_t*)malloc(voxel_size);
+                memcpy(job->nb_voxels[dx + 1][dz + 1], ht->chunks[ni].voxels, voxel_size);
+                job->nb_base_layer[dx + 1][dz + 1] = ht->chunks[ni].base_layer;
+                nb_count++;
+
+                // Copy neighbor's facing border torch values (cardinal neighbors only)
+                if (dx == 0 || dz == 0) {
+                    // Which border of the neighbor faces us?
+                    // dx=-1: neighbor is west, their east border (border[1]) faces our west
+                    // dx=+1: neighbor is east, their west border (border[0]) faces our east
+                    // dz=-1: neighbor is south, their north border (border[3]) faces our south
+                    // dz=+1: neighbor is north, their south border (border[2]) faces our north
+                    int bi = -1;
+                    if (dx == -1) bi = 1;
+                    else if (dx == 1) bi = 0;
+                    else if (dz == -1) bi = 3;
+                    else if (dz == 1) bi = 2;
+
+                    if (bi >= 0 && ht->chunks[ni].border_torch[bi]) {
+                        job->nb_border_torch[dx+1][dz+1] = (uint8_t*)malloc(border_size);
+                        memcpy(job->nb_border_torch[dx+1][dz+1],
+                               ht->chunks[ni].border_torch[bi], border_size);
+                    }
+                }
+            }
+        }
+    }
+    job->nb_count = nb_count;
+    hex_log("[NEIGHBORS] chunk(%d,%d) populated %d/8 neighbor voxel sets\n",
+            job->cx, job->cz, nb_count);
+}
+
 static void free_chunk(HexChunk* chunk) {
     if (chunk->cpu_vertices) {
         free(chunk->cpu_vertices);
@@ -1600,6 +2229,14 @@ static void free_chunk(HexChunk* chunk) {
         chunk->voxels = NULL;
     }
 
+    // Free boundary torch light data
+    for (int b = 0; b < 4; b++) {
+        if (chunk->border_torch[b]) {
+            free(chunk->border_torch[b]);
+            chunk->border_torch[b] = NULL;
+        }
+    }
+
     if (chunk->pending_job) {
         HexMeshJob* job = (HexMeshJob*)chunk->pending_job;
         if (job->completed) {
@@ -1608,6 +2245,8 @@ static void free_chunk(HexChunk* chunk) {
             if (job->sky_map) free(job->sky_map);
             if (job->torch_map) free(job->torch_map);
             if (job->wire_verts) free(job->wire_verts);
+            for (int b = 0; b < 4; b++) { if (job->out_border_torch[b]) free(job->out_border_torch[b]); }
+            free_job_neighbors(job);
             free(job);
         } else {
             orphan_job(job);
@@ -1680,6 +2319,8 @@ void hex_terrain_destroy(HexTerrain* ht) {
         if (job->sky_map) free(job->sky_map);
         if (job->torch_map) free(job->torch_map);
         if (job->wire_verts) free(job->wire_verts);
+        for (int b = 0; b < 4; b++) { if (job->out_border_torch[b]) free(job->out_border_torch[b]); }
+        free_job_neighbors(job);
         free(job);
     }
     s_orphan_count = 0;
@@ -1739,6 +2380,8 @@ void hex_terrain_update(HexTerrain* ht, HMM_Vec3 camera_pos,
         for (int i = 0; i < HEX_MAX_CHUNKS; i++) {
             if (ht->chunks[i].active) free_chunk(&ht->chunks[i]);
         }
+        ht->initial_gen_pending = 0;
+        ht->initial_load_complete = false;
     }
 
     // Process completed mesh generation jobs
@@ -1781,11 +2424,52 @@ void hex_terrain_update(HexTerrain* ht, HMM_Vec3 camera_pos,
             chunk->torch_scanned = false;  // Re-scan for torch instances
         }
 
+        // Transfer boundary torch light values (for cross-chunk propagation)
+        for (int b = 0; b < 4; b++) {
+            if (chunk->border_torch[b]) { free(chunk->border_torch[b]); chunk->border_torch[b] = NULL; }
+            chunk->border_torch[b] = job->out_border_torch[b];
+            job->out_border_torch[b] = NULL;
+        }
+
+        // Track initial-gen completion for coordinated second pass
+        if (job->is_initial_gen) {
+            ht->initial_gen_pending--;
+        }
+
+        free_job_neighbors(job);
         free(job);
         chunk->pending_job = NULL;
         chunk->generating = false;
         // Don't clear dirty — it was already cleared at submission time.
         // If it's true now, something re-dirtied it and we need another pass.
+    }
+
+    // Coordinated second pass: once ALL initial-gen chunks have completed
+    // and no more chunks need activation, mark all active chunks dirty.
+    // This ensures the second pass has full neighbor data for cross-chunk BFS.
+    if (!ht->initial_load_complete && ht->initial_gen_pending == 0) {
+        // Check that at least one active chunk exists with voxel data,
+        // and no active chunk still lacks voxel data (waiting for generation).
+        int active_with_voxels = 0;
+        bool any_missing = false;
+        for (int i = 0; i < HEX_MAX_CHUNKS; i++) {
+            if (!ht->chunks[i].active) continue;
+            if (ht->chunks[i].voxels) {
+                active_with_voxels++;
+            } else {
+                any_missing = true;
+                break;
+            }
+        }
+        if (active_with_voxels > 0 && !any_missing) {
+            for (int i = 0; i < HEX_MAX_CHUNKS; i++) {
+                if (ht->chunks[i].active && !ht->chunks[i].generating) {
+                    ht->chunks[i].dirty = true;
+                }
+            }
+            ht->initial_load_complete = true;
+            hex_log("[SECOND_PASS] All %d initial chunks complete — marking all dirty for coordinated rebuild\n", active_with_voxels);
+        }
     }
 
     // Determine chunk loading range
@@ -1886,12 +2570,14 @@ void hex_terrain_update(HexTerrain* ht, HMM_Vec3 camera_pos,
                     } else {
                         job->voxels = (uint8_t*)malloc(voxel_size);
                         job->has_voxels = false;
+                        job->is_initial_gen = true;
                         // Will be filled by generate_chunk_mesh
                     }
 
                     job->vertices = NULL;
                     job->vertex_count = 0;
                     job->completed = 0;
+                    populate_job_neighbors(ht, job);
 
                     if (job_system_try_submit(ht->jobs, hex_mesh_worker, job)) {
                         chunk->pending_job = job;
@@ -1899,8 +2585,10 @@ void hex_terrain_update(HexTerrain* ht, HMM_Vec3 camera_pos,
                         chunk->dirty = false;
                         chunk->edit_dirty = false;
                         jobs_submitted++;
+                        if (job->is_initial_gen) ht->initial_gen_pending++;
                     } else {
                         free(job->voxels);
+                        free_job_neighbors(job);
                         free(job);
                     }
                 }
@@ -1952,20 +2640,26 @@ void hex_terrain_update(HexTerrain* ht, HMM_Vec3 camera_pos,
             } else {
                 job->voxels = (uint8_t*)malloc(voxel_size);
                 job->has_voxels = false;
+                job->is_initial_gen = true;
             }
 
             job->vertices = NULL;
             job->vertex_count = 0;
             job->completed = 0;
+            populate_job_neighbors(ht, job);
 
             if (job_system_try_submit(ht->jobs, hex_mesh_worker, job)) {
+                hex_log("[JOB_SUBMIT] chunk(%d,%d) priority=%d edit_dirty=%d has_voxels=%d\n",
+                        chunk->cx, chunk->cz, priority, chunk->edit_dirty, job->has_voxels);
                 chunk->pending_job = job;
                 chunk->generating = true;
                 chunk->dirty = false;
                 chunk->edit_dirty = false;
                 jobs_submitted++;
+                if (job->is_initial_gen) ht->initial_gen_pending++;
             } else {
                 free(job->voxels);
+                free_job_neighbors(job);
                 free(job);
             }
         }
@@ -2228,32 +2922,14 @@ bool hex_terrain_break(HexTerrain* ht, const HexHitResult* hit) {
         edit_cache_record(&ht->edits, ux, uy, uz, hit->layer, VOXEL_AIR);
     }
 
-    // Dirty neighbor chunks if at chunk boundary OR breaking a torch (light bleeds across chunks)
-    bool at_boundary = (hit->col == 0 || hit->col == HEX_CHUNK_SIZE - 1 ||
-                        hit->row == 0 || hit->row == HEX_CHUNK_SIZE - 1);
-    if (at_boundary || broken_type == VOXEL_TORCH) {
-        for (int i = 0; i < HEX_MAX_CHUNKS; i++) {
-            if (!ht->chunks[i].active || i == hit->chunk_index) continue;
-            // For torch breaks, dirty all nearby chunks (light radius ~15 blocks)
-            if (broken_type == VOXEL_TORCH) {
-                int dx = ht->chunks[i].cx - chunk->cx;
-                int dz = ht->chunks[i].cz - chunk->cz;
-                if (dx >= -1 && dx <= 1 && dz >= -1 && dz <= 1) {
-                    ht->chunks[i].dirty = true;
-                }
-            } else if (at_boundary) {
-                // Original boundary-only logic for non-torch blocks
-                for (int dir = 0; dir < 6; dir++) {
-                    int ncol_g, nrow_g;
-                    hex_neighbor(hit->gcol, hit->grow, dir, &ncol_g, &nrow_g);
-                    int ncx = (int)floorf((float)ncol_g / HEX_CHUNK_SIZE);
-                    int ncz = (int)floorf((float)nrow_g / HEX_CHUNK_SIZE);
-                    if (ncx == ht->chunks[i].cx && ncz == ht->chunks[i].cz) {
-                        ht->chunks[i].dirty = true;
-                        ht->chunks[i].edit_dirty = true;
-                    }
-                }
-            }
+    // Always dirty all adjacent chunks: any block edit affects cross-chunk
+    // BFS lighting (sky light range 32, torch range 15) and boundary geometry.
+    for (int i = 0; i < HEX_MAX_CHUNKS; i++) {
+        if (!ht->chunks[i].active || i == hit->chunk_index) continue;
+        int dx = ht->chunks[i].cx - chunk->cx;
+        int dz = ht->chunks[i].cz - chunk->cz;
+        if (dx >= -1 && dx <= 1 && dz >= -1 && dz <= 1) {
+            ht->chunks[i].dirty = true;
         }
     }
     return true;
@@ -2289,6 +2965,9 @@ bool hex_terrain_place(HexTerrain* ht, const HexHitResult* hit, uint8_t voxel_ty
     chunk->dirty = true;
     chunk->edit_dirty = true;
 
+    hex_log("[PLACE] type=%d at gcol=%d grow=%d layer=%d | chunk(%d,%d) local(%d,%d)\n",
+            voxel_type, place_gcol, place_grow, place_layer, cx, cz, local_col, local_row);
+
     // Persist edit to disk-backed sector cache
     {
         double ux, uy, uz;
@@ -2296,33 +2975,20 @@ bool hex_terrain_place(HexTerrain* ht, const HexHitResult* hit, uint8_t voxel_ty
         edit_cache_record(&ht->edits, ux, uy, uz, place_layer, voxel_type);
     }
 
-    // Dirty neighbor chunks if at boundary OR placing a torch (light bleeds across chunks)
-    bool at_boundary = (local_col == 0 || local_col == HEX_CHUNK_SIZE - 1 ||
-                        local_row == 0 || local_row == HEX_CHUNK_SIZE - 1);
-    if (at_boundary || voxel_type == VOXEL_TORCH) {
-        for (int i = 0; i < HEX_MAX_CHUNKS; i++) {
-            if (!ht->chunks[i].active) continue;
-            if (ht->chunks[i].cx == cx && ht->chunks[i].cz == cz) continue;
-            if (voxel_type == VOXEL_TORCH) {
-                int dx = ht->chunks[i].cx - cx;
-                int dz = ht->chunks[i].cz - cz;
-                if (dx >= -1 && dx <= 1 && dz >= -1 && dz <= 1) {
-                    ht->chunks[i].dirty = true;
-                }
-            } else if (at_boundary) {
-                for (int dir = 0; dir < 6; dir++) {
-                    int ncol_g, nrow_g;
-                    hex_neighbor(place_gcol, place_grow, dir, &ncol_g, &nrow_g);
-                    int ncx = (int)floorf((float)ncol_g / HEX_CHUNK_SIZE);
-                    int ncz = (int)floorf((float)nrow_g / HEX_CHUNK_SIZE);
-                    if (ncx == ht->chunks[i].cx && ncz == ht->chunks[i].cz) {
-                        ht->chunks[i].dirty = true;
-                        ht->chunks[i].edit_dirty = true;
-                    }
-                }
-            }
+    // Always dirty all adjacent chunks: any block edit affects cross-chunk
+    // BFS lighting (sky light range 32, torch range 15) and boundary geometry.
+    int dirtied_count = 0;
+    for (int i = 0; i < HEX_MAX_CHUNKS; i++) {
+        if (!ht->chunks[i].active) continue;
+        if (ht->chunks[i].cx == cx && ht->chunks[i].cz == cz) continue;
+        int dx = ht->chunks[i].cx - cx;
+        int dz = ht->chunks[i].cz - cz;
+        if (dx >= -1 && dx <= 1 && dz >= -1 && dz <= 1) {
+            ht->chunks[i].dirty = true;
+            dirtied_count++;
         }
     }
+    hex_log("[PLACE] dirtied %d neighbor chunks\n", dirtied_count);
     return true;
 }
 
