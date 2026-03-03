@@ -65,6 +65,10 @@ static struct {
     uint64_t load_start_time;   // Benchmark: time when loading started
     int load_frame_count;       // Benchmark: frames spent in loading phase 3
 
+    // Block selector hotbar
+    uint8_t selected_block_type;
+    int hotbar_slot;
+
     // Background loading
     PlanetInitTask init_task;
 #ifdef _WIN32
@@ -79,12 +83,44 @@ bool log_verbose = false;
 // Block interaction: use hex terrain selection from renderer
 static void interact_break(void) {
     if (!app.renderer.hex_placement.valid) return;
-    hex_terrain_break(&app.renderer.hex_terrain, &app.renderer.hex_placement);
+    HexHitResult* hit = &app.renderer.hex_placement;
+
+    // Check if breaking a torch — need to remove visual instance
+    uint8_t broken_type = hex_terrain_get_voxel(&app.renderer.hex_terrain,
+        hit->gcol, hit->grow, hit->layer);
+
+    if (hex_terrain_break(&app.renderer.hex_terrain, hit)) {
+        if (broken_type == VOXEL_TORCH) {
+            torch_remove(&app.renderer.torch_system, hit->gcol, hit->grow, hit->layer);
+        }
+    }
 }
+
+// Hotbar: placeable block types in order
+static const uint8_t hotbar_types[] = {
+    VOXEL_STONE, VOXEL_DIRT, VOXEL_GRASS, VOXEL_SAND,
+    VOXEL_WATER, VOXEL_ICE, VOXEL_BEDROCK, VOXEL_TORCH
+};
+#define HOTBAR_COUNT 8
 
 static void interact_place(void) {
     if (!app.renderer.hex_placement.valid) return;
-    hex_terrain_place(&app.renderer.hex_terrain, &app.renderer.hex_placement, VOXEL_STONE);
+    HexHitResult* hit = &app.renderer.hex_placement;
+
+    if (hex_terrain_place(&app.renderer.hex_terrain, hit, app.selected_block_type)) {
+        if (app.selected_block_type == VOXEL_TORCH) {
+            // Compute world position for the torch model
+            float wx, wy, wz, ux, uy, uz;
+            hex_terrain_hex_to_world(&app.renderer.hex_terrain,
+                hit->place_gcol, hit->place_grow, hit->place_layer,
+                &wx, &wy, &wz, &ux, &uy, &uz);
+
+            int cx = (int)floorf((float)hit->place_gcol / HEX_CHUNK_SIZE);
+            int cz = (int)floorf((float)hit->place_grow / HEX_CHUNK_SIZE);
+            torch_add(&app.renderer.torch_system, wx, wy, wz, ux, uy, uz,
+                      cx, cz, hit->place_gcol, hit->place_grow, hit->place_layer);
+        }
+    }
 }
 
 static void init(void) {
@@ -127,6 +163,8 @@ static void init(void) {
 static void start_loading(void) {
     app.state = STATE_LOADING;
     app.loading_phase = 0;
+    app.selected_block_type = VOXEL_STONE;
+    app.hotbar_slot = 0;
 }
 
 static void draw_loading_screen(const char* status, int patches_ready, int patches_total, int verts) {
@@ -224,7 +262,7 @@ static void frame(void) {
         sdtx_puts("Space = jump, ESC = unlock\n");
         sdtx_puts("Double-tap Space = jetpack\n");
         sdtx_puts("Scroll wheel = jetpack speed\n");
-        sdtx_puts("Ctrl = jetpack descend\n");
+        sdtx_puts("Ctrl/C = jetpack descend\n");
         sdtx_puts("Alt+P = screenshot\n");
         sdtx_puts("L = toggle LOD debug colors\n");
         sdtx_puts("V = toggle verbose logs\n");
@@ -246,7 +284,15 @@ static void frame(void) {
             app.init_task.subdivision = 64;
             app.init_task.completed = 0;
 
-#ifdef _WIN32
+#ifdef __EMSCRIPTEN__
+            // Emscripten: no pthreads — run planet_init synchronously
+            planet_init(app.init_task.planet, app.init_task.subdivision);
+            app.init_task.completed = 1;
+            app.loading_phase = 2;  // Skip phase 1 (thread polling)
+            printf("[GAME] PHASE 0 DONE: planet_init completed synchronously, moving to phase 2\n"); fflush(stdout);
+            draw_loading_screen("Generating planet...", 0, 0, 0);
+            return;
+#elif defined(_WIN32)
             app.init_thread = CreateThread(NULL, 0, planet_init_thread, &app.init_task, 0, NULL);
 #else
             pthread_create(&app.init_thread, NULL, planet_init_thread, &app.init_task);
@@ -303,9 +349,10 @@ static void frame(void) {
         }
         if (app.loading_phase == 3) {
             // Phase 3: one update+upload per frame, tree builds progressively
+            // No camera movement during loading — only update projection
             app.load_frame_count++;
-            camera_update(&app.camera, &app.planet, &app.renderer.lod_tree, &app.renderer.hex_terrain, dt);
 
+            // LOD tree
             HMM_Mat4 vp = HMM_MulM4(app.camera.proj, app.camera.view);
             lod_tree_update(&app.renderer.lod_tree, app.camera.position, vp);
             lod_tree_upload_meshes(&app.renderer.lod_tree);
@@ -313,8 +360,25 @@ static void frame(void) {
             int active = lod_tree_active_leaves(&app.renderer.lod_tree);
             int total_verts = app.renderer.lod_tree.total_vertex_count;
             int pending = job_system_pending(app.renderer.lod_tree.jobs);
-            printf("[LOAD] frame %d: %d patches, %d pending, %dk verts\n",
-                app.load_frame_count, active, pending, total_verts / 1000);
+
+            // Hex terrain (close-range voxel grid)
+            hex_terrain_update(&app.renderer.hex_terrain, app.camera.position,
+                               app.renderer.lod_tree.world_origin);
+            hex_terrain_upload_meshes(&app.renderer.hex_terrain);
+
+            // Check hex terrain readiness: no chunks still generating or dirty
+            bool hex_ready = true;
+            for (int i = 0; i < HEX_MAX_CHUNKS; i++) {
+                HexChunk* chunk = &app.renderer.hex_terrain.chunks[i];
+                if (chunk->active && (chunk->generating || chunk->dirty)) {
+                    hex_ready = false;
+                    break;
+                }
+            }
+
+            printf("[LOAD] frame %d: %d patches, %d pending, hex=%s, %dk verts\n",
+                app.load_frame_count, active, pending,
+                hex_ready ? "ready" : "loading", total_verts / 1000);
             fflush(stdout);
 
             // Show loading progress with detail
@@ -327,8 +391,10 @@ static void frame(void) {
                 active, pending, elapsed_ms / 1000.0);
             draw_loading_screen(status_buf, active, display_total, total_verts);
 
-            // Transition once we have enough patches and workers are idle
-            if ((active >= 20 && pending == 0) || active >= 50) {
+            // Transition once both LOD tree and hex terrain have stabilized
+            bool tree_stable = pending == 0 && app.renderer.lod_tree.splits_this_frame == 0;
+            bool patches_ready = active >= 20 && tree_stable;
+            if (patches_ready && hex_ready) {
                 printf("[GAME] Terrain ready: %d patches, %d vertices. Load time: %.0fms (%d frames). Starting game.\n",
                     active, total_verts, elapsed_ms, app.load_frame_count);
                 fflush(stdout);
@@ -354,6 +420,41 @@ static void frame(void) {
         // Re-upload mesh if planet was modified or player moved far enough
         render_update_mesh(&app.renderer, &app.planet, &app.camera);
 
+        // Scan newly-loaded chunks for torch voxels and create visual instances
+        {
+            HexTerrain* ht = &app.renderer.hex_terrain;
+            TorchSystem* ts = &app.renderer.torch_system;
+            for (int i = 0; i < HEX_MAX_CHUNKS; i++) {
+                HexChunk* chunk = &ht->chunks[i];
+                if (!chunk->active || !chunk->voxels || chunk->torch_scanned) continue;
+                chunk->torch_scanned = true;
+
+                // Remove any old instances for this chunk position (handles re-activation)
+                torch_remove_chunk(ts, chunk->cx, chunk->cz);
+
+                // Scan for VOXEL_TORCH in this chunk's voxel data
+                for (int col = 0; col < HEX_CHUNK_SIZE; col++) {
+                    for (int row = 0; row < HEX_CHUNK_SIZE; row++) {
+                        int min_s = chunk->col_min_solid[col][row];
+                        int max_s = chunk->col_max_solid[col][row];
+                        for (int l = min_s; l <= max_s; l++) {
+                            if (HEX_VOXEL(chunk->voxels, col, row, l) == VOXEL_TORCH) {
+                                int gcol = chunk->cx * HEX_CHUNK_SIZE + col;
+                                int grow = chunk->cz * HEX_CHUNK_SIZE + row;
+                                int world_layer = l + chunk->base_layer;
+                                float wx, wy, wz, ux, uy, uz;
+                                hex_terrain_hex_to_world(ht, gcol, grow, world_layer,
+                                    &wx, &wy, &wz, &ux, &uy, &uz);
+                                torch_add(ts, wx, wy, wz, ux, uy, uz,
+                                          chunk->cx, chunk->cz, gcol, grow, world_layer);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        app.renderer.hotbar_selected_slot = app.hotbar_slot;
         render_frame(&app.renderer, &app.camera, dt);
     }
 
@@ -444,7 +545,26 @@ static void event(const sapp_event* ev) {
     }
 
     // Track ctrl state for inverted placement mode
-    app.renderer.ctrl_mode = (ev->modifiers & SAPP_MODIFIER_CTRL) != 0;
+    // C key serves as Ctrl alternative (browsers intercept Ctrl for shortcuts)
+    app.renderer.ctrl_mode = (ev->modifiers & SAPP_MODIFIER_CTRL) != 0 || app.camera.key_ctrl;
+
+    // Block selector: keys 1-8 select hotbar slot
+    if (ev->type == SAPP_EVENTTYPE_KEY_DOWN) {
+        int slot = -1;
+        if (ev->key_code >= SAPP_KEYCODE_1 && ev->key_code <= SAPP_KEYCODE_8)
+            slot = ev->key_code - SAPP_KEYCODE_1;
+        if (slot >= 0 && slot < HOTBAR_COUNT) {
+            app.hotbar_slot = slot;
+            app.selected_block_type = hotbar_types[slot];
+        }
+    }
+
+    // Scroll wheel cycles hotbar when mouse is locked
+    if (ev->type == SAPP_EVENTTYPE_MOUSE_SCROLL && app.camera.mouse_locked) {
+        int dir = (ev->scroll_y > 0.0f) ? -1 : 1;
+        app.hotbar_slot = (app.hotbar_slot + dir + HOTBAR_COUNT) % HOTBAR_COUNT;
+        app.selected_block_type = hotbar_types[app.hotbar_slot];
+    }
 
     // Block interactions: while mouse is locked, left=break, right=place
     if (app.camera.mouse_locked) {

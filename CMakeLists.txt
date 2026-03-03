@@ -41,6 +41,7 @@ add_executable(hex-planets
     src/atmosphere.c
     src/lod.c
     src/hex_terrain.c
+    src/torch.c
     src/voxel_edits.c
     src/job_system.c
     src/math_utils.c
@@ -67,28 +68,33 @@ set(SOKOL_SHDC "${CMAKE_SOURCE_DIR}/tools/sokol-shdc${CMAKE_EXECUTABLE_SUFFIX}")
 set(SHADER_SLANG "hlsl5:glsl430:glsl300es:wgsl")
 set(SHADER_DIR "${CMAKE_SOURCE_DIR}/shaders")
 
-file(GLOB SHADER_SOURCES "${SHADER_DIR}/*.glsl")
-set(SHADER_HEADERS)
+# Only compile shaders if sokol-shdc is available (CI uses pre-committed .glsl.h headers)
+if(EXISTS ${SOKOL_SHDC})
+    file(GLOB SHADER_SOURCES "${SHADER_DIR}/*.glsl")
+    set(SHADER_HEADERS)
 
-foreach(SHADER_SRC ${SHADER_SOURCES})
-    get_filename_component(SHADER_NAME ${SHADER_SRC} NAME)
-    set(SHADER_OUT "${SHADER_DIR}/${SHADER_NAME}.h")
-    list(APPEND SHADER_HEADERS ${SHADER_OUT})
+    foreach(SHADER_SRC ${SHADER_SOURCES})
+        get_filename_component(SHADER_NAME ${SHADER_SRC} NAME)
+        set(SHADER_OUT "${SHADER_DIR}/${SHADER_NAME}.h")
+        list(APPEND SHADER_HEADERS ${SHADER_OUT})
 
-    add_custom_command(
-        OUTPUT ${SHADER_OUT}
-        COMMAND ${SOKOL_SHDC}
-            --input ${SHADER_SRC}
-            --output ${SHADER_OUT}
-            --slang ${SHADER_SLANG}
-        DEPENDS ${SHADER_SRC}
-        COMMENT "Compiling shader: ${SHADER_NAME}"
-        VERBATIM
-    )
-endforeach()
+        add_custom_command(
+            OUTPUT ${SHADER_OUT}
+            COMMAND ${SOKOL_SHDC}
+                --input ${SHADER_SRC}
+                --output ${SHADER_OUT}
+                --slang ${SHADER_SLANG}
+            DEPENDS ${SHADER_SRC}
+            COMMENT "Compiling shader: ${SHADER_NAME}"
+            VERBATIM
+        )
+    endforeach()
 
-add_custom_target(shaders DEPENDS ${SHADER_HEADERS})
-add_dependencies(hex-planets shaders)
+    add_custom_target(shaders DEPENDS ${SHADER_HEADERS})
+    add_dependencies(hex-planets shaders)
+else()
+    message(STATUS "sokol-shdc not found — using pre-committed shader headers")
+endif()
 
 # Emscripten web build settings
 if(EMSCRIPTEN)
@@ -99,6 +105,8 @@ if(EMSCRIPTEN)
         -sINITIAL_MEMORY=67108864
         -sTOTAL_STACK=8388608
         --shell-file=${CMAKE_SOURCE_DIR}/web/shell.html
+        --preload-file=${CMAKE_SOURCE_DIR}/assets/textures@/assets/textures
+        --preload-file=${CMAKE_SOURCE_DIR}/tenebris/dist/textures@/tenebris/dist/textures
     )
     # Copy output to dist/ after build
     add_custom_command(TARGET hex-planets POST_BUILD
@@ -106,6 +114,7 @@ if(EMSCRIPTEN)
         COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:hex-planets> ${CMAKE_SOURCE_DIR}/dist/index.html
         COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/hex-planets.js ${CMAKE_SOURCE_DIR}/dist/hex-planets.js
         COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/hex-planets.wasm ${CMAKE_SOURCE_DIR}/dist/hex-planets.wasm
+        COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/hex-planets.data ${CMAKE_SOURCE_DIR}/dist/hex-planets.data
         COMMENT "Copying web build to dist/"
     )
 endif()

@@ -729,7 +729,7 @@ void camera_handle_event(Camera* cam, const sapp_event* ev) {
                 cam->key_space = true;
             }
             if (ev->key_code == SAPP_KEYCODE_LEFT_SHIFT) cam->key_shift = true;
-            if (ev->key_code == SAPP_KEYCODE_LEFT_CONTROL) cam->key_ctrl = true;
+            if (ev->key_code == SAPP_KEYCODE_LEFT_CONTROL || ev->key_code == SAPP_KEYCODE_C) cam->key_ctrl = true;
             if (ev->key_code == SAPP_KEYCODE_ESCAPE) {
                 cam->mouse_locked = false;
                 sapp_lock_mouse(false);
@@ -743,7 +743,7 @@ void camera_handle_event(Camera* cam, const sapp_event* ev) {
             if (ev->key_code == SAPP_KEYCODE_D) cam->key_d = false;
             if (ev->key_code == SAPP_KEYCODE_SPACE) cam->key_space = false;
             if (ev->key_code == SAPP_KEYCODE_LEFT_SHIFT) cam->key_shift = false;
-            if (ev->key_code == SAPP_KEYCODE_LEFT_CONTROL) cam->key_ctrl = false;
+            if (ev->key_code == SAPP_KEYCODE_LEFT_CONTROL || ev->key_code == SAPP_KEYCODE_C) cam->key_ctrl = false;
             break;
 
         default:

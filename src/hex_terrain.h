@@ -41,6 +41,7 @@ typedef struct HexChunk {
     bool edit_dirty;            // Dirty from player edit (priority remesh)
     bool generating;            // Mesh is being generated on worker thread
     bool is_transition;         // True = smooth surface-only mesh (transition zone)
+    bool torch_scanned;         // True = torch visual instances created for this chunk
     // 3D voxel data: [col][row][layer] — local layer index
     // world_layer = local_layer + base_layer
     // Dynamically allocated when chunk activates (128KB per chunk)
@@ -208,5 +209,11 @@ bool hex_terrain_has_headroom(const HexTerrain* ht, int gcol, int grow,
 // Convert a world-space position to hex grid coords + layer.
 void hex_terrain_world_to_hex(const HexTerrain* ht, HMM_Vec3 world_pos,
                                int* out_gcol, int* out_grow, int* out_layer);
+
+// Convert hex grid coords + layer to world position + surface normal.
+// Returns the center of the hex cell at the given layer.
+void hex_terrain_hex_to_world(const HexTerrain* ht, int gcol, int grow, int layer,
+                               float* out_x, float* out_y, float* out_z,
+                               float* out_up_x, float* out_up_y, float* out_up_z);
 
 #endif

@@ -9,6 +9,7 @@
 #include "lod.h"
 #include "hex_terrain.h"
 #include "config.h"
+#include "torch.h"
 
 // ---- Profiler stats (F3 overlay) ----
 typedef struct ProfileStats {
@@ -98,6 +99,14 @@ typedef struct Renderer {
     sg_pipeline lod_wireframe_pip;   // wireframe for LodVertex (stride 36)
     sg_pipeline hex_wireframe_pip;   // wireframe for HexVertex (stride 32)
     sg_buffer wireframe_idx;         // shared wireframe index buffer
+
+    // Torch rendering system
+    TorchSystem torch_system;
+
+    // Block selection hotbar
+    int hotbar_selected_slot;
+    sg_pipeline hotbar_pip;
+    sg_buffer hotbar_buf;
 
     // Debug modes
     bool show_profiler;     // F3: performance overlay

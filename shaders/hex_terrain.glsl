@@ -17,12 +17,14 @@ layout(location=1) in vec3 a_normal;
 layout(location=2) in vec2 a_uv;
 layout(location=3) in vec3 a_color;
 layout(location=4) in float a_sky_light;
+layout(location=5) in float a_torch_light;
 
 out vec3 fs_normal;
 out vec2 fs_uv;
 out vec3 fs_cam_rel_pos;
 out vec3 fs_color;
 out float fs_sky_light;
+out float fs_torch_light;
 
 void main() {
     vec3 cam_rel_pos = (a_position - camera_offset.xyz) - camera_offset_low.xyz;
@@ -39,6 +41,7 @@ void main() {
     fs_cam_rel_pos = cam_rel_pos;
     fs_color = a_color;
     fs_sky_light = a_sky_light;
+    fs_torch_light = a_torch_light;
 }
 @end
 
@@ -61,6 +64,7 @@ in vec2 fs_uv;
 in vec3 fs_cam_rel_pos;
 in vec3 fs_color;
 in float fs_sky_light;
+in float fs_torch_light;
 
 out vec4 frag_color;
 
@@ -81,6 +85,9 @@ void main() {
         float fade = smoothstep(hex_fade.x, hex_fade.y, fade_dist);
         base_color = mix(base_color, fs_color, fade);
     }
+
+    // Save un-darkened base for torch light contribution
+    vec3 torch_base = base_color;
 
     // Apply tenebris depth-based sky light (darkens underground blocks uniformly)
     // Applied AFTER texture/vertex blend so both texture and vertex color get darkened
@@ -117,6 +124,10 @@ void main() {
     terrain_color += sunColor * spec * ocean_mask * 0.4 * sun_brightness;
 
     // Rim lighting disabled for hex terrain — voxel faces should shade uniformly
+
+    // Torch light: warm orange glow, additive on un-darkened base color
+    // Visible even in full darkness (independent of sky light)
+    terrain_color += torch_base * vec3(1.0, 0.7, 0.3) * fs_torch_light;
 
     // Shadow desaturation
     float shadow_amount = 1.0 - ndotl * sun_brightness;
