@@ -9,6 +9,7 @@
 #include "HandmadeMath.h"
 
 #include <stdio.h>
+#include <math.h>
 
 #ifdef _WIN32
 #define _CRT_SECURE_NO_WARNINGS
@@ -16,6 +17,7 @@
 #pragma warning(disable: 4996)  // freopen deprecation
 #else
 #include <pthread.h>
+#include <sys/stat.h>
 #endif
 
 #include "camera.h"
@@ -159,6 +161,9 @@ static void init(void) {
     app.last_time = stm_now();
     printf("[GAME] init: done, entering menu.\n"); fflush(stdout);
 }
+
+static void player_save(void);
+static bool player_load(void);
 
 static void start_loading(void) {
     app.state = STATE_LOADING;
@@ -329,27 +334,32 @@ static void frame(void) {
             render_init(&app.renderer, &app.planet, &app.camera);
             printf("[GAME] PHASE 2: render_init done\n"); fflush(stdout);
 
-            // Position camera above the actual terrain at spawn point
-            // Twilight zone, grass biome (lat 68.55, lon -106.52)
-            HMM_Vec3 spawn_dir = HMM_NormV3((HMM_Vec3){{-0.103983f, 0.930767f, -0.350514f}});
-            double surface_r = lod_tree_terrain_height(&app.renderer.lod_tree, spawn_dir) + 10.0;
-            app.camera.pos_d[0] = (double)spawn_dir.X * surface_r;
-            app.camera.pos_d[1] = (double)spawn_dir.Y * surface_r;
-            app.camera.pos_d[2] = (double)spawn_dir.Z * surface_r;
-            app.camera.position = (HMM_Vec3){{
-                (float)app.camera.pos_d[0],
-                (float)app.camera.pos_d[1],
-                (float)app.camera.pos_d[2]
-            }};
+            // Try loading saved player position; fall back to default spawn
+            if (!player_load()) {
+                // Default spawn: Twilight zone, grass biome (lat 68.55, lon -106.52)
+                HMM_Vec3 spawn_dir = HMM_NormV3((HMM_Vec3){{-0.103983f, 0.930767f, -0.350514f}});
+                double surface_r = lod_tree_terrain_height(&app.renderer.lod_tree, spawn_dir) + 10.0;
+                app.camera.pos_d[0] = (double)spawn_dir.X * surface_r;
+                app.camera.pos_d[1] = (double)spawn_dir.Y * surface_r;
+                app.camera.pos_d[2] = (double)spawn_dir.Z * surface_r;
+                app.camera.position = (HMM_Vec3){{
+                    (float)app.camera.pos_d[0],
+                    (float)app.camera.pos_d[1],
+                    (float)app.camera.pos_d[2]
+                }};
+            }
 
-            // Set floating origin to spawn position BEFORE any LOD meshes are generated.
+            // Set floating origin to spawn/loaded position BEFORE any LOD meshes are generated.
             // Without this, the first frame of gameplay would recenter (802km > 50km threshold)
             // and destroy all meshes that were just loaded during the loading screen.
             app.renderer.lod_tree.world_origin[0] = app.camera.pos_d[0];
             app.renderer.lod_tree.world_origin[1] = app.camera.pos_d[1];
             app.renderer.lod_tree.world_origin[2] = app.camera.pos_d[2];
 
-            printf("[GAME] PHASE 2 DONE: camera at (0, %.0f, 0), origin set, moving to phase 3\n", surface_r);
+            double cam_r = sqrt(app.camera.pos_d[0]*app.camera.pos_d[0] +
+                               app.camera.pos_d[1]*app.camera.pos_d[1] +
+                               app.camera.pos_d[2]*app.camera.pos_d[2]);
+            printf("[GAME] PHASE 2 DONE: camera r=%.0f, origin set, moving to phase 3\n", cam_r);
             fflush(stdout);
 
             app.loading_phase = 3;
@@ -591,8 +601,71 @@ static void event(const sapp_event* ev) {
     camera_handle_event(&app.camera, ev);
 }
 
+// ---- Player state persistence ----
+#define PLAYER_SAVE_MAGIC 0x504C5952  // "PLYR"
+typedef struct {
+    uint32_t magic;
+    double pos_d[3];
+    float yaw;
+    float pitch;
+    uint8_t hotbar_slot;
+    uint8_t pad[3];
+} PlayerSave;
+
+static void player_save(void) {
+    // Ensure cache directory exists
+    #ifdef _WIN32
+    CreateDirectoryA("cache", NULL);
+    #else
+    mkdir("cache", 0755);
+    #endif
+
+    FILE* f = fopen("cache/player.dat", "wb");
+    if (!f) return;
+    PlayerSave save = {
+        .magic = PLAYER_SAVE_MAGIC,
+        .pos_d = { app.camera.pos_d[0], app.camera.pos_d[1], app.camera.pos_d[2] },
+        .yaw = app.camera.yaw,
+        .pitch = app.camera.pitch,
+        .hotbar_slot = (uint8_t)app.hotbar_slot,
+    };
+    fwrite(&save, sizeof(save), 1, f);
+    fclose(f);
+    printf("[SAVE] Player position saved\n"); fflush(stdout);
+}
+
+static bool player_load(void) {
+    FILE* f = fopen("cache/player.dat", "rb");
+    if (!f) return false;
+    PlayerSave save;
+    if (fread(&save, sizeof(save), 1, f) != 1 || save.magic != PLAYER_SAVE_MAGIC) {
+        fclose(f);
+        return false;
+    }
+    fclose(f);
+
+    // Validate: position must be a reasonable distance from planet center
+    double r = sqrt(save.pos_d[0]*save.pos_d[0] + save.pos_d[1]*save.pos_d[1] + save.pos_d[2]*save.pos_d[2]);
+    if (r < 700000.0 || r > 900000.0) return false;  // Sanity check (~800km planet)
+
+    app.camera.pos_d[0] = save.pos_d[0];
+    app.camera.pos_d[1] = save.pos_d[1];
+    app.camera.pos_d[2] = save.pos_d[2];
+    app.camera.position = (HMM_Vec3){{
+        (float)save.pos_d[0], (float)save.pos_d[1], (float)save.pos_d[2]
+    }};
+    app.camera.yaw = save.yaw;
+    app.camera.pitch = save.pitch;
+    app.hotbar_slot = save.hotbar_slot % HOTBAR_COUNT;
+    app.selected_block_type = hotbar_types[app.hotbar_slot];
+
+    printf("[SAVE] Player position loaded (r=%.0f)\n", r); fflush(stdout);
+    return true;
+}
+
 static void cleanup(void) {
     if (app.state == STATE_PLAYING || app.state == STATE_LOADING) {
+        player_save();
         render_shutdown(&app.renderer);
         planet_destroy(&app.planet);
     }

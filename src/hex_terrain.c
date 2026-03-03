@@ -2898,20 +2898,38 @@ HexHitResult hex_terrain_raycast(const HexTerrain* ht, HMM_Vec3 ray_origin,
 // ---- Break / Place (per-voxel) ----
 
 bool hex_terrain_break(HexTerrain* ht, const HexHitResult* hit) {
-    if (!hit->valid || hit->chunk_index < 0 || hit->chunk_index >= HEX_MAX_CHUNKS) return false;
+    if (!hit->valid) return false;
 
-    HexChunk* chunk = &ht->chunks[hit->chunk_index];
+    // Re-derive chunk from global coords (hit->chunk_index may be stale)
+    int cx = (int)floorf((float)hit->gcol / HEX_CHUNK_SIZE);
+    int cz = (int)floorf((float)hit->grow / HEX_CHUNK_SIZE);
+    int local_col = hit->gcol - cx * HEX_CHUNK_SIZE;
+    int local_row = hit->grow - cz * HEX_CHUNK_SIZE;
+    if (local_col < 0) { local_col += HEX_CHUNK_SIZE; cx--; }
+    if (local_row < 0) { local_row += HEX_CHUNK_SIZE; cz--; }
+
+    int chunk_idx = find_chunk(ht, cx, cz);
+    if (chunk_idx < 0) return false;
+
+    HexChunk* chunk = &ht->chunks[chunk_idx];
     if (!chunk->active || !chunk->voxels) return false;
 
     int local_layer = hit->layer - chunk->base_layer;
     if (local_layer < 0 || local_layer >= HEX_CHUNK_LAYERS) return false;
 
     // Bedrock is unbreakable
-    uint8_t broken_type = HEX_VOXEL(chunk->voxels, hit->col, hit->row, local_layer);
-    if (broken_type == VOXEL_BEDROCK) return false;
+    uint8_t broken_type = HEX_VOXEL(chunk->voxels, local_col, local_row, local_layer);
+    if (broken_type == VOXEL_BEDROCK) {
+        hex_log("[BREAK] BLOCKED: bedrock at gcol=%d grow=%d layer=%d\n",
+                hit->gcol, hit->grow, hit->layer);
+        return false;
+    }
 
-    HEX_VOXEL(chunk->voxels, hit->col, hit->row, local_layer) = VOXEL_AIR;
-    update_column_cache(chunk, hit->col, hit->row);
+    hex_log("[BREAK] type=%d at gcol=%d grow=%d layer=%d | chunk(%d,%d) local(%d,%d)\n",
+            broken_type, hit->gcol, hit->grow, hit->layer, cx, cz, local_col, local_row);
+
+    HEX_VOXEL(chunk->voxels, local_col, local_row, local_layer) = VOXEL_AIR;
+    update_column_cache(chunk, local_col, local_row);
     chunk->dirty = true;
     chunk->edit_dirty = true;
 
@@ -2925,9 +2943,9 @@ bool hex_terrain_break(HexTerrain* ht, const HexHitResult* hit) {
     // Always dirty all adjacent chunks: any block edit affects cross-chunk
     // BFS lighting (sky light range 32, torch range 15) and boundary geometry.
     for (int i = 0; i < HEX_MAX_CHUNKS; i++) {
-        if (!ht->chunks[i].active || i == hit->chunk_index) continue;
-        int dx = ht->chunks[i].cx - chunk->cx;
-        int dz = ht->chunks[i].cz - chunk->cz;
+        if (!ht->chunks[i].active || i == chunk_idx) continue;
+        int dx = ht->chunks[i].cx - cx;
+        int dz = ht->chunks[i].cz - cz;
         if (dx >= -1 && dx <= 1 && dz >= -1 && dz <= 1) {
             ht->chunks[i].dirty = true;
         }

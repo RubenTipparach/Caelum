@@ -47,11 +47,19 @@ jobs:
       - name: Build
         run: cmake --build build --config Release
 
+      - name: Package Windows build
+        shell: bash
+        run: |
+          mkdir -p package/assets/textures
+          cp build/Release/hex-planets.exe package/
+          cp assets/textures/*.png package/assets/textures/
+          if [ -f config.yaml ]; then cp config.yaml package/; fi
+
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: hex-planets-windows
-          path: build/Release/hex-planets.exe
+          path: package/
 
   build-web:
     name: Web Build (Emscripten)
