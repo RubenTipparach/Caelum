@@ -78,7 +78,7 @@ static bool check_wall_collision(Planet* planet, HMM_Vec3 pos,
 
         // Check each solid voxel layer in this cell
         for (int layer = 0; layer < MAX_VOXEL_HEIGHT; layer++) {
-            if (cell->voxels[layer] == VOXEL_AIR) continue;
+            if (cell->voxels[layer] == VOXEL_AIR || cell->voxels[layer] == VOXEL_TORCH) continue;
 
             float block_bot_r = planet->radius + layer * planet->layer_thickness;
             float block_top_r = block_bot_r + planet->layer_thickness;
@@ -550,7 +550,7 @@ void camera_update(Camera* cam, Planet* planet, const LodTree* lod,
         bool blocked = false;
         for (int check_l = feet_layer; check_l <= head_layer; check_l++) {
             uint8_t voxel = hex_terrain_get_voxel(hex, gcol, grow, check_l);
-            if (voxel != 0) {  // VOXEL_AIR = 0
+            if (voxel != VOXEL_AIR && voxel != VOXEL_TORCH) {
                 blocked = true;
                 break;
             }

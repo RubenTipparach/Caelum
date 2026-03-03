@@ -27,17 +27,29 @@ canvas {
 <div id="loading">Loading Hex Planets...</div>
 <canvas id="canvas" oncontextmenu="event.preventDefault()"></canvas>
 <script>
+    // Prevent space/arrows/tab from scrolling the page (itch.io iframe)
+    window.addEventListener('keydown', function(e) {
+        if ([32, 37, 38, 39, 40, 9].indexOf(e.keyCode) !== -1) {
+            e.preventDefault();
+        }
+    }, { passive: false });
+
     var Module = {
         canvas: (function() {
             var canvas = document.getElementById('canvas');
+            canvas.setAttribute('tabindex', '0');
             canvas.addEventListener('webglcontextlost', function(e) {
                 alert('WebGL context lost — please reload.');
                 e.preventDefault();
             }, false);
+            // Auto-focus canvas on any interaction
+            canvas.addEventListener('mousedown', function() { canvas.focus(); });
+            canvas.addEventListener('touchstart', function() { canvas.focus(); });
             return canvas;
         })(),
         onRuntimeInitialized: function() {
             document.getElementById('loading').style.display = 'none';
+            document.getElementById('canvas').focus();
         }
     };
 </script>

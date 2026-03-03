@@ -215,7 +215,7 @@ void render_init(Renderer* r, Planet* planet, const Camera* cam) {
             "assets/textures/snow.png",
             "assets/textures/dirt_grass.png",
             NULL,  // dirt_snow: generated from dirt+snow blend
-            "tenebris/dist/textures/torch.png",
+            "assets/textures/torch.png",
         };
         const int TILE_SIZE = 16;
         const int NUM_TILES = 10;
