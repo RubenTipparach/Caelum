@@ -2920,8 +2920,17 @@ bool hex_terrain_break(HexTerrain* ht, const HexHitResult* hit) {
     // Bedrock is unbreakable
     uint8_t broken_type = HEX_VOXEL(chunk->voxels, local_col, local_row, local_layer);
     if (broken_type == VOXEL_BEDROCK) {
-        hex_log("[BREAK] BLOCKED: bedrock at gcol=%d grow=%d layer=%d\n",
-                hit->gcol, hit->grow, hit->layer);
+        float altitude_m = (float)hit->layer * HEX_HEIGHT;
+        float base_alt_m = (float)chunk->base_layer * HEX_HEIGHT;
+        hex_log("[BREAK] BLOCKED: bedrock at gcol=%d grow=%d world_layer=%d (alt=%.0fm) | "
+                "chunk(%d,%d) local(%d,%d) local_layer=%d base_layer=%d (base_alt=%.0fm) | "
+                "bedrock_range=[0..%d] col_min=%d col_max=%d\n",
+                hit->gcol, hit->grow, hit->layer, altitude_m,
+                cx, cz, local_col, local_row, local_layer,
+                chunk->base_layer, base_alt_m,
+                HEX_BEDROCK_LAYERS - 1,
+                chunk->col_min_solid[local_col][local_row],
+                chunk->col_max_solid[local_col][local_row]);
         return false;
     }
 

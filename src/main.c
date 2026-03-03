@@ -82,6 +82,13 @@ static struct {
 
 bool log_verbose = false;
 
+// Menu state
+static int menu_selected = 0;   // 0 = single player, 1 = multiplayer
+static int menu_hover = -1;     // -1 = none (mouse not over any button)
+static float menu_mouse_x = 0;
+static float menu_mouse_y = 0;
+#define MENU_BUTTON_COUNT 2
+
 // Block interaction: use hex terrain selection from renderer
 static void interact_break(void) {
     if (!app.renderer.hex_placement.valid) return;
@@ -164,6 +171,7 @@ static void init(void) {
 
 static void player_save(void);
 static bool player_load(void);
+static int autosave_counter;
 
 static void start_loading(void) {
     app.state = STATE_LOADING;
@@ -249,16 +257,52 @@ static void frame(void) {
         });
 
         // Draw menu text
-        sdtx_canvas(sapp_widthf() * 0.5f, sapp_heightf() * 0.5f);
-        sdtx_origin(3.0f, 3.0f);
+        // Canvas is half window size; each char cell = 2 screen pixels.
+        float canvas_w = sapp_widthf() * 0.5f;
+        float canvas_h = sapp_heightf() * 0.5f;
+        sdtx_canvas(canvas_w, canvas_h);
+        float origin_x = 3.0f, origin_y = 3.0f;
+        sdtx_origin(origin_x, origin_y);
         sdtx_font(0);
+
+        // Mouse hit-test: convert pixel coords to character grid coords
+        // sdtx char cell = 8 pixels in canvas space; canvas maps to full window
+        float px_per_char_x = sapp_widthf() / (canvas_w / 8.0f);
+        float px_per_char_y = sapp_heightf() / (canvas_h / 8.0f);
+        float char_x = menu_mouse_x / px_per_char_x - origin_x;
+        float char_y = menu_mouse_y / px_per_char_y - origin_y;
+
+        // Button layout: row 2 = "Single Player", row 4 = "Multiplayer"
+        // (row 0-1 = title + blank line)
+        menu_hover = -1;
+        for (int i = 0; i < MENU_BUTTON_COUNT; i++) {
+            float btn_row = 2.0f + (float)i * 2.0f;  // rows 2, 4
+            if (char_y >= btn_row && char_y < btn_row + 1.0f &&
+                char_x >= 0.0f && char_x < 20.0f) {
+                menu_hover = i;
+            }
+        }
+
+        // Use hover for highlight; fall back to keyboard selection
+        int active = (menu_hover >= 0) ? menu_hover : menu_selected;
 
         sdtx_color3f(0.8f, 0.9f, 1.0f);
         sdtx_puts("=== HEX PLANETS ===\n\n");
 
-        sdtx_color3f(0.7f, 0.7f, 0.7f);
-        sdtx_puts("[1] Single Player\n\n");
-        sdtx_puts("[2] Multiplayer\n\n\n");
+        // Button 0: Single Player
+        {
+            bool lit = (active == 0);
+            if (lit) sdtx_color3f(1.0f, 1.0f, 0.3f);
+            else     sdtx_color3f(0.6f, 0.6f, 0.6f);
+            sdtx_printf("%s [1] Single Player\n\n", lit ? ">" : " ");
+        }
+        // Button 1: Multiplayer
+        {
+            bool lit = (active == 1);
+            if (lit) sdtx_color3f(1.0f, 1.0f, 0.3f);
+            else     sdtx_color3f(0.6f, 0.6f, 0.6f);
+            sdtx_printf("%s [2] Multiplayer\n\n\n", lit ? ">" : " ");
+        }
 
         sdtx_color3f(0.4f, 0.4f, 0.5f);
         sdtx_puts("WASD to move, Mouse to look\n");
@@ -433,6 +477,12 @@ static void frame(void) {
         // Feed camera timing into profiler
         app.renderer.profile.accum_camera_ms += (float)stm_ms(stm_diff(t_cam, t_frame_start));
 
+        // Autosave player position every ~5 seconds (300 frames at 60fps)
+        if (++autosave_counter >= 300) {
+            autosave_counter = 0;
+            player_save();
+        }
+
         // Floating origin: recenter if camera has drifted far from current origin
         lod_tree_update_origin(&app.renderer.lod_tree, app.camera.pos_d);
 
@@ -490,20 +540,62 @@ static void event(const sapp_event* ev) {
     //     fflush(stdout);
     // }
     if (app.state == STATE_MENU) {
+        // Track mouse position for hover
+        if (ev->type == SAPP_EVENTTYPE_MOUSE_MOVE) {
+            menu_mouse_x = ev->mouse_x;
+            menu_mouse_y = ev->mouse_y;
+        }
+
+        // Helper: activate selected menu option
+        #define MENU_ACTIVATE(slot) do { \
+            if ((slot) == 0) { \
+                printf("[GAME] Starting single player\n"); fflush(stdout); \
+                app.load_start_time = stm_now(); \
+                app.load_frame_count = 0; \
+                start_loading(); \
+            } else if ((slot) == 1) { \
+                LOG(GAME, "Starting multiplayer (placeholder)...\n"); \
+                start_loading(); \
+            } \
+        } while(0)
+
+        // Mouse click
+        if (ev->type == SAPP_EVENTTYPE_MOUSE_DOWN &&
+            ev->mouse_button == SAPP_MOUSEBUTTON_LEFT && menu_hover >= 0) {
+            menu_selected = menu_hover;
+            MENU_ACTIVATE(menu_selected);
+            return;
+        }
+
+        // Keyboard
         if (ev->type == SAPP_EVENTTYPE_KEY_DOWN) {
+            // Direct number keys
             if (ev->key_code == SAPP_KEYCODE_1) {
-                printf("[GAME] KEY '1' PRESSED - starting single player\n"); fflush(stdout);
-                app.load_start_time = stm_now();
-                app.load_frame_count = 0;
-                start_loading();
+                menu_selected = 0;
+                MENU_ACTIVATE(0);
                 return;
             }
             if (ev->key_code == SAPP_KEYCODE_2) {
-                LOG(GAME, "Starting multiplayer (placeholder)...\n");
-                start_loading();
+                menu_selected = 1;
+                MENU_ACTIVATE(1);
+                return;
+            }
+            // Arrow / WASD navigation
+            if (ev->key_code == SAPP_KEYCODE_UP || ev->key_code == SAPP_KEYCODE_W) {
+                menu_selected = (menu_selected - 1 + MENU_BUTTON_COUNT) % MENU_BUTTON_COUNT;
+                return;
+            }
+            if (ev->key_code == SAPP_KEYCODE_DOWN || ev->key_code == SAPP_KEYCODE_S) {
+                menu_selected = (menu_selected + 1) % MENU_BUTTON_COUNT;
+                return;
+            }
+            // Enter / Space confirms
+            if (ev->key_code == SAPP_KEYCODE_ENTER || ev->key_code == SAPP_KEYCODE_SPACE) {
+                MENU_ACTIVATE(menu_selected);
                 return;
             }
         }
+        #undef MENU_ACTIVATE
         return;
     }
 
@@ -621,7 +713,10 @@ static void player_save(void) {
     #endif
 
     FILE* f = fopen("cache/player.dat", "wb");
-    if (!f) return;
+    if (!f) {
+        printf("[SAVE] ERROR: could not open cache/player.dat for writing\n"); fflush(stdout);
+        return;
+    }
     PlayerSave save = {
         .magic = PLAYER_SAVE_MAGIC,
         .pos_d = { app.camera.pos_d[0], app.camera.pos_d[1], app.camera.pos_d[2] },
@@ -631,7 +726,10 @@ static void player_save(void) {
     };
     fwrite(&save, sizeof(save), 1, f);
     fclose(f);
-    printf("[SAVE] Player position saved\n"); fflush(stdout);
+    double r = sqrt(save.pos_d[0]*save.pos_d[0] + save.pos_d[1]*save.pos_d[1] + save.pos_d[2]*save.pos_d[2]);
+    printf("[SAVE] Player saved: r=%.0f yaw=%.2f pitch=%.2f slot=%d\n",
+           r, save.yaw, save.pitch, save.hotbar_slot);
+    fflush(stdout);
 }
 
 static bool player_load(void) {
