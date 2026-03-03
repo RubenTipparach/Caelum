@@ -16,43 +16,65 @@
 #define mkdir_p(path) mkdir(path, 0755)
 #endif
 
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
-
-// ---- File format ----
+// ---- File format (v2: cube-map sectors, unit-vector edits) ----
 
 #define EDIT_FILE_MAGIC   0x54494445  // "EDIT"
-#define EDIT_FILE_VERSION 1
+#define EDIT_FILE_VERSION 2
 
 typedef struct EditFileHeader {
-    uint32_t magic;
-    uint32_t version;
-    int32_t  seed;
-    int32_t  lon_idx;
-    int32_t  lat_idx;
-    int32_t  edit_count;
-    int32_t  reserved[2];   // 32 bytes total
-} EditFileHeader;
+    uint32_t magic;         // 4
+    uint32_t version;       // 4
+    int32_t  seed;          // 4
+    int32_t  edit_count;    // 4
+    int8_t   face;          // 1
+    int8_t   pad_h[3];      // 3
+    int16_t  u_idx;         // 2
+    int16_t  v_idx;         // 2
+    int32_t  reserved[2];   // 8
+} EditFileHeader;           // 32 bytes total
 
-// ---- Sector key computation ----
+// ---- Cube-map projection ----
 
-static float edit_sector_angular_size(float planet_radius) {
+void edit_unit_to_cubemap(HMM_Vec3 unit, int8_t* face, float* u, float* v) {
+    float ax = fabsf(unit.X), ay = fabsf(unit.Y), az = fabsf(unit.Z);
+    if (ay >= ax && ay >= az) {
+        *face = (unit.Y > 0.0f) ? 2 : 3;
+        float inv = 1.0f / ay;
+        *u = unit.X * inv;
+        *v = unit.Z * inv;
+    } else if (ax >= az) {
+        *face = (unit.X > 0.0f) ? 0 : 1;
+        float inv = 1.0f / ax;
+        *u = unit.Y * inv;
+        *v = unit.Z * inv;
+    } else {
+        *face = (unit.Z > 0.0f) ? 4 : 5;
+        float inv = 1.0f / az;
+        *u = unit.X * inv;
+        *v = unit.Y * inv;
+    }
+}
+
+static float edit_sector_uv_size(float planet_radius) {
     return EDIT_SECTOR_SIZE_M / planet_radius;
 }
 
-static EditSectorKey edit_sector_key_from_lonlat(float lon, float lat, float planet_radius) {
-    float sector_rad = edit_sector_angular_size(planet_radius);
+EditSectorKey edit_sector_key(HMM_Vec3 unit, float planet_radius) {
+    int8_t face;
+    float u, v;
+    edit_unit_to_cubemap(unit, &face, &u, &v);
+
+    float sector_uv = edit_sector_uv_size(planet_radius);
     EditSectorKey key;
-    key.lon_idx = (int32_t)floorf(lon / sector_rad);
-    key.lat_idx = (int32_t)floorf(lat / sector_rad);
+    key.face = face;
+    key.pad = 0;
+    key.u_idx = (int16_t)floorf(u / sector_uv);
+    key.v_idx = (int16_t)floorf(v / sector_uv);
     return key;
 }
 
-static EditSectorKey edit_sector_key_from_unit(HMM_Vec3 unit_pos, float planet_radius) {
-    float lat = asinf(unit_pos.Y);
-    float lon = atan2f(unit_pos.Z, unit_pos.X);
-    return edit_sector_key_from_lonlat(lon, lat, planet_radius);
+static bool edit_key_eq(const EditSectorKey* a, const EditSectorKey* b) {
+    return a->face == b->face && a->u_idx == b->u_idx && a->v_idx == b->v_idx;
 }
 
 // ---- Directory helpers ----
@@ -70,9 +92,11 @@ static void edit_ensure_dir(const char* path) {
     mkdir_p(buf);
 }
 
-static void edit_sector_path(const EditCache* cache, const EditSectorKey* key, char* out, int out_size) {
-    snprintf(out, out_size, "%s/%d/%d_%d.bin",
-             cache->cache_dir, cache->seed, key->lon_idx, key->lat_idx);
+static void edit_sector_path(const EditCache* cache, const EditSectorKey* key,
+                              char* out, int out_size) {
+    snprintf(out, out_size, "%s/%d/f%d_%d_%d.bin",
+             cache->cache_dir, cache->seed,
+             (int)key->face, (int)key->u_idx, (int)key->v_idx);
 }
 
 // ---- Disk I/O ----
@@ -81,7 +105,6 @@ static bool edit_save_sector(const EditCache* cache, const EditSector* sector) {
     char path[512];
     edit_sector_path(cache, &sector->key, path, sizeof(path));
 
-    // Ensure directory exists
     char dir[512];
     snprintf(dir, sizeof(dir), "%s/%d", cache->cache_dir, cache->seed);
     edit_ensure_dir(dir);
@@ -93,9 +116,10 @@ static bool edit_save_sector(const EditCache* cache, const EditSector* sector) {
     hdr.magic = EDIT_FILE_MAGIC;
     hdr.version = EDIT_FILE_VERSION;
     hdr.seed = cache->seed;
-    hdr.lon_idx = sector->key.lon_idx;
-    hdr.lat_idx = sector->key.lat_idx;
     hdr.edit_count = sector->edit_count;
+    hdr.face = sector->key.face;
+    hdr.u_idx = sector->key.u_idx;
+    hdr.v_idx = sector->key.v_idx;
 
     fwrite(&hdr, sizeof(hdr), 1, f);
     if (sector->edit_count > 0 && sector->edits) {
@@ -162,9 +186,7 @@ static void edit_load_into_slot(EditCache* cache, int slot, const EditSectorKey*
 static int edit_find_slot(const EditCache* cache, const EditSectorKey* key) {
     for (int i = 0; i < EDIT_MAX_CACHED; i++) {
         const EditSector* s = &cache->sectors[i];
-        if (s->state != EDIT_STATE_EMPTY &&
-            s->key.lon_idx == key->lon_idx &&
-            s->key.lat_idx == key->lat_idx) {
+        if (s->state != EDIT_STATE_EMPTY && edit_key_eq(&s->key, key)) {
             return i;
         }
     }
@@ -172,13 +194,11 @@ static int edit_find_slot(const EditCache* cache, const EditSectorKey* key) {
 }
 
 static int edit_find_or_evict_slot(EditCache* cache) {
-    // Find empty slot
     for (int i = 0; i < EDIT_MAX_CACHED; i++) {
         if (cache->sectors[i].state == EDIT_STATE_EMPTY)
             return i;
     }
 
-    // Evict least-recently-used READY slot
     int best = -1;
     uint64_t oldest = UINT64_MAX;
     for (int i = 0; i < EDIT_MAX_CACHED; i++) {
@@ -191,7 +211,6 @@ static int edit_find_or_evict_slot(EditCache* cache) {
 
     if (best >= 0) {
         EditSector* s = &cache->sectors[best];
-        // Save dirty sector before evicting
         if (s->dirty) {
             edit_save_sector(cache, s);
             s->dirty = false;
@@ -222,6 +241,24 @@ static void edit_sector_add(EditSector* sector, const VoxelEdit* edit) {
     sector->dirty = true;
 }
 
+static void edit_load_into_slot(EditCache* cache, int slot, const EditSectorKey* key) {
+    EditSector* s = &cache->sectors[slot];
+    memset(s, 0, sizeof(EditSector));
+    s->key = *key;
+    s->state = EDIT_STATE_READY;
+    s->last_access_frame = cache->current_frame;
+
+    VoxelEdit* loaded = NULL;
+    int loaded_count = 0;
+    if (edit_load_sector_from_disk(cache, key, &loaded, &loaded_count)) {
+        s->edits = loaded;
+        s->edit_count = loaded_count;
+        s->edit_capacity = loaded_count;
+    } else {
+        free(loaded);
+    }
+}
+
 // ---- Public API ----
 
 void edit_cache_init(EditCache* cache, int seed, float planet_radius, const char* cache_dir) {
@@ -238,7 +275,8 @@ void edit_cache_init(EditCache* cache, int seed, float planet_radius, const char
     pthread_mutex_init(&cache->mutex, NULL);
 #endif
 
-    printf("[EDITS] Initialized: seed=%d, sector=%.0fm\n", seed, EDIT_SECTOR_SIZE_M);
+    printf("[EDITS] Initialized: seed=%d, sector=%.0fm, cube-map sectors\n",
+           seed, EDIT_SECTOR_SIZE_M);
     fflush(stdout);
 }
 
@@ -257,9 +295,10 @@ void edit_cache_destroy(EditCache* cache) {
 #endif
 }
 
-void edit_cache_record(EditCache* cache, float lon, float lat,
+void edit_cache_record(EditCache* cache, double ux, double uy, double uz,
                        int32_t layer, uint8_t voxel_type) {
-    EditSectorKey key = edit_sector_key_from_lonlat(lon, lat, cache->planet_radius);
+    HMM_Vec3 unit = {{(float)ux, (float)uy, (float)uz}};
+    EditSectorKey key = edit_sector_key(unit, cache->planet_radius);
 
 #ifdef _WIN32
     EnterCriticalSection(&cache->mutex);
@@ -269,7 +308,6 @@ void edit_cache_record(EditCache* cache, float lon, float lat,
 
     int slot = edit_find_slot(cache, &key);
     if (slot < 0) {
-        // Sector not cached — find or evict a slot, load synchronously
         slot = edit_find_or_evict_slot(cache);
         if (slot < 0) {
 #ifdef _WIN32
@@ -289,7 +327,6 @@ void edit_cache_record(EditCache* cache, float lon, float lat,
         s->edit_capacity = 0;
         s->edits = NULL;
 
-        // Try loading from disk (synchronous — edits are small files)
         VoxelEdit* loaded = NULL;
         int loaded_count = 0;
         edit_load_sector_from_disk(cache, &key, &loaded, &loaded_count);
@@ -306,8 +343,9 @@ void edit_cache_record(EditCache* cache, float lon, float lat,
     s->last_access_frame = cache->current_frame;
 
     VoxelEdit edit;
-    edit.lon = lon;
-    edit.lat = lat;
+    edit.ux = ux;
+    edit.uy = uy;
+    edit.uz = uz;
     edit.layer = layer;
     edit.voxel_type = voxel_type;
     memset(edit.pad, 0, sizeof(edit.pad));
@@ -322,12 +360,12 @@ void edit_cache_record(EditCache* cache, float lon, float lat,
 }
 
 int edit_cache_query_area(const EditCache* cache,
-                          float lon_min, float lon_max,
-                          float lat_min, float lat_max,
+                          int8_t face,
+                          int16_t u_idx_min, int16_t u_idx_max,
+                          int16_t v_idx_min, int16_t v_idx_max,
                           VoxelEdit* out_edits, int max_edits) {
     int count = 0;
 
-    // Cast away const for mutex — query is logically const
     EditCache* mutable_cache = (EditCache*)cache;
 
 #ifdef _WIN32
@@ -336,26 +374,16 @@ int edit_cache_query_area(const EditCache* cache,
     pthread_mutex_lock(&mutable_cache->mutex);
 #endif
 
-    float sector_rad = edit_sector_angular_size(cache->planet_radius);
-
-    // Compute which sector keys overlap the query bounding box
-    int32_t key_lon_min = (int32_t)floorf(lon_min / sector_rad);
-    int32_t key_lon_max = (int32_t)floorf(lon_max / sector_rad);
-    int32_t key_lat_min = (int32_t)floorf(lat_min / sector_rad);
-    int32_t key_lat_max = (int32_t)floorf(lat_max / sector_rad);
-
-    // For each sector key in the query box, ensure it's loaded
-    for (int32_t ky = key_lat_min; ky <= key_lat_max && count < max_edits; ky++) {
-        for (int32_t kx = key_lon_min; kx <= key_lon_max && count < max_edits; kx++) {
+    for (int16_t vy = v_idx_min; vy <= v_idx_max && count < max_edits; vy++) {
+        for (int16_t ux = u_idx_min; ux <= u_idx_max && count < max_edits; ux++) {
             EditSectorKey key;
-            key.lon_idx = kx;
-            key.lat_idx = ky;
+            key.face = face;
+            key.pad = 0;
+            key.u_idx = ux;
+            key.v_idx = vy;
 
-            // Check if already in cache
             int slot = edit_find_slot(mutable_cache, &key);
             if (slot < 0) {
-                // Not cached — try loading from disk on the fly
-                // (edit files are tiny, <10KB, safe to do synchronously)
                 int free_slot = edit_find_or_evict_slot(mutable_cache);
                 if (free_slot >= 0) {
                     edit_load_into_slot(mutable_cache, free_slot, &key);
@@ -367,13 +395,9 @@ int edit_cache_query_area(const EditCache* cache,
             const EditSector* s = &cache->sectors[slot];
             if (s->state != EDIT_STATE_READY || s->edit_count == 0) continue;
 
-            // Check individual edits in this sector
+            // Copy all edits from this sector (caller does fine filtering)
             for (int e = 0; e < s->edit_count && count < max_edits; e++) {
-                const VoxelEdit* ed = &s->edits[e];
-                if (ed->lon >= lon_min && ed->lon <= lon_max &&
-                    ed->lat >= lat_min && ed->lat <= lat_max) {
-                    out_edits[count++] = *ed;
-                }
+                out_edits[count++] = s->edits[e];
             }
         }
     }
@@ -387,25 +411,6 @@ int edit_cache_query_area(const EditCache* cache,
     return count;
 }
 
-// Load a sector synchronously into a cache slot
-static void edit_load_into_slot(EditCache* cache, int slot, const EditSectorKey* key) {
-    EditSector* s = &cache->sectors[slot];
-    memset(s, 0, sizeof(EditSector));
-    s->key = *key;
-    s->state = EDIT_STATE_READY;
-    s->last_access_frame = cache->current_frame;
-
-    VoxelEdit* loaded = NULL;
-    int loaded_count = 0;
-    if (edit_load_sector_from_disk(cache, key, &loaded, &loaded_count)) {
-        s->edits = loaded;
-        s->edit_count = loaded_count;
-        s->edit_capacity = loaded_count;
-    } else {
-        free(loaded);
-    }
-}
-
 void edit_cache_update(EditCache* cache, HMM_Vec3 camera_unit_pos) {
     cache->current_frame++;
 
@@ -415,16 +420,18 @@ void edit_cache_update(EditCache* cache, HMM_Vec3 camera_unit_pos) {
     pthread_mutex_lock(&cache->mutex);
 #endif
 
-    // Preload nearby sectors (synchronous — files are < 10KB)
+    // Preload nearby sectors
     {
-        EditSectorKey center = edit_sector_key_from_unit(camera_unit_pos, cache->planet_radius);
+        EditSectorKey center = edit_sector_key(camera_unit_pos, cache->planet_radius);
         int loads = 0;
 
         for (int dy = -EDIT_PRELOAD_RADIUS; dy <= EDIT_PRELOAD_RADIUS && loads < 4; dy++) {
             for (int dx = -EDIT_PRELOAD_RADIUS; dx <= EDIT_PRELOAD_RADIUS && loads < 4; dx++) {
                 EditSectorKey key;
-                key.lon_idx = center.lon_idx + dx;
-                key.lat_idx = center.lat_idx + dy;
+                key.face = center.face;
+                key.pad = 0;
+                key.u_idx = center.u_idx + (int16_t)dx;
+                key.v_idx = center.v_idx + (int16_t)dy;
 
                 int slot = edit_find_slot(cache, &key);
                 if (slot >= 0) {
@@ -441,7 +448,7 @@ void edit_cache_update(EditCache* cache, HMM_Vec3 camera_unit_pos) {
         }
     }
 
-    // Flush dirty sectors every ~300 frames (~5 seconds at 60fps)
+    // Flush dirty sectors periodically (~5 seconds at 60fps)
     cache->flush_timer += 1.0f;
     if (cache->flush_timer >= 300.0f) {
         cache->flush_timer = 0.0f;
