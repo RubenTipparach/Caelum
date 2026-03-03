@@ -10,3 +10,6 @@
 
 #define SOKOL_DEBUGTEXT_IMPL
 #include "util/sokol_debugtext.h"
+
+#define SOKOL_GL_IMPL
+#include "util/sokol_gl.h"
