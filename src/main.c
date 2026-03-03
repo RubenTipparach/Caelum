@@ -78,13 +78,13 @@ bool log_verbose = false;
 
 // Block interaction: use hex terrain selection from renderer
 static void interact_break(void) {
-    if (!app.renderer.hex_selection.valid) return;
-    hex_terrain_break(&app.renderer.hex_terrain, &app.renderer.hex_selection);
+    if (!app.renderer.hex_placement.valid) return;
+    hex_terrain_break(&app.renderer.hex_terrain, &app.renderer.hex_placement);
 }
 
 static void interact_place(void) {
-    if (!app.renderer.hex_selection.valid) return;
-    hex_terrain_place(&app.renderer.hex_terrain, &app.renderer.hex_selection, VOXEL_STONE);
+    if (!app.renderer.hex_placement.valid) return;
+    hex_terrain_place(&app.renderer.hex_terrain, &app.renderer.hex_placement, VOXEL_STONE);
 }
 
 static void init(void) {
@@ -365,10 +365,10 @@ static void frame(void) {
 }
 
 static void event(const sapp_event* ev) {
-    if (ev->type == SAPP_EVENTTYPE_KEY_DOWN) {
-        printf("[EVENT] key_down: code=%d state=%d\n", ev->key_code, app.state);
-        fflush(stdout);
-    }
+    // if (ev->type == SAPP_EVENTTYPE_KEY_DOWN) {
+    //     printf("[EVENT] key_down: code=%d state=%d\n", ev->key_code, app.state);
+    //     fflush(stdout);
+    // }
     if (app.state == STATE_MENU) {
         if (ev->type == SAPP_EVENTTYPE_KEY_DOWN) {
             if (ev->key_code == SAPP_KEYCODE_1) {
@@ -409,6 +409,14 @@ static void event(const sapp_event* ev) {
         return;
     }
 
+    // Toggle wireframe overlay with P (physics debug)
+    if (ev->type == SAPP_EVENTTYPE_KEY_DOWN &&
+        ev->key_code == SAPP_KEYCODE_P && !(ev->modifiers & SAPP_MODIFIER_ALT)) {
+        app.renderer.show_wireframe = !app.renderer.show_wireframe;
+        LOG(GAME, "Wireframe: %s\n", app.renderer.show_wireframe ? "ON" : "OFF");
+        return;
+    }
+
     // Toggle profiler overlay with F3
     if (ev->type == SAPP_EVENTTYPE_KEY_DOWN && ev->key_code == SAPP_KEYCODE_F3) {
         app.renderer.show_profiler = !app.renderer.show_profiler;
@@ -434,6 +442,9 @@ static void event(const sapp_event* ev) {
         }
         return;
     }
+
+    // Track ctrl state for inverted placement mode
+    app.renderer.ctrl_mode = (ev->modifiers & SAPP_MODIFIER_CTRL) != 0;
 
     // Block interactions: while mouse is locked, left=break, right=place
     if (app.camera.mouse_locked) {

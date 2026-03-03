@@ -7,8 +7,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <stdio.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <time.h>
+#endif
 
 #include "FastNoiseLite.h"
+#include "terrain_noise.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -64,101 +72,7 @@ static void hex_neighbor(int col, int row, int dir, int* ncol, int* nrow) {
     axial_to_offset(nq, nr, ncol, nrow);
 }
 
-// ---- Terrain noise (identical to lod.c) ----
-#define TERRAIN_SEA_LEVEL_M   4000.0f
-#define TERRAIN_AMPLITUDE_M   8000.0f
-#define TERRAIN_MIN_M         500.0f
-
-static float ht_smoothstepf(float edge0, float edge1, float x) {
-    float t = (x - edge0) / (edge1 - edge0);
-    t = fminf(1.0f, fmaxf(0.0f, t));
-    return t * t * (3.0f - 2.0f * t);
-}
-
-static fnl_state ht_create_continental_noise(int seed) {
-    fnl_state noise = fnlCreateState();
-    noise.noise_type = FNL_NOISE_OPENSIMPLEX2;
-    noise.fractal_type = FNL_FRACTAL_FBM;
-    noise.octaves = 3;
-    noise.frequency = 0.6f;
-    noise.seed = seed;
-    return noise;
-}
-
-static fnl_state ht_create_mountain_noise(int seed) {
-    fnl_state noise = fnlCreateState();
-    noise.noise_type = FNL_NOISE_OPENSIMPLEX2;
-    noise.fractal_type = FNL_FRACTAL_RIDGED;
-    noise.octaves = 5;
-    noise.frequency = 1.5f;
-    noise.seed = seed + 4000;
-    return noise;
-}
-
-static fnl_state ht_create_warp_noise(int seed) {
-    fnl_state noise = fnlCreateState();
-    noise.noise_type = FNL_NOISE_OPENSIMPLEX2;
-    noise.fractal_type = FNL_FRACTAL_FBM;
-    noise.octaves = 3;
-    noise.frequency = 4.0f;
-    noise.seed = seed + 1000;
-    return noise;
-}
-
-static fnl_state ht_create_detail_noise(int seed) {
-    fnl_state noise = fnlCreateState();
-    noise.noise_type = FNL_NOISE_OPENSIMPLEX2;
-    noise.fractal_type = FNL_FRACTAL_RIDGED;
-    noise.octaves = 3;
-    noise.frequency = 16.0f;
-    noise.seed = seed + 2000;
-    return noise;
-}
-
-static float ht_sample_terrain_noise(fnl_state* continental, fnl_state* mountain,
-                                      fnl_state* warp_noise, fnl_state* detail_noise,
-                                      HMM_Vec3 unit_pos) {
-    float scale = 3.0f;
-    float px = unit_pos.X * scale;
-    float py = unit_pos.Y * scale;
-    float pz = unit_pos.Z * scale;
-
-    float warp_strength = 0.5f;
-    float wx = fnlGetNoise3D(warp_noise, px + 5.2f, py + 1.3f, pz + 3.7f);
-    float wy = fnlGetNoise3D(warp_noise, px + 9.1f, py + 4.8f, pz + 7.2f);
-    float wz = fnlGetNoise3D(warp_noise, px + 2.6f, py + 8.4f, pz + 0.9f);
-    float wpx = px + wx * warp_strength;
-    float wpy = py + wy * warp_strength;
-    float wpz = pz + wz * warp_strength;
-
-    float continent = fnlGetNoise3D(continental, wpx, wpy, wpz);
-
-    float mountain_raw = fnlGetNoise3D(mountain, wpx, wpy, wpz);
-    float mountain_val = (mountain_raw + 1.0f) * 0.5f;
-    mountain_val *= mountain_val;
-    float land_factor = ht_smoothstepf(-0.05f, 0.35f, continent);
-    float mountain_height = mountain_val * land_factor;
-
-    float detail = fnlGetNoise3D(detail_noise, px, py, pz);
-    float detail_weight = 0.05f + land_factor * 0.10f;
-
-    float height = continent * 0.55f - 0.22f;
-    height += mountain_height * 0.45f;
-    height += detail * detail_weight;
-
-    if (height > 1.0f) height = 1.0f;
-    if (height < -1.0f) height = -1.0f;
-    return height;
-}
-
-static float ht_sample_height_m(fnl_state* continental, fnl_state* mountain,
-                                  fnl_state* warp_noise, fnl_state* detail_noise,
-                                  HMM_Vec3 unit_pos) {
-    float n = ht_sample_terrain_noise(continental, mountain, warp_noise, detail_noise, unit_pos);
-    float height = TERRAIN_MIN_M + (n + 1.0f) * 0.5f * TERRAIN_AMPLITUDE_M;
-    if (height < 0.0f) height = 0.0f;
-    return height;
-}
+// ---- Terrain noise (shared with lod.c via terrain_noise.h) ----
 
 // ---- Stone Arch (same as lod.c, for voxel filling) ----
 #define ARCH_R_OUTER    100.0f   // outer semicircle radius (total width 200m, height 100m)
@@ -255,14 +169,42 @@ void hex_terrain_sample_height(int seed, float planet_radius, HMM_Vec3 unit_pos,
     if (out_effective_h_m) *out_effective_h_m = effective;
 }
 
-// Voxel type by height (matches lod.c compute_voxel_type logic)
-static VoxelType ht_voxel_type(float height_m) {
+// Deterministic hash for dithering at biome transitions
+static float dither_hash(int gcol, int grow, int seed) {
+    uint32_t h = (uint32_t)(gcol * 374761393 + grow * 668265263 + seed * 1103515245);
+    h = (h ^ (h >> 13)) * 1274126177u;
+    h = h ^ (h >> 16);
+    return (float)(h & 0xFFFFu) / 65535.0f;
+}
+
+// Voxel type by height with deterministic dithering at transitions.
+// Each hex column gets a stable random threshold so biome boundaries
+// show a natural mix of block types instead of a hard line.
+static VoxelType ht_voxel_type(float height_m, int gcol, int grow, int seed) {
     float rel = height_m - TERRAIN_SEA_LEVEL_M;
     if (height_m < TERRAIN_SEA_LEVEL_M) return VOXEL_WATER;
-    if (rel < 200.0f) return VOXEL_SAND;
-    if (rel < 1500.0f) return VOXEL_GRASS;
-    if (rel < 3000.0f) return VOXEL_STONE;
-    if (rel < 4500.0f) return VOXEL_STONE;
+
+    float d = dither_hash(gcol, grow, seed);
+    float dz = 100.0f;  // dither zone half-width in meters
+
+    // Sand -> Grass at 200m
+    if (rel < 200.0f - dz) return VOXEL_SAND;
+    if (rel < 200.0f + dz) {
+        float t = (rel - (200.0f - dz)) / (2.0f * dz);
+        return (d < t) ? VOXEL_GRASS : VOXEL_SAND;
+    }
+    // Grass -> Stone at 1500m
+    if (rel < 1500.0f - dz) return VOXEL_GRASS;
+    if (rel < 1500.0f + dz) {
+        float t = (rel - (1500.0f - dz)) / (2.0f * dz);
+        return (d < t) ? VOXEL_STONE : VOXEL_GRASS;
+    }
+    // Stone -> Ice at 4500m
+    if (rel < 4500.0f - dz) return VOXEL_STONE;
+    if (rel < 4500.0f + dz) {
+        float t = (rel - (4500.0f - dz)) / (2.0f * dz);
+        return (d < t) ? VOXEL_ICE : VOXEL_STONE;
+    }
     return VOXEL_ICE;
 }
 
@@ -318,13 +260,14 @@ static HMM_Vec3 ht_terrain_color(float height_m) {
 
 static int voxel_top_atlas(VoxelType type) {
     switch (type) {
-        case VOXEL_WATER: return ATLAS_WATER;
-        case VOXEL_SAND:  return ATLAS_SAND;
-        case VOXEL_DIRT:  return ATLAS_DIRT;
-        case VOXEL_GRASS: return ATLAS_GRASS;
-        case VOXEL_STONE: return ATLAS_STONE;
-        case VOXEL_ICE:   return ATLAS_ICE;
-        default:          return ATLAS_GRASS;
+        case VOXEL_WATER:   return ATLAS_WATER;
+        case VOXEL_SAND:    return ATLAS_SAND;
+        case VOXEL_DIRT:    return ATLAS_DIRT;
+        case VOXEL_GRASS:   return ATLAS_GRASS;
+        case VOXEL_STONE:   return ATLAS_STONE;
+        case VOXEL_ICE:     return ATLAS_ICE;
+        case VOXEL_BEDROCK: return ATLAS_STONE;
+        default:            return ATLAS_GRASS;
     }
 }
 
@@ -377,6 +320,27 @@ static HMM_Vec3 tangent_to_world(const HexTerrain* ht, float lx, float lz, float
     return vec3_scale(vec3_normalize(world_dir), radius);
 }
 
+// Inverse of tangent_to_world: world position → tangent-plane (lx, lz).
+// Uses spherical projection to exactly invert the normalize() in the forward map.
+// The flat projection (dot(P-T_o, T_e)) diverges at distance because it ignores
+// the sphere curvature that normalize() applies.
+static void world_to_tangent(const HexTerrain* ht, HMM_Vec3 world_pos,
+                              float* out_lx, float* out_lz) {
+    HMM_Vec3 dir = vec3_normalize(world_pos);
+    float cos_theta = vec3_dot(dir, ht->tangent_up);
+    if (cos_theta < 0.01f) {
+        // Point is on the far side of the sphere — shouldn't happen for nearby hex
+        *out_lx = 0.0f;
+        *out_lz = 0.0f;
+        return;
+    }
+    // ground_r = |tangent_origin| = planet_radius + sea_level
+    float ground_r = ht->planet_radius + TERRAIN_SEA_LEVEL_M;
+    float k = ground_r / cos_theta;
+    *out_lx = k * vec3_dot(dir, ht->tangent_east);
+    *out_lz = k * vec3_dot(dir, ht->tangent_north);
+}
+
 // Convert tangent-plane pixel position to hex grid coordinates
 static void pixel_to_hex(float px, float pz, int* out_col, int* out_row) {
     float q_f = (2.0f / 3.0f) * px / HEX_RADIUS;
@@ -397,6 +361,21 @@ static void pixel_to_hex(float px, float pz, int* out_col, int* out_row) {
     axial_to_offset(qi, ri, out_col, out_row);
 }
 
+// ---- Spherical coordinate helpers (for voxel edit persistence) ----
+
+// Convert hex grid (gcol, grow) to spherical (lon, lat) using current tangent frame
+static void gcol_grow_to_lonlat(const HexTerrain* ht, int gcol, int grow,
+                                 float* out_lon, float* out_lat) {
+    float lx, lz;
+    hex_local_pos(gcol, grow, &lx, &lz);
+    HMM_Vec3 world_dir = vec3_normalize(
+        vec3_add(ht->tangent_origin,
+            vec3_add(vec3_scale(ht->tangent_east, lx),
+                     vec3_scale(ht->tangent_north, lz))));
+    *out_lon = atan2f(world_dir.Z, world_dir.X);
+    *out_lat = asinf(world_dir.Y);
+}
+
 // ---- Mesh generation job ----
 
 typedef struct HexMeshJob {
@@ -413,6 +392,7 @@ typedef struct HexMeshJob {
 
     // 3D voxel data (generated on worker thread)
     uint8_t* voxels;  // HEX_CHUNK_SIZE * HEX_CHUNK_SIZE * HEX_CHUNK_LAYERS (malloc'd)
+    uint8_t* sky_map; // Per-voxel sky light (0..SKY_MAX), same layout as voxels (malloc'd)
     int base_layer;
     bool has_voxels;  // true = voxels already populated (remesh only, skip terrain gen)
     int16_t col_min_solid[HEX_CHUNK_SIZE][HEX_CHUNK_SIZE];
@@ -426,9 +406,71 @@ typedef struct HexMeshJob {
     HexVertex* vertices;
     int vertex_count;
 
+    // Physics debug wireframe (hex prism outlines as float3 line pairs)
+    float* wire_verts;
+    int wire_count;    // number of floats (count/3 = vertex count, count/6 = line count)
+    int wire_cap;
+
     int chunk_index;
     volatile int completed;
+
+    // Edit cache (read-only pointer for edit queries on worker thread)
+    const EditCache* edit_cache;
 } HexMeshJob;
+
+// ---- Spherical → hex grid under job's tangent frame ----
+
+static void lonlat_to_gcol_grow(const HexMeshJob* job, float lon, float lat,
+                                 int* out_gcol, int* out_grow) {
+    float cos_lat = cosf(lat);
+    HMM_Vec3 unit_pos;
+    unit_pos.X = cos_lat * cosf(lon);
+    unit_pos.Y = sinf(lat);
+    unit_pos.Z = cos_lat * sinf(lon);
+
+    // Project onto tangent plane (same math as world_to_tangent)
+    HMM_Vec3 tangent_up = vec3_normalize(job->tangent_origin);
+    float cos_theta = vec3_dot(unit_pos, tangent_up);
+    if (cos_theta < 0.01f) { *out_gcol = 0; *out_grow = 0; return; }
+    float ground_r = sqrtf(vec3_dot(job->tangent_origin, job->tangent_origin));
+    float k = ground_r / cos_theta;
+    float lx = k * vec3_dot(unit_pos, job->tangent_east);
+    float lz = k * vec3_dot(unit_pos, job->tangent_north);
+
+    pixel_to_hex(lx, lz, out_gcol, out_grow);
+}
+
+static void compute_chunk_lonlat_bounds(const HexMeshJob* job,
+                                         float* lon_min, float* lon_max,
+                                         float* lat_min, float* lat_max) {
+    *lon_min = 1e9f; *lon_max = -1e9f;
+    *lat_min = 1e9f; *lat_max = -1e9f;
+
+    // Sample 4 corners of the chunk
+    int corners[4][2] = { {0, 0}, {HEX_CHUNK_SIZE - 1, 0},
+                          {0, HEX_CHUNK_SIZE - 1}, {HEX_CHUNK_SIZE - 1, HEX_CHUNK_SIZE - 1} };
+    for (int c = 0; c < 4; c++) {
+        int gcol = job->cx * HEX_CHUNK_SIZE + corners[c][0];
+        int grow = job->cz * HEX_CHUNK_SIZE + corners[c][1];
+        float lx, lz;
+        hex_local_pos(gcol, grow, &lx, &lz);
+        HMM_Vec3 dir = vec3_normalize(
+            vec3_add(job->tangent_origin,
+                vec3_add(vec3_scale(job->tangent_east, lx),
+                         vec3_scale(job->tangent_north, lz))));
+        float lon = atan2f(dir.Z, dir.X);
+        float lat = asinf(dir.Y);
+        if (lon < *lon_min) *lon_min = lon;
+        if (lon > *lon_max) *lon_max = lon;
+        if (lat < *lat_min) *lat_min = lat;
+        if (lat > *lat_max) *lat_max = lat;
+    }
+
+    // Pad to handle hex columns straddling the boundary
+    float pad = 2.0f * HEX_ROW_SPACING / job->planet_radius;
+    *lon_min -= pad; *lon_max += pad;
+    *lat_min -= pad; *lat_max += pad;
+}
 
 // ---- Emit triangle helper (textured) ----
 
@@ -474,6 +516,19 @@ static void hex_emit_tri(HexVertex** verts, int* count, int* cap,
     v[2].uv[0] = uv2.u; v[2].uv[1] = uv2.v;
 
     *count += 3;
+}
+
+// ---- Wire push: emit a line segment (2 float3 vertices) ----
+static void wire_push_line(float** verts, int* count, int* cap,
+                            HMM_Vec3 a, HMM_Vec3 b) {
+    if (*count + 6 > *cap) {
+        *cap = (*cap == 0) ? 4096 : (*cap) * 2;
+        *verts = (float*)realloc(*verts, *cap * sizeof(float));
+    }
+    float* v = &(*verts)[*count];
+    v[0] = a.X; v[1] = a.Y; v[2] = a.Z;
+    v[3] = b.X; v[4] = b.Y; v[5] = b.Z;
+    *count += 6;
 }
 
 static HexUV hex_top_uv(float vx, float vz, float cx, float cz, int atlas_idx) {
@@ -530,16 +585,269 @@ static uint8_t job_get_neighbor_voxel(const HexMeshJob* job,
     ht_arch_project(&job->arch_frame, vec3_normalize(ndir), job->planet_radius, &alx, &alz);
     int ab, at;
     ht_arch_query(alx, alz, job->arch_base, &ab, &at);
-    if (ab != INT16_MIN && world_layer >= ab && world_layer <= at)
-        return VOXEL_STONE;
 
-    if (world_layer <= surface_layer) return VOXEL_STONE; // approximate as solid
+    // Be conservative near any surface boundary to prevent missing faces.
+    // The noise approximation can disagree with actual voxel data by ±1 layer.
+    // Returning VOXEL_AIR forces face emission (safe: worst case = hidden extra face).
+    int margin = 2;
+
+    // Near arch surfaces: conservative
+    if (ab != INT16_MIN) {
+        if (world_layer >= ab - margin && world_layer <= at + margin) {
+            // Near arch boundary — could be inside or outside the shell
+            if (world_layer >= ab && world_layer <= at)
+                return VOXEL_STONE;  // definitely inside arch shell
+            return VOXEL_AIR;  // near arch edge, be safe
+        }
+    }
+
+    // Near terrain surface: conservative
+    if (world_layer >= surface_layer - margin && world_layer <= surface_layer + margin)
+        return VOXEL_AIR;
+
+    // Well below surface: definitely solid
+    if (world_layer < surface_layer - margin) return VOXEL_STONE;
+
+    // Well above surface: definitely air
     return VOXEL_AIR;
+}
+
+// ---- BFS sky light propagation (Minecraft-style) ----
+// Light level 0 = dark, SKY_MAX = full sunlight.
+// Rules:
+//   1. Sky column pre-pass: air blocks above the topmost solid in each
+//      column get SKY_MAX (direct sunlight streaming down).
+//   2. Downward from SKY_MAX through air: stays SKY_MAX (the "sky column
+//      rule" — vertical shafts carry full sunlight to bedrock).
+//   3. All other propagation: new = current - 1  (taxicab attenuation).
+//   4. Only enqueue if the new value improves the neighbor's current value.
+// These rules guarantee termination (monotonic decrease, bounded by SKY_MAX).
+
+#define SKY_MAX  32
+#define SKY_VOXEL(sky, col, row, layer) \
+    ((sky)[(col) * HEX_CHUNK_SIZE * HEX_CHUNK_LAYERS + (row) * HEX_CHUNK_LAYERS + (layer)])
+
+// Maximum BFS queue entries. With SKY_MAX=32, worst case per source is
+// O(32^2) surface area ≈ ~4000 nodes.  For the whole chunk we cap at the
+// full voxel count which is generous but safe.
+#define SKY_BFS_CAP (HEX_CHUNK_SIZE * HEX_CHUNK_SIZE * HEX_CHUNK_LAYERS)
+
+// Get the col_max_solid for a hex neighbor, handling cross-chunk boundary via noise.
+static int sky_neighbor_max_solid(const HexMeshJob* job,
+                                   fnl_state* continental, fnl_state* mountain,
+                                   fnl_state* warp, fnl_state* detail,
+                                   int gcol, int grow) {
+    int local_col = gcol - job->cx * HEX_CHUNK_SIZE;
+    int local_row = grow - job->cz * HEX_CHUNK_SIZE;
+    if (local_col >= 0 && local_col < HEX_CHUNK_SIZE &&
+        local_row >= 0 && local_row < HEX_CHUNK_SIZE) {
+        return job->col_max_solid[local_col][local_row];
+    }
+
+    // Cross-chunk: sample noise to approximate surface height
+    float lx, lz;
+    hex_local_pos(gcol, grow, &lx, &lz);
+    HMM_Vec3 ndir = vec3_normalize(
+        vec3_add(job->tangent_origin,
+            vec3_add(vec3_scale(job->tangent_east, lx),
+                     vec3_scale(job->tangent_north, lz))));
+    float nh_m = ht_sample_height_m(continental, mountain, warp, detail, ndir);
+    float nh_eff = fmaxf(nh_m, TERRAIN_SEA_LEVEL_M);
+    int surface_layer = (int)ceilf(nh_eff / HEX_HEIGHT);
+
+    // Check arch
+    float alx, alz;
+    ht_arch_project(&job->arch_frame, ndir, job->planet_radius, &alx, &alz);
+    int ab, at;
+    ht_arch_query(alx, alz, job->arch_base, &ab, &at);
+    if (ab != INT16_MIN && at > surface_layer)
+        surface_layer = at;
+
+    int local_max = surface_layer - job->base_layer;
+    if (local_max < 0) return -1;
+    if (local_max >= HEX_CHUNK_LAYERS) return HEX_CHUNK_LAYERS - 1;
+    return local_max;
+}
+
+static void compute_sky_light(HexMeshJob* job,
+                               fnl_state* continental, fnl_state* mountain,
+                               fnl_state* warp, fnl_state* detail) {
+    size_t voxel_count = (size_t)HEX_CHUNK_SIZE * HEX_CHUNK_SIZE * HEX_CHUNK_LAYERS;
+    uint8_t* sky = (uint8_t*)calloc(voxel_count, 1);
+    job->sky_map = sky;
+
+    // ---- Pass 1: Sky column fill ----
+    // For each column, scan downward from the top of the chunk.
+    // Fill all air blocks above (and including) the first unobstructed air
+    // with SKY_MAX.  This handles both open-sky columns AND vertical shafts
+    // that have been dug out (col_max_solid is recalculated from voxels).
+    for (int col = 0; col < HEX_CHUNK_SIZE; col++) {
+        for (int row = 0; row < HEX_CHUNK_SIZE; row++) {
+            // Scan from the TOP of the chunk downward until we hit a solid block
+            for (int l = HEX_CHUNK_LAYERS - 1; l >= 0; l--) {
+                if (HEX_VOXEL(job->voxels, col, row, l) != VOXEL_AIR) break;
+                SKY_VOXEL(sky, col, row, l) = SKY_MAX;
+            }
+        }
+    }
+
+    // ---- Pass 2: Seed BFS queue ----
+    // Any sky-lit air block adjacent to a non-sky-lit air block is a seed.
+    // Also seed from sky-lit blocks adjacent to columns with higher terrain
+    // (cross-chunk boundary awareness).
+    int* queue = (int*)malloc(SKY_BFS_CAP * sizeof(int));
+    int qhead = 0, qtail = 0;
+
+    for (int col = 0; col < HEX_CHUNK_SIZE; col++) {
+        for (int row = 0; row < HEX_CHUNK_SIZE; row++) {
+            int max_s = job->col_max_solid[col][row];
+            int min_s = job->col_min_solid[col][row];
+            int my_top = (min_s > max_s) ? -1 : max_s;
+
+            int gcol = job->cx * HEX_CHUNK_SIZE + col;
+            int grow = job->cz * HEX_CHUNK_SIZE + row;
+
+            // Find tallest neighbor column (for cross-chunk boundary seeding)
+            int tallest_neighbor = my_top;
+            for (int dir = 0; dir < 6; dir++) {
+                int ncol_g, nrow_g;
+                hex_neighbor(gcol, grow, dir, &ncol_g, &nrow_g);
+                int n_max = sky_neighbor_max_solid(job, continental, mountain, warp, detail,
+                                                    ncol_g, nrow_g);
+                if (n_max > tallest_neighbor) tallest_neighbor = n_max;
+            }
+
+            // Seed sky-lit blocks that overlap a taller neighbor's shadow zone
+            if (tallest_neighbor > my_top) {
+                int seed_start = my_top + 1;
+                if (seed_start < 0) seed_start = 0;
+                int seed_end = tallest_neighbor;
+                if (seed_end >= HEX_CHUNK_LAYERS) seed_end = HEX_CHUNK_LAYERS - 1;
+
+                for (int l = seed_start; l <= seed_end; l++) {
+                    if (SKY_VOXEL(sky, col, row, l) == SKY_MAX && qtail < SKY_BFS_CAP) {
+                        queue[qtail++] = col * HEX_CHUNK_SIZE * HEX_CHUNK_LAYERS
+                                       + row * HEX_CHUNK_LAYERS + l;
+                    }
+                }
+            }
+
+            // Also seed any sky-lit block directly above a solid block
+            // (the transition point where light needs to spread laterally)
+            if (my_top >= 0 && my_top + 1 < HEX_CHUNK_LAYERS) {
+                int l = my_top + 1;
+                if (SKY_VOXEL(sky, col, row, l) == SKY_MAX && qtail < SKY_BFS_CAP) {
+                    // Check if any lateral neighbor at this layer is non-sky-lit air
+                    bool needs_seed = false;
+                    for (int dir = 0; dir < 6 && !needs_seed; dir++) {
+                        int ncol_g, nrow_g;
+                        hex_neighbor(gcol, grow, dir, &ncol_g, &nrow_g);
+                        int nc = ncol_g - job->cx * HEX_CHUNK_SIZE;
+                        int nr = nrow_g - job->cz * HEX_CHUNK_SIZE;
+                        if (nc >= 0 && nc < HEX_CHUNK_SIZE && nr >= 0 && nr < HEX_CHUNK_SIZE &&
+                            HEX_VOXEL(job->voxels, nc, nr, l) == VOXEL_AIR &&
+                            SKY_VOXEL(sky, nc, nr, l) < SKY_MAX) {
+                            needs_seed = true;
+                        }
+                    }
+                    if (needs_seed) {
+                        queue[qtail++] = col * HEX_CHUNK_SIZE * HEX_CHUNK_LAYERS
+                                       + row * HEX_CHUNK_LAYERS + l;
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- Pass 3: BFS flood-fill ----
+    while (qhead < qtail) {
+        int idx = queue[qhead++];
+        int c  = idx / (HEX_CHUNK_SIZE * HEX_CHUNK_LAYERS);
+        int rem = idx % (HEX_CHUNK_SIZE * HEX_CHUNK_LAYERS);
+        int r  = rem / HEX_CHUNK_LAYERS;
+        int l  = rem % HEX_CHUNK_LAYERS;
+
+        uint8_t current = SKY_VOXEL(sky, c, r, l);
+        if (current <= 1) continue;  // Can't propagate further
+
+        // Vertical neighbors (up and down)
+        for (int dv = -1; dv <= 1; dv += 2) {
+            int nl = l + dv;
+            if (nl < 0 || nl >= HEX_CHUNK_LAYERS) continue;
+            if (HEX_VOXEL(job->voxels, c, r, nl) != VOXEL_AIR) continue;
+
+            // Sky column rule: downward from SKY_MAX stays SKY_MAX
+            uint8_t new_light;
+            if (dv == -1 && current == SKY_MAX) {
+                new_light = SKY_MAX;
+            } else {
+                new_light = current - 1;
+            }
+
+            if (new_light > SKY_VOXEL(sky, c, r, nl)) {
+                SKY_VOXEL(sky, c, r, nl) = new_light;
+                if (qtail < SKY_BFS_CAP) {
+                    queue[qtail++] = c * HEX_CHUNK_SIZE * HEX_CHUNK_LAYERS
+                                   + r * HEX_CHUNK_LAYERS + nl;
+                }
+            }
+        }
+
+        // 6 lateral hex neighbors (in-chunk only)
+        int gcol = job->cx * HEX_CHUNK_SIZE + c;
+        int grow = job->cz * HEX_CHUNK_SIZE + r;
+        for (int dir = 0; dir < 6; dir++) {
+            int ncol_g, nrow_g;
+            hex_neighbor(gcol, grow, dir, &ncol_g, &nrow_g);
+            int nc = ncol_g - job->cx * HEX_CHUNK_SIZE;
+            int nr_local = nrow_g - job->cz * HEX_CHUNK_SIZE;
+
+            if (nc < 0 || nc >= HEX_CHUNK_SIZE || nr_local < 0 || nr_local >= HEX_CHUNK_SIZE)
+                continue;
+            if (HEX_VOXEL(job->voxels, nc, nr_local, l) != VOXEL_AIR) continue;
+
+            uint8_t new_light = current - 1;
+            if (new_light > SKY_VOXEL(sky, nc, nr_local, l)) {
+                SKY_VOXEL(sky, nc, nr_local, l) = new_light;
+                if (qtail < SKY_BFS_CAP) {
+                    queue[qtail++] = nc * HEX_CHUNK_SIZE * HEX_CHUNK_LAYERS
+                                   + nr_local * HEX_CHUNK_LAYERS + l;
+                }
+            }
+        }
+    }
+
+    free(queue);
+}
+
+// Read sky light directly from the sky_map for a face.
+// Returns 0.0–1.0 (normalized from 0..SKY_MAX).
+static float read_sky_light(const HexMeshJob* job, int col, int row, int layer) {
+    if (!job->sky_map) return 1.0f;
+    if (layer < 0 || layer >= HEX_CHUNK_LAYERS) return 1.0f;
+    if (col < 0 || col >= HEX_CHUNK_SIZE || row < 0 || row >= HEX_CHUNK_SIZE) return 1.0f;
+    return (float)SKY_VOXEL(job->sky_map, col, row, layer) / (float)SKY_MAX;
+}
+
+// ---- Timing helper (thread-safe) ----
+static double timer_ms(void) {
+#ifdef _WIN32
+    LARGE_INTEGER freq, now;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&now);
+    return (double)now.QuadPart * 1000.0 / (double)freq.QuadPart;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
+#endif
 }
 
 // ---- Core mesh generation for a chunk ----
 
 static void generate_chunk_mesh(HexMeshJob* job) {
+    double t_start = timer_ms();
+
     fnl_state continental = ht_create_continental_noise(job->seed);
     fnl_state mountain = ht_create_mountain_noise(job->seed);
     fnl_state warp = ht_create_warp_noise(job->seed);
@@ -591,7 +899,7 @@ static void generate_chunk_mesh(HexMeshJob* job) {
                 float h_m = ht_sample_height_m(&continental, &mountain, &warp, &detail, unit);
                 float effective_h = fmaxf(h_m, TERRAIN_SEA_LEVEL_M);
                 int surface_layer = (int)ceilf(effective_h / HEX_HEIGHT);
-                VoxelType surface_type = ht_voxel_type(h_m);
+                VoxelType surface_type = ht_voxel_type(h_m, gcol, grow, job->seed); // biome from raw h_m
 
                 int min_solid = HEX_CHUNK_LAYERS;
                 int max_solid = -1;
@@ -650,7 +958,64 @@ static void generate_chunk_mesh(HexMeshJob* job) {
                 }
             }
         }
+
+        // Phase 2b2: Apply persisted voxel edits from disk cache
+        if (job->edit_cache) {
+            float lon_min, lon_max, lat_min, lat_max;
+            compute_chunk_lonlat_bounds(job, &lon_min, &lon_max, &lat_min, &lat_max);
+
+            VoxelEdit chunk_edits[512];
+            int num_edits = edit_cache_query_area(job->edit_cache,
+                lon_min, lon_max, lat_min, lat_max,
+                chunk_edits, 512);
+
+            for (int e = 0; e < num_edits; e++) {
+                int egcol, egrow;
+                lonlat_to_gcol_grow(job, chunk_edits[e].lon, chunk_edits[e].lat,
+                                     &egcol, &egrow);
+
+                int local_col = egcol - job->cx * HEX_CHUNK_SIZE;
+                int local_row = egrow - job->cz * HEX_CHUNK_SIZE;
+                if (local_col < 0 || local_col >= HEX_CHUNK_SIZE ||
+                    local_row < 0 || local_row >= HEX_CHUNK_SIZE) continue;
+
+                int local_layer = chunk_edits[e].layer - job->base_layer;
+                if (local_layer < 0 || local_layer >= HEX_CHUNK_LAYERS) continue;
+
+                HEX_VOXEL(job->voxels, local_col, local_row, local_layer) =
+                    chunk_edits[e].voxel_type;
+
+                // Update column cache
+                if (chunk_edits[e].voxel_type != VOXEL_AIR) {
+                    if (local_layer < job->col_min_solid[local_col][local_row])
+                        job->col_min_solid[local_col][local_row] = (int16_t)local_layer;
+                    if (local_layer > job->col_max_solid[local_col][local_row])
+                        job->col_max_solid[local_col][local_row] = (int16_t)local_layer;
+                }
+            }
+        }
     }
+
+    double t_voxels = timer_ms();
+
+    // Phase 2c: Fill bedrock floor at bottom of chunk (unbreakable)
+    for (int col = 0; col < HEX_CHUNK_SIZE; col++) {
+        for (int row = 0; row < HEX_CHUNK_SIZE; row++) {
+            for (int l = 0; l < HEX_BEDROCK_LAYERS; l++) {
+                HEX_VOXEL(job->voxels, col, row, l) = (uint8_t)VOXEL_BEDROCK;
+            }
+            // Update column cache to include bedrock
+            if (job->col_min_solid[col][row] > 0)
+                job->col_min_solid[col][row] = 0;
+            if (job->col_max_solid[col][row] < HEX_BEDROCK_LAYERS - 1)
+                job->col_max_solid[col][row] = HEX_BEDROCK_LAYERS - 1;
+        }
+    }
+
+    // Phase 2d: BFS sky light propagation
+    double t_bedrock = timer_ms();
+    compute_sky_light(job, &continental, &mountain, &warp, &detail);
+    double t_skylight = timer_ms();
 
     // Phase 3: Generate mesh geometry
     int cap = HEX_CHUNK_SIZE * HEX_CHUNK_SIZE * 48; // generous initial
@@ -738,11 +1103,6 @@ static void generate_chunk_mesh(HexMeshJob* job) {
             int max_s = job->col_max_solid[col][row];
             if (min_s > max_s) continue;
 
-            // Natural surface layer (from noise, not voxel edits).
-            // Blocks below this are underground and get depth-darkened even after digging.
-            float natural_h_m = fmaxf(col_h_m, TERRAIN_SEA_LEVEL_M);
-            int natural_surface_layer = (int)floorf(natural_h_m / HEX_HEIGHT);
-
             // Precompute 6 hex corner directions (reused across layers)
             HMM_Vec3 hex_dirs[6];
             float hex_vx[6], hex_vz[6];
@@ -782,19 +1142,13 @@ static void generate_chunk_mesh(HexMeshJob* job) {
                 float bot_r = job->planet_radius + world_layer * HEX_HEIGHT + HEX_SURFACE_BIAS;
                 float top_r = bot_r + HEX_HEIGHT;
 
-                // Depth-based sky light (tenebris style):
-                // Uses NATURAL terrain surface (from noise) as reference, not current voxel top.
-                // Blocks below natural surface stay dark even when exposed by digging.
-                int depth_below_surface = natural_surface_layer - world_layer;
-                float layer_sky = 1.0f;
-                if (depth_below_surface > 0) {
-                    layer_sky = powf(0.8f, (float)depth_below_surface);
-                    if (layer_sky < 0.05f) layer_sky = 0.05f;
-                }
-
                 // --- TOP FACE: emit if layer above is AIR ---
                 uint8_t above = job_get_voxel(job, col, row, l + 1);
                 if (above == VOXEL_AIR) {
+                    // Column sky light from the air block above this face
+                    float face_sky = read_sky_light(job, col, row, l + 1);
+                    if (face_sky < 0.05f) face_sky = 0.05f;
+
                     int atlas = voxel_top_atlas((VoxelType)vtype);
                     HMM_Vec3 verts[6];
                     HexUV uvs[6];
@@ -806,16 +1160,17 @@ static void generate_chunk_mesh(HexMeshJob* job) {
                         hex_emit_tri(&job->vertices, &job->vertex_count, &cap,
                             verts[0], verts[i + 1], verts[i + 2],
                             local_up, slope_normal, uvs[0], uvs[i + 1], uvs[i + 2],
-                            col_color, layer_sky);
+                            col_color, face_sky);
                     }
                 }
 
                 // --- BOTTOM FACE: emit if layer below is AIR ---
                 uint8_t below = job_get_voxel(job, col, row, l - 1);
                 if (below == VOXEL_AIR) {
-                    // Extra 0.8x penalty for bottom faces (ceilings receive less light)
-                    float bottom_sky = layer_sky * 0.8f;
-                    if (bottom_sky < 0.05f) bottom_sky = 0.05f;
+                    // Column sky light from the air block below, with mild ceiling penalty
+                    float face_sky = read_sky_light(job, col, row, l - 1) * 0.85f;
+                    if (face_sky < 0.05f) face_sky = 0.05f;
+
                     int atlas = voxel_bottom_atlas((VoxelType)vtype);
                     HMM_Vec3 verts[6];
                     HexUV uvs[6];
@@ -828,7 +1183,7 @@ static void generate_chunk_mesh(HexMeshJob* job) {
                         hex_emit_tri(&job->vertices, &job->vertex_count, &cap,
                             verts[0], verts[i + 2], verts[i + 1],
                             local_down, local_down, uvs[0], uvs[i + 2], uvs[i + 1],
-                            col_color, bottom_sky);
+                            col_color, face_sky);
                     }
                 }
 
@@ -837,6 +1192,21 @@ static void generate_chunk_mesh(HexMeshJob* job) {
                     uint8_t nv = job_get_neighbor_voxel(job, &continental, &mountain, &warp, &detail,
                                                          col, row, l, dir);
                     if (nv != VOXEL_AIR) continue;
+
+                    // Column sky light from the air block the side faces into
+                    float face_sky = 1.0f;  // default for cross-chunk
+                    {
+                        int ncol_g, nrow_g;
+                        hex_neighbor(job->cx * HEX_CHUNK_SIZE + col,
+                                     job->cz * HEX_CHUNK_SIZE + row, dir, &ncol_g, &nrow_g);
+                        int nc = ncol_g - job->cx * HEX_CHUNK_SIZE;
+                        int nr_local = nrow_g - job->cz * HEX_CHUNK_SIZE;
+                        if (nc >= 0 && nc < HEX_CHUNK_SIZE &&
+                            nr_local >= 0 && nr_local < HEX_CHUNK_SIZE) {
+                            face_sky = read_sky_light(job, nc, nr_local, l);
+                        }
+                    }
+                    if (face_sky < 0.05f) face_sky = 0.05f;
 
                     int edge = DIR_TO_EDGE[dir];
                     int vi0 = edge;
@@ -855,10 +1225,98 @@ static void generate_chunk_mesh(HexMeshJob* job) {
 
                     hex_emit_tri(&job->vertices, &job->vertex_count, &cap,
                         p0b, p1b, p1t, wall_outs[dir], local_up, wuv00, wuv10, wuv11,
-                        col_color, layer_sky);
+                        col_color, face_sky);
                     hex_emit_tri(&job->vertices, &job->vertex_count, &cap,
                         p0b, p1t, p0t, wall_outs[dir], local_up, wuv00, wuv11, wuv01,
-                        col_color, layer_sky);
+                        col_color, face_sky);
+                }
+            }
+        }
+    }
+
+    // Phase 3b: Generate hex prism outline wireframe (physics debug)
+    job->wire_verts = NULL;
+    job->wire_count = 0;
+    job->wire_cap = 0;
+
+    for (int col = 0; col < HEX_CHUNK_SIZE; col++) {
+        for (int row = 0; row < HEX_CHUNK_SIZE; row++) {
+            int min_s = job->col_min_solid[col][row];
+            int max_s = job->col_max_solid[col][row];
+            if (min_s > max_s) continue;  // all-air column
+
+            int gcol = job->cx * HEX_CHUNK_SIZE + col;
+            int grow = job->cz * HEX_CHUNK_SIZE + row;
+
+            float lx, lz;
+            hex_local_pos(gcol, grow, &lx, &lz);
+
+            HMM_Vec3 hex_wire_dirs[6];
+            for (int i = 0; i < 6; i++) {
+                float vx = lx + HEX_RADIUS * HEX_COS[i];
+                float vz = lz + HEX_RADIUS * HEX_SIN[i];
+                hex_wire_dirs[i] = vec3_normalize(
+                    vec3_add(job->tangent_origin,
+                        vec3_add(vec3_scale(job->tangent_east, vx),
+                                 vec3_scale(job->tangent_north, vz))));
+            }
+
+            for (int l = min_s; l <= max_s; l++) {
+                uint8_t vtype = HEX_VOXEL(job->voxels, col, row, l);
+                if (vtype == VOXEL_AIR) continue;
+
+                int world_layer = l + job->base_layer;
+                float bot_r = job->planet_radius + world_layer * HEX_HEIGHT + HEX_SURFACE_BIAS;
+                float top_r = bot_r + HEX_HEIGHT;
+
+                // Top face outline: hexagon at top_r
+                uint8_t above = (l + 1 < HEX_CHUNK_LAYERS)
+                    ? HEX_VOXEL(job->voxels, col, row, l + 1) : VOXEL_AIR;
+                if (above == VOXEL_AIR) {
+                    for (int i = 0; i < 6; i++) {
+                        HMM_Vec3 a = vec3_scale(hex_wire_dirs[i], top_r);
+                        HMM_Vec3 b = vec3_scale(hex_wire_dirs[(i + 1) % 6], top_r);
+                        wire_push_line(&job->wire_verts, &job->wire_count,
+                                       &job->wire_cap, a, b);
+                    }
+                }
+
+                // Bottom face outline: hexagon at bot_r
+                uint8_t below = (l - 1 >= 0)
+                    ? HEX_VOXEL(job->voxels, col, row, l - 1) : VOXEL_AIR;
+                if (below == VOXEL_AIR) {
+                    for (int i = 0; i < 6; i++) {
+                        HMM_Vec3 a = vec3_scale(hex_wire_dirs[i], bot_r);
+                        HMM_Vec3 b = vec3_scale(hex_wire_dirs[(i + 1) % 6], bot_r);
+                        wire_push_line(&job->wire_verts, &job->wire_count,
+                                       &job->wire_cap, a, b);
+                    }
+                }
+
+                // Vertical edges for exposed sides
+                for (int dir = 0; dir < 6; dir++) {
+                    int ncol_g, nrow_g;
+                    hex_neighbor(gcol, grow, dir, &ncol_g, &nrow_g);
+                    int nc = ncol_g - job->cx * HEX_CHUNK_SIZE;
+                    int nr = nrow_g - job->cz * HEX_CHUNK_SIZE;
+                    bool exposed = true;
+                    if (nc >= 0 && nc < HEX_CHUNK_SIZE && nr >= 0 && nr < HEX_CHUNK_SIZE) {
+                        exposed = (HEX_VOXEL(job->voxels, nc, nr, l) == VOXEL_AIR);
+                    }
+                    if (exposed) {
+                        int edge = DIR_TO_EDGE[dir];
+                        int vi0 = edge;
+                        int vi1 = (edge + 1) % 6;
+                        // Two vertical edges for this side
+                        wire_push_line(&job->wire_verts, &job->wire_count,
+                                       &job->wire_cap,
+                                       vec3_scale(hex_wire_dirs[vi0], bot_r),
+                                       vec3_scale(hex_wire_dirs[vi0], top_r));
+                        wire_push_line(&job->wire_verts, &job->wire_count,
+                                       &job->wire_cap,
+                                       vec3_scale(hex_wire_dirs[vi1], bot_r),
+                                       vec3_scale(hex_wire_dirs[vi1], top_r));
+                    }
                 }
             }
         }
@@ -869,6 +1327,33 @@ static void generate_chunk_mesh(HexMeshJob* job) {
         job->vertices[i].pos[0] -= job->origin[0];
         job->vertices[i].pos[1] -= job->origin[1];
         job->vertices[i].pos[2] -= job->origin[2];
+    }
+    // Also offset wireframe vertices
+    for (int i = 0; i < job->wire_count; i += 3) {
+        job->wire_verts[i + 0] -= job->origin[0];
+        job->wire_verts[i + 1] -= job->origin[1];
+        job->wire_verts[i + 2] -= job->origin[2];
+    }
+
+    // Free sky_map (only needed during mesh gen, not after)
+    if (job->sky_map) {
+        free(job->sky_map);
+        job->sky_map = NULL;
+    }
+
+    double t_end = timer_ms();
+
+    // Benchmark: print timing for edit-dirty remeshes (has_voxels=true)
+    if (job->has_voxels) {
+        printf("[HEX BENCH] Remesh chunk(%d,%d): voxels=%.1fms bedrock=%.1fms skylight=%.1fms mesh=%.1fms TOTAL=%.1fms (%d verts)\n",
+               job->cx, job->cz,
+               t_voxels - t_start,
+               t_bedrock - t_voxels,
+               t_skylight - t_bedrock,
+               t_end - t_skylight,
+               t_end - t_start,
+               job->vertex_count);
+        fflush(stdout);
     }
 
     job->completed = 1;
@@ -898,6 +1383,8 @@ static void sweep_orphans(void) {
         if (job->completed) {
             if (job->vertices) free(job->vertices);
             if (job->voxels) free(job->voxels);
+            if (job->sky_map) free(job->sky_map);
+            if (job->wire_verts) free(job->wire_verts);
             free(job);
         } else {
             s_orphaned_jobs[write++] = s_orphaned_jobs[i];
@@ -946,6 +1433,18 @@ static void free_chunk(HexChunk* chunk) {
     }
     chunk->gpu_vertex_count = 0;
 
+    // Free wireframe data
+    if (chunk->cpu_wire_verts) {
+        free(chunk->cpu_wire_verts);
+        chunk->cpu_wire_verts = NULL;
+    }
+    chunk->cpu_wire_count = 0;
+    if (chunk->wire_buf.id != SG_INVALID_ID) {
+        sg_destroy_buffer(chunk->wire_buf);
+        chunk->wire_buf = (sg_buffer){0};
+    }
+    chunk->wire_vertex_count = 0;
+
     if (chunk->voxels) {
         free(chunk->voxels);
         chunk->voxels = NULL;
@@ -956,6 +1455,8 @@ static void free_chunk(HexChunk* chunk) {
         if (job->completed) {
             if (job->vertices) free(job->vertices);
             if (job->voxels) free(job->voxels);
+            if (job->sky_map) free(job->sky_map);
+            if (job->wire_verts) free(job->wire_verts);
             free(job);
         } else {
             orphan_job(job);
@@ -1001,6 +1502,9 @@ void hex_terrain_init(HexTerrain* ht, float planet_radius, float layer_thickness
         ht->chunks[i].voxels = NULL;
     }
 
+    // Initialize voxel edit persistence
+    edit_cache_init(&ht->edits, seed, planet_radius, "cache/edits");
+
     printf("[HEX] 3D voxel terrain initialized: radius=%.0f, range=%.0fm, chunk=%dx%dx%d\n",
         planet_radius, HEX_RANGE, HEX_CHUNK_SIZE, HEX_CHUNK_SIZE, HEX_CHUNK_LAYERS);
     fflush(stdout);
@@ -1021,9 +1525,13 @@ void hex_terrain_destroy(HexTerrain* ht) {
         while (!job->completed) { /* spin-wait */ }
         if (job->vertices) free(job->vertices);
         if (job->voxels) free(job->voxels);
+        if (job->sky_map) free(job->sky_map);
+        if (job->wire_verts) free(job->wire_verts);
         free(job);
     }
     s_orphan_count = 0;
+    edit_cache_flush_all(&ht->edits);
+    edit_cache_destroy(&ht->edits);
 }
 
 #define FRAME_REANCHOR_THRESHOLD 10000.0f
@@ -1056,6 +1564,9 @@ void hex_terrain_update(HexTerrain* ht, HMM_Vec3 camera_pos,
         return;
     }
 
+    // Update voxel edit cache (preload nearby sectors, periodic flush)
+    edit_cache_update(&ht->edits, cam_dir);
+
     // Check if tangent frame needs re-anchoring
     bool reanchor = false;
     if (!ht->frame_valid) {
@@ -1085,23 +1596,42 @@ void hex_terrain_update(HexTerrain* ht, HMM_Vec3 camera_pos,
         HexMeshJob* job = (HexMeshJob*)chunk->pending_job;
         if (!job->completed) continue;
 
-        // Transfer results: mesh
+        // If chunk was re-dirtied during generation (break/place happened),
+        // keep the chunk's current voxels (which have edits) and discard
+        // the job's stale voxel data. Still take the mesh as a visual fallback
+        // until the re-generation completes.
+        bool re_dirtied = chunk->dirty;
+
+        // Transfer results: mesh (always — better than nothing)
         chunk->cpu_vertices = job->vertices;
         chunk->cpu_vertex_count = job->vertex_count;
         job->vertices = NULL;
 
-        // Transfer results: voxel data
-        if (chunk->voxels) free(chunk->voxels);
-        chunk->voxels = job->voxels;
-        job->voxels = NULL;
-        chunk->base_layer = job->base_layer;
-        memcpy(chunk->col_min_solid, job->col_min_solid, sizeof(chunk->col_min_solid));
-        memcpy(chunk->col_max_solid, job->col_max_solid, sizeof(chunk->col_max_solid));
+        // Transfer results: wireframe
+        if (chunk->cpu_wire_verts) free(chunk->cpu_wire_verts);
+        chunk->cpu_wire_verts = job->wire_verts;
+        chunk->cpu_wire_count = job->wire_count;
+        job->wire_verts = NULL;
+
+        // Transfer results: voxel data — only if chunk wasn't edited during generation
+        if (re_dirtied) {
+            // Chunk voxels were modified by break/place; discard job's stale copy
+            free(job->voxels);
+            job->voxels = NULL;
+        } else {
+            if (chunk->voxels) free(chunk->voxels);
+            chunk->voxels = job->voxels;
+            job->voxels = NULL;
+            chunk->base_layer = job->base_layer;
+            memcpy(chunk->col_min_solid, job->col_min_solid, sizeof(chunk->col_min_solid));
+            memcpy(chunk->col_max_solid, job->col_max_solid, sizeof(chunk->col_max_solid));
+        }
 
         free(job);
         chunk->pending_job = NULL;
         chunk->generating = false;
-        chunk->dirty = false;
+        // Don't clear dirty — it was already cleared at submission time.
+        // If it's true now, something re-dirtied it and we need another pass.
     }
 
     // Determine chunk loading range
@@ -1138,7 +1668,6 @@ void hex_terrain_update(HexTerrain* ht, HMM_Vec3 camera_pos,
             if (dist > HEX_RANGE + HEX_CHUNK_WIDTH) continue;
 
             int idx = find_chunk(ht, cx, cz);
-            bool want_transition = (dist > HEX_INNER_RANGE);
 
             if (idx >= 0) {
                 HexChunk* chunk = &ht->chunks[idx];
@@ -1146,10 +1675,8 @@ void hex_terrain_update(HexTerrain* ht, HMM_Vec3 camera_pos,
                     chunk->cpu_vertex_count == 0) {
                     chunk->dirty = true;
                 }
-                if (!chunk->is_transition && dist > HEX_TRANSITION_ON) {
-                    chunk->is_transition = true;
-                    if (!chunk->generating) chunk->dirty = true;
-                } else if (chunk->is_transition && dist < HEX_TRANSITION_OFF) {
+                // Force voxel prism mode if stuck in transition
+                if (chunk->is_transition) {
                     chunk->is_transition = false;
                     if (!chunk->generating) chunk->dirty = true;
                 }
@@ -1164,8 +1691,9 @@ void hex_terrain_update(HexTerrain* ht, HMM_Vec3 camera_pos,
                 chunk->cz = cz;
                 chunk->active = true;
                 chunk->dirty = true;
-                chunk->is_transition = want_transition;
+                chunk->is_transition = false;  // Always voxel prisms
                 chunk->gpu_buffer.id = SG_INVALID_ID;
+                chunk->wire_buf.id = SG_INVALID_ID;
                 chunk->voxels = NULL;
                 new_activations++;
             }
@@ -1190,6 +1718,7 @@ void hex_terrain_update(HexTerrain* ht, HMM_Vec3 camera_pos,
                     job->origin[2] = (float)ht->world_origin[2];
                     job->chunk_index = idx;
                     job->is_transition = chunk->is_transition;
+                    job->edit_cache = &ht->edits;
 
                     // If chunk already has voxel data (dirty from break/place),
                     // copy it so the worker rebuilds mesh from existing voxels
@@ -1214,6 +1743,7 @@ void hex_terrain_update(HexTerrain* ht, HMM_Vec3 camera_pos,
                         chunk->pending_job = job;
                         chunk->generating = true;
                         chunk->dirty = false;
+                        chunk->edit_dirty = false;
                         jobs_submitted++;
                     } else {
                         free(job->voxels);
@@ -1223,6 +1753,77 @@ void hex_terrain_update(HexTerrain* ht, HMM_Vec3 camera_pos,
             }
         }
         if (new_activations >= HEX_MAX_ACTIVATIONS || jobs_submitted >= 8) break;
+    }
+
+    // Second pass: submit jobs for remaining dirty chunks.
+    // Priority 1: edit_dirty chunks (player break/place — must be immediate)
+    // Priority 2: regular dirty chunks
+    for (int priority = 0; priority < 2 && jobs_submitted < 16; priority++) {
+        for (int i = 0; i < HEX_MAX_CHUNKS && jobs_submitted < 16; i++) {
+            HexChunk* chunk = &ht->chunks[i];
+            if (!chunk->active || chunk->generating) continue;
+
+            bool should_submit = false;
+            if (priority == 0) {
+                should_submit = chunk->edit_dirty;
+            } else {
+                should_submit = chunk->dirty && !chunk->edit_dirty;
+            }
+            if (!should_submit) continue;
+
+            size_t voxel_size = (size_t)HEX_CHUNK_SIZE * HEX_CHUNK_SIZE * HEX_CHUNK_LAYERS;
+            HexMeshJob* job = (HexMeshJob*)calloc(1, sizeof(HexMeshJob));
+            job->cx = chunk->cx;
+            job->cz = chunk->cz;
+            job->planet_radius = ht->planet_radius;
+            job->seed = ht->seed;
+            job->tangent_origin = ht->tangent_origin;
+            job->tangent_up = ht->tangent_up;
+            job->tangent_east = ht->tangent_east;
+            job->tangent_north = ht->tangent_north;
+            job->origin[0] = (float)ht->world_origin[0];
+            job->origin[1] = (float)ht->world_origin[1];
+            job->origin[2] = (float)ht->world_origin[2];
+            job->chunk_index = i;
+            job->is_transition = chunk->is_transition;
+            job->edit_cache = &ht->edits;
+
+            if (chunk->voxels) {
+                job->voxels = (uint8_t*)malloc(voxel_size);
+                memcpy(job->voxels, chunk->voxels, voxel_size);
+                job->base_layer = chunk->base_layer;
+                job->has_voxels = true;
+                memcpy(job->col_min_solid, chunk->col_min_solid, sizeof(job->col_min_solid));
+                memcpy(job->col_max_solid, chunk->col_max_solid, sizeof(job->col_max_solid));
+            } else {
+                job->voxels = (uint8_t*)malloc(voxel_size);
+                job->has_voxels = false;
+            }
+
+            job->vertices = NULL;
+            job->vertex_count = 0;
+            job->completed = 0;
+
+            if (job_system_try_submit(ht->jobs, hex_mesh_worker, job)) {
+                chunk->pending_job = job;
+                chunk->generating = true;
+                chunk->dirty = false;
+                chunk->edit_dirty = false;
+                jobs_submitted++;
+            } else {
+                free(job->voxels);
+                free(job);
+            }
+        }
+    }
+
+    // Watchdog: force-dirty any active chunks stuck with no mesh
+    for (int i = 0; i < HEX_MAX_CHUNKS; i++) {
+        HexChunk* chunk = &ht->chunks[i];
+        if (chunk->active && !chunk->generating && !chunk->dirty &&
+            chunk->gpu_vertex_count == 0 && chunk->cpu_vertex_count == 0) {
+            chunk->dirty = true;
+        }
     }
 
     int active = 0;
@@ -1259,6 +1860,27 @@ void hex_terrain_upload_meshes(HexTerrain* ht) {
         free(chunk->cpu_vertices);
         chunk->cpu_vertices = NULL;
         chunk->cpu_vertex_count = 0;
+
+        // Upload wireframe alongside mesh
+        if (chunk->wire_buf.id != SG_INVALID_ID) {
+            sg_destroy_buffer(chunk->wire_buf);
+            chunk->wire_buf = (sg_buffer){0};
+        }
+        if (chunk->cpu_wire_verts && chunk->cpu_wire_count > 0) {
+            chunk->wire_buf = sg_make_buffer(&(sg_buffer_desc){
+                .data = (sg_range){
+                    chunk->cpu_wire_verts,
+                    (size_t)chunk->cpu_wire_count * sizeof(float)
+                },
+                .label = "hex-wire-verts",
+            });
+            chunk->wire_vertex_count = chunk->cpu_wire_count / 3;
+        }
+        if (chunk->cpu_wire_verts) {
+            free(chunk->cpu_wire_verts);
+            chunk->cpu_wire_verts = NULL;
+            chunk->cpu_wire_count = 0;
+        }
     }
 }
 
@@ -1354,10 +1976,9 @@ HexHitResult hex_terrain_raycast(const HexTerrain* ht, HMM_Vec3 ray_origin,
         HMM_Vec3 world_pt = vec3_add(ray_origin, vec3_scale(ray_dir, t));
         float point_r = sqrtf(vec3_dot(world_pt, world_pt));
 
-        // Project to tangent plane
-        HMM_Vec3 offset = vec3_sub(world_pt, ht->tangent_origin);
-        float lx = vec3_dot(offset, ht->tangent_east);
-        float lz = vec3_dot(offset, ht->tangent_north);
+        // Spherical inverse: world position → tangent-plane hex coords
+        float lx, lz;
+        world_to_tangent(ht, world_pt, &lx, &lz);
 
         int gcol, grow;
         pixel_to_hex(lx, lz, &gcol, &grow);
@@ -1373,7 +1994,29 @@ HexHitResult hex_terrain_raycast(const HexTerrain* ht, HMM_Vec3 ray_origin,
         uint8_t vtype = hex_terrain_get_voxel(ht, gcol, grow, world_layer);
 
         if (vtype != VOXEL_AIR) {
-            // HIT
+            // Determine hit face
+            int face;
+            int p_gcol, p_grow, p_layer;
+            if (world_layer != prev_layer && gcol == prev_gcol && grow == prev_grow) {
+                // Vertical transition
+                if (world_layer > prev_layer) {
+                    face = 1; // bottom face
+                    p_gcol = gcol; p_grow = grow; p_layer = world_layer - 1;
+                } else {
+                    face = 0; // top face
+                    p_gcol = gcol; p_grow = grow; p_layer = world_layer + 1;
+                }
+            } else if (gcol != prev_gcol || grow != prev_grow) {
+                // Horizontal transition: side face
+                face = 2; // generic side
+                p_gcol = prev_gcol; p_grow = prev_grow; p_layer = world_layer;
+            } else {
+                // First step hit (no previous)
+                face = 0;
+                p_gcol = gcol; p_grow = grow; p_layer = world_layer + 1;
+            }
+
+            // HIT accepted
             int cx = (int)floorf((float)gcol / HEX_CHUNK_SIZE);
             int cz = (int)floorf((float)grow / HEX_CHUNK_SIZE);
             int local_col = gcol - cx * HEX_CHUNK_SIZE;
@@ -1389,34 +2032,10 @@ HexHitResult hex_terrain_raycast(const HexTerrain* ht, HMM_Vec3 ray_origin,
             result.grow = grow;
             result.layer = world_layer;
             result.type = vtype;
-
-            // Determine hit face and placement position
-            if (world_layer != prev_layer && gcol == prev_gcol && grow == prev_grow) {
-                // Vertical transition
-                if (world_layer > prev_layer) {
-                    result.face = 1; // bottom face
-                    result.place_gcol = gcol;
-                    result.place_grow = grow;
-                    result.place_layer = world_layer - 1;
-                } else {
-                    result.face = 0; // top face
-                    result.place_gcol = gcol;
-                    result.place_grow = grow;
-                    result.place_layer = world_layer + 1;
-                }
-            } else if (gcol != prev_gcol || grow != prev_grow) {
-                // Horizontal transition: side face
-                result.face = 2; // generic side
-                result.place_gcol = prev_gcol;
-                result.place_grow = prev_grow;
-                result.place_layer = world_layer;
-            } else {
-                // First step hit (no previous)
-                result.face = 0;
-                result.place_gcol = gcol;
-                result.place_grow = grow;
-                result.place_layer = world_layer + 1;
-            }
+            result.face = face;
+            result.place_gcol = p_gcol;
+            result.place_grow = p_grow;
+            result.place_layer = p_layer;
             return result;
         }
 
@@ -1439,9 +2058,20 @@ bool hex_terrain_break(HexTerrain* ht, const HexHitResult* hit) {
     int local_layer = hit->layer - chunk->base_layer;
     if (local_layer < 0 || local_layer >= HEX_CHUNK_LAYERS) return false;
 
+    // Bedrock is unbreakable
+    if (HEX_VOXEL(chunk->voxels, hit->col, hit->row, local_layer) == VOXEL_BEDROCK) return false;
+
     HEX_VOXEL(chunk->voxels, hit->col, hit->row, local_layer) = VOXEL_AIR;
     update_column_cache(chunk, hit->col, hit->row);
     chunk->dirty = true;
+    chunk->edit_dirty = true;
+
+    // Persist edit to disk-backed sector cache
+    {
+        float lon, lat;
+        gcol_grow_to_lonlat(ht, hit->gcol, hit->grow, &lon, &lat);
+        edit_cache_record(&ht->edits, lon, lat, hit->layer, VOXEL_AIR);
+    }
 
     // Dirty neighbor chunks if at chunk boundary
     if (hit->col == 0 || hit->col == HEX_CHUNK_SIZE - 1 ||
@@ -1453,8 +2083,9 @@ bool hex_terrain_break(HexTerrain* ht, const HexHitResult* hit) {
             int ncz = (int)floorf((float)nrow_g / HEX_CHUNK_SIZE);
             if (ncx != chunk->cx || ncz != chunk->cz) {
                 int ni = find_chunk(ht, ncx, ncz);
-                if (ni >= 0 && !ht->chunks[ni].generating) {
+                if (ni >= 0) {
                     ht->chunks[ni].dirty = true;
+                    ht->chunks[ni].edit_dirty = true;
                 }
             }
         }
@@ -1490,6 +2121,14 @@ bool hex_terrain_place(HexTerrain* ht, const HexHitResult* hit, uint8_t voxel_ty
     HEX_VOXEL(chunk->voxels, local_col, local_row, local_layer) = voxel_type;
     update_column_cache(chunk, local_col, local_row);
     chunk->dirty = true;
+    chunk->edit_dirty = true;
+
+    // Persist edit to disk-backed sector cache
+    {
+        float lon, lat;
+        gcol_grow_to_lonlat(ht, place_gcol, place_grow, &lon, &lat);
+        edit_cache_record(&ht->edits, lon, lat, place_layer, voxel_type);
+    }
 
     // Dirty neighbor chunks if at boundary
     if (local_col == 0 || local_col == HEX_CHUNK_SIZE - 1 ||
@@ -1501,8 +2140,9 @@ bool hex_terrain_place(HexTerrain* ht, const HexHitResult* hit, uint8_t voxel_ty
             int ncz = (int)floorf((float)nrow_g / HEX_CHUNK_SIZE);
             if (ncx != chunk->cx || ncz != chunk->cz) {
                 int ni = find_chunk(ht, ncx, ncz);
-                if (ni >= 0 && !ht->chunks[ni].generating) {
+                if (ni >= 0) {
                     ht->chunks[ni].dirty = true;
+                    ht->chunks[ni].edit_dirty = true;
                 }
             }
         }
@@ -1510,8 +2150,72 @@ bool hex_terrain_place(HexTerrain* ht, const HexHitResult* hit, uint8_t voxel_ty
     return true;
 }
 
+// ---- Ctrl placement (inverted ray) ----
+
+// Ctrl mode: find placement face by inverting the view direction.
+// Picks the side face on the FAR side of the selected block (away from camera).
+// If that side neighbor is solid, falls back to top or bottom face.
+void hex_terrain_ctrl_placement(const HexTerrain* ht, HexHitResult* hit,
+                                 HMM_Vec3 camera_pos) {
+    if (!hit->valid || !ht->frame_valid) return;
+
+    // Get hex center and camera in tangent plane
+    float hx, hz;
+    hex_local_pos(hit->gcol, hit->grow, &hx, &hz);
+
+    float cx, cz;
+    world_to_tangent(ht, camera_pos, &cx, &cz);
+
+    // Inverted direction: from camera TOWARD hex (opposite of camera-facing)
+    float dx = hx - cx;
+    float dz = hz - cz;
+
+    // Find which side face best matches the inverted direction
+    int best_dir = 0;
+    float best_dot = -1e30f;
+    for (int dir = 0; dir < 6; dir++) {
+        int edge = DIR_TO_EDGE[dir];
+        float nx = (HEX_COS[edge] + HEX_COS[(edge + 1) % 6]) * 0.5f;
+        float nz = (HEX_SIN[edge] + HEX_SIN[(edge + 1) % 6]) * 0.5f;
+        float d = dx * nx + dz * nz;
+        if (d > best_dot) {
+            best_dot = d;
+            best_dir = dir;
+        }
+    }
+
+    // Check if the neighbor on that side is solid
+    int ngcol, ngrow;
+    hex_neighbor(hit->gcol, hit->grow, best_dir, &ngcol, &ngrow);
+    uint8_t neighbor = hex_terrain_get_voxel(ht, ngcol, ngrow, hit->layer);
+
+    if (neighbor == VOXEL_AIR) {
+        // Side is free — place there
+        hit->face = 2;
+        hit->place_gcol = ngcol;
+        hit->place_grow = ngrow;
+        hit->place_layer = hit->layer;
+    } else {
+        // Side blocked — fall back to top or bottom
+        uint8_t above = hex_terrain_get_voxel(ht, hit->gcol, hit->grow, hit->layer + 1);
+        if (above == VOXEL_AIR) {
+            hit->face = 0;  // top
+            hit->place_gcol = hit->gcol;
+            hit->place_grow = hit->grow;
+            hit->place_layer = hit->layer + 1;
+        } else {
+            hit->face = 1;  // bottom
+            hit->place_gcol = hit->gcol;
+            hit->place_grow = hit->grow;
+            hit->place_layer = hit->layer - 1;
+        }
+    }
+}
+
 // ---- Highlight ----
 
+// Full hex prism outline: top hex + bottom hex + 6 vertical edges = 18 line segments = 36 verts = 108 floats.
+// Slightly oversized (HEX_RADIUS * 1.04) so the wireframe wraps visibly around the target block.
 bool hex_terrain_build_highlight(const HexTerrain* ht, const HexHitResult* hit,
                                   const double world_origin[3], float* out_verts) {
     if (!hit->valid || !ht->frame_valid) return false;
@@ -1519,37 +2223,172 @@ bool hex_terrain_build_highlight(const HexTerrain* ht, const HexHitResult* hit,
     float lx, lz;
     hex_local_pos(hit->gcol, hit->grow, &lx, &lz);
 
-    // Highlight at the specific layer, not column top
-    float top_r = ht->planet_radius + (float)(hit->layer + 1) * HEX_HEIGHT + HEX_SURFACE_BIAS + 0.05f;
+    // Slightly oversized radius so outline wraps around the block
+    float overshoot = HEX_RADIUS * 1.04f;
+    float margin = 0.05f;  // radial outset so lines sit just outside block faces
+    float bot_r = ht->planet_radius + (float)hit->layer * HEX_HEIGHT + HEX_SURFACE_BIAS - margin;
+    float top_r = ht->planet_radius + (float)(hit->layer + 1) * HEX_HEIGHT + HEX_SURFACE_BIAS + margin;
 
-    HMM_Vec3 hex_v[6];
+    // Compute 6 vertex directions (oversized hex)
+    HMM_Vec3 dirs[6];
     for (int i = 0; i < 6; i++) {
-        float vx = lx + HEX_RADIUS * HEX_COS[i];
-        float vz = lz + HEX_RADIUS * HEX_SIN[i];
-        HMM_Vec3 vdir = vec3_normalize(
+        float vx = lx + overshoot * HEX_COS[i];
+        float vz = lz + overshoot * HEX_SIN[i];
+        dirs[i] = vec3_normalize(
             vec3_add(ht->tangent_origin,
                 vec3_add(vec3_scale(ht->tangent_east, vx),
                          vec3_scale(ht->tangent_north, vz))));
-        hex_v[i] = vec3_scale(vdir, top_r);
     }
 
+    // Build 12 vertices for top hex and 12 for bottom hex (6 edges each)
+    HMM_Vec3 top_v[6], bot_v[6];
     for (int i = 0; i < 6; i++) {
-        hex_v[i].X -= (float)world_origin[0];
-        hex_v[i].Y -= (float)world_origin[1];
-        hex_v[i].Z -= (float)world_origin[2];
+        top_v[i] = vec3_scale(dirs[i], top_r);
+        bot_v[i] = vec3_scale(dirs[i], bot_r);
+        // Apply floating origin offset
+        top_v[i].X -= (float)world_origin[0];
+        top_v[i].Y -= (float)world_origin[1];
+        top_v[i].Z -= (float)world_origin[2];
+        bot_v[i].X -= (float)world_origin[0];
+        bot_v[i].Y -= (float)world_origin[1];
+        bot_v[i].Z -= (float)world_origin[2];
     }
 
+    int idx = 0;
+    // Top hexagon (6 edges)
     for (int i = 0; i < 6; i++) {
         int j = (i + 1) % 6;
-        out_verts[i * 6 + 0] = hex_v[i].X;
-        out_verts[i * 6 + 1] = hex_v[i].Y;
-        out_verts[i * 6 + 2] = hex_v[i].Z;
-        out_verts[i * 6 + 3] = hex_v[j].X;
-        out_verts[i * 6 + 4] = hex_v[j].Y;
-        out_verts[i * 6 + 5] = hex_v[j].Z;
+        out_verts[idx++] = top_v[i].X; out_verts[idx++] = top_v[i].Y; out_verts[idx++] = top_v[i].Z;
+        out_verts[idx++] = top_v[j].X; out_verts[idx++] = top_v[j].Y; out_verts[idx++] = top_v[j].Z;
     }
+    // Bottom hexagon (6 edges)
+    for (int i = 0; i < 6; i++) {
+        int j = (i + 1) % 6;
+        out_verts[idx++] = bot_v[i].X; out_verts[idx++] = bot_v[i].Y; out_verts[idx++] = bot_v[i].Z;
+        out_verts[idx++] = bot_v[j].X; out_verts[idx++] = bot_v[j].Y; out_verts[idx++] = bot_v[j].Z;
+    }
+    // 6 vertical edges connecting top to bottom
+    for (int i = 0; i < 6; i++) {
+        out_verts[idx++] = top_v[i].X; out_verts[idx++] = top_v[i].Y; out_verts[idx++] = top_v[i].Z;
+        out_verts[idx++] = bot_v[i].X; out_verts[idx++] = bot_v[i].Y; out_verts[idx++] = bot_v[i].Z;
+    }
+    // idx should be 108 (36 vertices * 3 floats)
 
     return true;
+}
+
+int hex_terrain_build_placement_face(const HexTerrain* ht, const HexHitResult* hit,
+                                      const double world_origin[3], float* out_verts) {
+    if (!hit->valid || !ht->frame_valid) return 0;
+
+    float lx, lz;
+    hex_local_pos(hit->gcol, hit->grow, &lx, &lz);
+
+    // Use the same offset as the white wireframe (slightly oversized to avoid z-fighting)
+    float bot_r = ht->planet_radius + (float)hit->layer * HEX_HEIGHT + HEX_SURFACE_BIAS;
+    float top_r = bot_r + HEX_HEIGHT;
+
+    // Inset factor: shrink vertices toward face center (0.85 = 15% inset)
+    float inset = 0.85f;
+
+    // Compute 6 vertex directions (at full hex radius)
+    HMM_Vec3 dirs[6];
+    for (int i = 0; i < 6; i++) {
+        float vx = lx + HEX_RADIUS * HEX_COS[i];
+        float vz = lz + HEX_RADIUS * HEX_SIN[i];
+        dirs[i] = vec3_normalize(
+            vec3_add(ht->tangent_origin,
+                vec3_add(vec3_scale(ht->tangent_east, vx),
+                         vec3_scale(ht->tangent_north, vz))));
+    }
+
+    // Center direction (for inset lerp)
+    HMM_Vec3 center_dir = vec3_normalize(
+        vec3_add(ht->tangent_origin,
+            vec3_add(vec3_scale(ht->tangent_east, lx),
+                     vec3_scale(ht->tangent_north, lz))));
+
+    // Compute inset vertices: lerp each dir toward center
+    HMM_Vec3 top_v[6], bot_v[6];
+    for (int i = 0; i < 6; i++) {
+        HMM_Vec3 inset_dir = vec3_normalize(vec3_lerp(center_dir, dirs[i], inset));
+        top_v[i] = vec3_scale(inset_dir, top_r);
+        bot_v[i] = vec3_scale(inset_dir, bot_r);
+        top_v[i].X -= (float)world_origin[0];
+        top_v[i].Y -= (float)world_origin[1];
+        top_v[i].Z -= (float)world_origin[2];
+        bot_v[i].X -= (float)world_origin[0];
+        bot_v[i].Y -= (float)world_origin[1];
+        bot_v[i].Z -= (float)world_origin[2];
+    }
+
+    int idx = 0;
+
+    if (hit->face == 0) {
+        // Top face: 6 line segments forming inset hexagon
+        for (int i = 0; i < 6; i++) {
+            int j = (i + 1) % 6;
+            out_verts[idx++] = top_v[i].X; out_verts[idx++] = top_v[i].Y; out_verts[idx++] = top_v[i].Z;
+            out_verts[idx++] = top_v[j].X; out_verts[idx++] = top_v[j].Y; out_verts[idx++] = top_v[j].Z;
+        }
+    } else if (hit->face == 1) {
+        // Bottom face: 6 line segments forming inset hexagon
+        for (int i = 0; i < 6; i++) {
+            int j = (i + 1) % 6;
+            out_verts[idx++] = bot_v[i].X; out_verts[idx++] = bot_v[i].Y; out_verts[idx++] = bot_v[i].Z;
+            out_verts[idx++] = bot_v[j].X; out_verts[idx++] = bot_v[j].Y; out_verts[idx++] = bot_v[j].Z;
+        }
+    } else {
+        // Side face: 4 line segments forming inset rectangle
+        int edge = 0;
+        if (hit->place_gcol != hit->gcol || hit->place_grow != hit->grow) {
+            for (int d = 0; d < 6; d++) {
+                int ncol, nrow;
+                hex_neighbor(hit->gcol, hit->grow, d, &ncol, &nrow);
+                if (ncol == hit->place_gcol && nrow == hit->place_grow) {
+                    edge = DIR_TO_EDGE[d];
+                    break;
+                }
+            }
+        }
+        int vi0 = edge;
+        int vi1 = (edge + 1) % 6;
+
+        // Inset the quad: also shrink vertically toward face center
+        HMM_Vec3 bl = bot_v[vi0], br = bot_v[vi1];
+        HMM_Vec3 tl = top_v[vi0], tr = top_v[vi1];
+
+        // Vertical inset: lerp top/bottom toward the vertical midpoint
+        HMM_Vec3 mid_l = vec3_lerp(bl, tl, 0.5f);
+        HMM_Vec3 mid_r = vec3_lerp(br, tr, 0.5f);
+        bl = vec3_lerp(mid_l, bl, inset);
+        tl = vec3_lerp(mid_l, tl, inset);
+        br = vec3_lerp(mid_r, br, inset);
+        tr = vec3_lerp(mid_r, tr, inset);
+
+        // Horizontal inset: lerp left/right toward horizontal midpoint
+        HMM_Vec3 mid_b = vec3_lerp(bl, br, 0.5f);
+        HMM_Vec3 mid_t = vec3_lerp(tl, tr, 0.5f);
+        bl = vec3_lerp(mid_b, bl, inset);
+        br = vec3_lerp(mid_b, br, inset);
+        tl = vec3_lerp(mid_t, tl, inset);
+        tr = vec3_lerp(mid_t, tr, inset);
+
+        // 4 line segments: BL-BR, BR-TR, TR-TL, TL-BL
+        out_verts[idx++] = bl.X; out_verts[idx++] = bl.Y; out_verts[idx++] = bl.Z;
+        out_verts[idx++] = br.X; out_verts[idx++] = br.Y; out_verts[idx++] = br.Z;
+
+        out_verts[idx++] = br.X; out_verts[idx++] = br.Y; out_verts[idx++] = br.Z;
+        out_verts[idx++] = tr.X; out_verts[idx++] = tr.Y; out_verts[idx++] = tr.Z;
+
+        out_verts[idx++] = tr.X; out_verts[idx++] = tr.Y; out_verts[idx++] = tr.Z;
+        out_verts[idx++] = tl.X; out_verts[idx++] = tl.Y; out_verts[idx++] = tl.Z;
+
+        out_verts[idx++] = tl.X; out_verts[idx++] = tl.Y; out_verts[idx++] = tl.Z;
+        out_verts[idx++] = bl.X; out_verts[idx++] = bl.Y; out_verts[idx++] = bl.Z;
+    }
+
+    return idx / 3; // number of vertices
 }
 
 // ---- Voxel query API (for collision) ----
@@ -1655,9 +2494,8 @@ bool hex_terrain_has_headroom(const HexTerrain* ht, int gcol, int grow,
 
 void hex_terrain_world_to_hex(const HexTerrain* ht, HMM_Vec3 world_pos,
                                int* out_gcol, int* out_grow, int* out_layer) {
-    HMM_Vec3 offset = vec3_sub(world_pos, ht->tangent_origin);
-    float lx = vec3_dot(offset, ht->tangent_east);
-    float lz = vec3_dot(offset, ht->tangent_north);
+    float lx, lz;
+    world_to_tangent(ht, world_pos, &lx, &lz);
     pixel_to_hex(lx, lz, out_gcol, out_grow);
 
     float point_r = sqrtf(vec3_dot(world_pos, world_pos));

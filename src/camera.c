@@ -13,8 +13,8 @@
 #define SPRINT_SPEED    8.0f
 #define JUMP_FORCE      8.0f    // Initial upward velocity on jump (m/s)
 #define BASE_GRAVITY    20.0f   // Gravitational acceleration toward center (m/s^2)
-#define PLAYER_EYE_HEIGHT 1.7f  // Eye height above feet (meters)
-#define PLAYER_HEIGHT   2.0f    // Total player height (2m capsule)
+#define PLAYER_EYE_HEIGHT 1.6f  // Eye height above feet (meters)
+#define PLAYER_HEIGHT   1.8f    // Total player height (1.8m, fits in 2m caves)
 #define PLAYER_RADIUS   0.3f    // Horizontal collision radius (meters)
 #define GROUND_SNAP_THRESHOLD 0.5f  // Snap to ground if within this distance
 #define AUTO_STEP_HEIGHT 1.0f   // Can step up blocks this tall without jumping (1 hex layer)
@@ -136,6 +136,11 @@ void camera_init(Camera* cam) {
 void camera_update(Camera* cam, Planet* planet, const LodTree* lod,
                    const HexTerrain* hex, float dt) {
     double dd = (double)dt;
+
+    // ---- Teleport detection: capture radius before movement ----
+    double radius_before = sqrt(cam->pos_d[0]*cam->pos_d[0] +
+                                cam->pos_d[1]*cam->pos_d[1] +
+                                cam->pos_d[2]*cam->pos_d[2]);
 
     // ---- Sync float position from double (authoritative) ----
     cam->position = (HMM_Vec3){{(float)cam->pos_d[0], (float)cam->pos_d[1], (float)cam->pos_d[2]}};
@@ -281,16 +286,19 @@ void camera_update(Camera* cam, Planet* planet, const LodTree* lod,
         if (cur_ground_r < 1.0f) use_hex_collision = false; // no chunk loaded here
     }
 
+    // Save position before movement (used by both hex and jetpack collision)
+    double old_pos_d[3] = { cam->pos_d[0], cam->pos_d[1], cam->pos_d[2] };
+
     if (use_hex_collision) {
         // ---- Hex voxel collision: try movement, check walls, slide ----
         // See docs/hex-collision-design.md for physics case documentation.
-        double old_pos_d[3] = { cam->pos_d[0], cam->pos_d[1], cam->pos_d[2] };
 
         // Get current ground info using player's feet altitude as search ceiling.
         // This correctly finds ground inside arches/caves (not the roof above).
         int cur_gcol, cur_grow, cur_layer;
         hex_terrain_world_to_hex(hex, cam->position, &cur_gcol, &cur_grow, &cur_layer);
-        int cur_feet_layer = (int)floorf((pos_len - cam->eye_height - hex->planet_radius) / HEX_HEIGHT);
+        // Double-precision altitude to avoid catastrophic cancellation at 800km
+        int cur_feet_layer = (int)floor((pos_len_d - (double)cam->eye_height - (double)hex->planet_radius) / (double)HEX_HEIGHT);
         int search_ceiling = cur_feet_layer + (int)ceilf(AUTO_STEP_HEIGHT / HEX_HEIGHT) + 1;
         float cur_ground_r = hex_terrain_ground_height_below(hex, cur_gcol, cur_grow, search_ceiling);
         if (cur_ground_r < 1.0f) cur_ground_r = hex_terrain_ground_height(hex, cur_gcol, cur_grow);
@@ -385,7 +393,7 @@ void camera_update(Camera* cam, Planet* planet, const LodTree* lod,
         double pr_snap = sqrt(cam->pos_d[0]*cam->pos_d[0] +
                               cam->pos_d[1]*cam->pos_d[1] +
                               cam->pos_d[2]*cam->pos_d[2]);
-        int snap_feet_layer = (int)floorf(((float)pr_snap - cam->eye_height - hex->planet_radius) / HEX_HEIGHT);
+        int snap_feet_layer = (int)floor((pr_snap - (double)cam->eye_height - (double)hex->planet_radius) / (double)HEX_HEIGHT);
 
         // When on ground, allow step-up margin so walking auto-steps.
         // When airborne, search only at/below feet — don't find surfaces above the player.
@@ -523,8 +531,91 @@ void camera_update(Camera* cam, Planet* planet, const LodTree* lod,
         }
     }
 
+    // ---- Hex solid voxel rejection (applies to jetpack AND walking) ----
+    // Prevent the player from moving INTO solid hex voxels regardless of movement mode.
+    // Uses double-precision radius to avoid catastrophic cancellation at 800km.
+    if (hex && hex->frame_valid) {
+        HMM_Vec3 test_pos = (HMM_Vec3){{(float)cam->pos_d[0], (float)cam->pos_d[1], (float)cam->pos_d[2]}};
+        int gcol, grow, layer;
+        hex_terrain_world_to_hex(hex, test_pos, &gcol, &grow, &layer);
+
+        // Double-precision radius for accurate layer computation
+        double pr_d = sqrt(cam->pos_d[0]*cam->pos_d[0] +
+                           cam->pos_d[1]*cam->pos_d[1] +
+                           cam->pos_d[2]*cam->pos_d[2]);
+        double feet_alt = pr_d - (double)cam->eye_height - (double)hex->planet_radius;
+        int feet_layer = (int)floor(feet_alt / (double)HEX_HEIGHT);
+        int head_layer = feet_layer + (int)ceil((double)PLAYER_HEIGHT / (double)HEX_HEIGHT);
+
+        bool blocked = false;
+        for (int check_l = feet_layer; check_l <= head_layer; check_l++) {
+            uint8_t voxel = hex_terrain_get_voxel(hex, gcol, grow, check_l);
+            if (voxel != 0) {  // VOXEL_AIR = 0
+                blocked = true;
+                break;
+            }
+        }
+
+        if (blocked) {
+            // Only revert if old position was NOT also blocked (prevents permanent trapping)
+            HMM_Vec3 old_pos_f = (HMM_Vec3){{(float)old_pos_d[0], (float)old_pos_d[1], (float)old_pos_d[2]}};
+            int old_gcol, old_grow, old_layer;
+            hex_terrain_world_to_hex(hex, old_pos_f, &old_gcol, &old_grow, &old_layer);
+
+            double old_pr_d = sqrt(old_pos_d[0]*old_pos_d[0] +
+                                   old_pos_d[1]*old_pos_d[1] +
+                                   old_pos_d[2]*old_pos_d[2]);
+            double old_feet_alt = old_pr_d - (double)cam->eye_height - (double)hex->planet_radius;
+            int old_feet_layer = (int)floor(old_feet_alt / (double)HEX_HEIGHT);
+            int old_head_layer = old_feet_layer + (int)ceil((double)PLAYER_HEIGHT / (double)HEX_HEIGHT);
+
+            bool old_blocked = false;
+            for (int check_l = old_feet_layer; check_l <= old_head_layer; check_l++) {
+                if (hex_terrain_get_voxel(hex, old_gcol, old_grow, check_l) != 0) {
+                    old_blocked = true;
+                    break;
+                }
+            }
+
+            if (!old_blocked) {
+                cam->pos_d[0] = old_pos_d[0];
+                cam->pos_d[1] = old_pos_d[1];
+                cam->pos_d[2] = old_pos_d[2];
+                cam->velocity = (HMM_Vec3){{0, 0, 0}};
+            }
+            // If old position was also blocked, let the player through — they need
+            // to escape (e.g., jetpack out). Don't trap them forever.
+        }
+    }
+
     // ---- Final sync: double → float for rendering ----
     cam->position = (HMM_Vec3){{(float)cam->pos_d[0], (float)cam->pos_d[1], (float)cam->pos_d[2]}};
+
+    // ---- Teleport detection: check for unexpected upward position jumps ----
+    // Only active when jetpack is OFF — jetpack can legitimately cause large movements.
+    if (!cam->jetpack_active) {
+        double radius_after = sqrt(cam->pos_d[0]*cam->pos_d[0] +
+                                   cam->pos_d[1]*cam->pos_d[1] +
+                                   cam->pos_d[2]*cam->pos_d[2]);
+        double radius_change = radius_after - radius_before;
+        if (radius_change > 0.5) {
+            LOG(PLAYER, "========== UNEXPECTED UPWARD TELEPORT ==========\n");
+            LOG(PLAYER, "Radius change: %.3f -> %.3f (+%.3f)\n",
+                radius_before, radius_after, radius_change);
+            LOG(PLAYER, "on_ground=%d key_w=%d key_space=%d dt=%.4f\n",
+                cam->on_ground, cam->key_w, cam->key_space, dt);
+            LOG(PLAYER, "pos=(%.3f, %.3f, %.3f) vel=(%.3f, %.3f, %.3f)\n",
+                cam->position.X, cam->position.Y, cam->position.Z,
+                cam->velocity.X, cam->velocity.Y, cam->velocity.Z);
+            if (hex && hex->frame_valid) {
+                int gcol, grow, layer;
+                hex_terrain_world_to_hex(hex, cam->position, &gcol, &grow, &layer);
+                float ground_r = hex_terrain_ground_height(hex, gcol, grow);
+                LOG(PLAYER, "hex=(%d,%d) layer=%d ground_r=%.3f\n", gcol, grow, layer, ground_r);
+            }
+            LOG(PLAYER, "================================================\n");
+        }
+    }
 
     // ---- View matrix (built directly from basis vectors) ----
     // AVOID HMM_LookAt_RH(pos, pos+forward, up) — it does normalize(target-eye)
