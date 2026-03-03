@@ -17,6 +17,8 @@ typedef enum {
     VOXEL_STONE,
     VOXEL_ICE,
     VOXEL_BEDROCK,  // Unbreakable dark-grey floor at bottom of world
+    VOXEL_TORCH,    // Placeable torch (renders as model, emits light)
+    VOXEL_TYPE_COUNT,
 } VoxelType;
 
 typedef struct HexCell {

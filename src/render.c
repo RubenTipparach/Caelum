@@ -8,6 +8,7 @@
 #include "sky.glsl.h"
 #include "highlight.glsl.h"
 #include "hex_terrain.glsl.h"
+#include "hotbar.glsl.h"
 #include <math.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -202,9 +203,9 @@ void render_init(Renderer* r, Planet* planet, const Camera* cam) {
     // ---- Hex terrain textured pipeline ----
     printf("[RENDER] render_init: loading hex terrain textures...\n"); fflush(stdout);
     {
-        // Load 9 terrain textures and build atlas
-        // Layout: water, sand, dirt, grass, stone, ice, snow, dirt_grass, dirt_snow
-        const char* tex_files[9] = {
+        // Load 10 terrain textures and build atlas
+        // Layout: water, sand, dirt, grass, stone, ice, snow, dirt_grass, dirt_snow, torch
+        const char* tex_files[10] = {
             "assets/textures/water.png",
             "assets/textures/sand.png",
             "assets/textures/dirt.png",
@@ -214,9 +215,10 @@ void render_init(Renderer* r, Planet* planet, const Camera* cam) {
             "assets/textures/snow.png",
             "assets/textures/dirt_grass.png",
             NULL,  // dirt_snow: generated from dirt+snow blend
+            "tenebris/dist/textures/torch.png",
         };
         const int TILE_SIZE = 16;
-        const int NUM_TILES = 9;
+        const int NUM_TILES = 10;
         const int atlas_w = TILE_SIZE * NUM_TILES;
         const int atlas_h = TILE_SIZE;
         unsigned char* atlas_data = (unsigned char*)calloc(atlas_w * atlas_h * 4, 1);
@@ -307,11 +309,12 @@ void render_init(Renderer* r, Planet* planet, const Camera* cam) {
             .shader = hex_shd,
             .layout = {
                 .attrs = {
-                    [ATTR_hex_terrain_a_position]  = { .format = SG_VERTEXFORMAT_FLOAT3 },
-                    [ATTR_hex_terrain_a_normal]    = { .format = SG_VERTEXFORMAT_FLOAT3 },
-                    [ATTR_hex_terrain_a_uv]        = { .format = SG_VERTEXFORMAT_FLOAT2 },
-                    [ATTR_hex_terrain_a_color]     = { .format = SG_VERTEXFORMAT_FLOAT3 },
-                    [ATTR_hex_terrain_a_sky_light] = { .format = SG_VERTEXFORMAT_FLOAT },
+                    [ATTR_hex_terrain_a_position]    = { .format = SG_VERTEXFORMAT_FLOAT3 },
+                    [ATTR_hex_terrain_a_normal]      = { .format = SG_VERTEXFORMAT_FLOAT3 },
+                    [ATTR_hex_terrain_a_uv]          = { .format = SG_VERTEXFORMAT_FLOAT2 },
+                    [ATTR_hex_terrain_a_color]       = { .format = SG_VERTEXFORMAT_FLOAT3 },
+                    [ATTR_hex_terrain_a_sky_light]   = { .format = SG_VERTEXFORMAT_FLOAT },
+                    [ATTR_hex_terrain_a_torch_light] = { .format = SG_VERTEXFORMAT_FLOAT },
                 }
             },
             .depth = {
@@ -358,11 +361,11 @@ void render_init(Renderer* r, Planet* planet, const Camera* cam) {
             .label = "lod-wireframe-pipeline",
         });
 
-        // Pipeline for HexVertex (44-byte stride)
+        // Pipeline for HexVertex (52-byte stride)
         r->hex_wireframe_pip = sg_make_pipeline(&(sg_pipeline_desc){
             .shader = wire_shd,
             .layout = {
-                .buffers[0] = { .stride = 44 },
+                .buffers[0] = { .stride = 52 },
                 .attrs = {
                     [ATTR_highlight_a_position] = { .format = SG_VERTEXFORMAT_FLOAT3 },
                 }
@@ -405,6 +408,46 @@ void render_init(Renderer* r, Planet* planet, const Camera* cam) {
         });
         free(wire_indices);
     }
+
+    // ---- Hotbar UI pipeline ----
+    {
+        sg_shader hotbar_shd = sg_make_shader(hotbar_shader_desc(sg_query_backend()));
+        r->hotbar_pip = sg_make_pipeline(&(sg_pipeline_desc){
+            .shader = hotbar_shd,
+            .layout = {
+                .attrs = {
+                    [ATTR_hotbar_a_position] = { .format = SG_VERTEXFORMAT_FLOAT2 },
+                    [ATTR_hotbar_a_uv]       = { .format = SG_VERTEXFORMAT_FLOAT2 },
+                }
+            },
+            .depth = {
+                .compare = SG_COMPAREFUNC_ALWAYS,
+                .write_enabled = false,
+            },
+            .cull_mode = SG_CULLMODE_NONE,
+            .colors[0] = {
+                .blend = {
+                    .enabled = true,
+                    .src_factor_rgb = SG_BLENDFACTOR_SRC_ALPHA,
+                    .dst_factor_rgb = SG_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
+                    .src_factor_alpha = SG_BLENDFACTOR_ONE,
+                    .dst_factor_alpha = SG_BLENDFACTOR_ZERO,
+                }
+            },
+            .label = "hotbar-pipeline",
+        });
+
+        // Dynamic vertex buffer for hotbar quads (8 slots * 6 verts * 4 floats)
+        r->hotbar_buf = sg_make_buffer(&(sg_buffer_desc){
+            .usage.vertex_buffer = true,
+            .usage.stream_update = true,
+            .size = 8 * 6 * 4 * sizeof(float),
+            .label = "hotbar-vbuf",
+        });
+    }
+
+    // ---- Torch rendering system ----
+    torch_init(&r->torch_system);
 
     printf("[RENDER] All pipelines created\n");
     fflush(stdout);
@@ -657,7 +700,26 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
                            r->hex_atlas_view, r->hex_atlas_smp);
     }
 
-    // ---- 3b+. Physics wireframe overlay (P key): hex prism outlines ----
+    // ---- 3b+. Draw torch models ----
+    torch_update(&r->torch_system, dt);
+    if (r->torch_system.instance_count > 0) {
+        double cam_off[3] = {
+            (double)vs_params.camera_offset.X,
+            (double)vs_params.camera_offset.Y,
+            (double)vs_params.camera_offset.Z
+        };
+        double cam_off_low[3] = {
+            (double)vs_params.camera_offset_low.X,
+            (double)vs_params.camera_offset_low.Y,
+            (double)vs_params.camera_offset_low.Z
+        };
+        torch_render(&r->torch_system, vp_terrain,
+                     cam_off, cam_off_low,
+                     vs_params.log_depth.X, vs_params.log_depth.Y, vs_params.log_depth.Z,
+                     r->sun_direction);
+    }
+
+    // ---- 3b++. Physics wireframe overlay (P key): hex prism outlines ----
     if (r->show_wireframe && r->hex_terrain.active_count > 0) {
         sg_apply_pipeline(r->highlight_pip);
         highlight_vs_params_t wire_vs = {
@@ -826,6 +888,19 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
         sdtx_puts("JETPACK OFF\n");
     }
 
+    // Selected block type
+    {
+        static const char* block_names[] = {
+            "AIR", "WATER", "SAND", "DIRT", "GRASS", "STONE", "ICE", "BEDROCK", "TORCH"
+        };
+        // Hotbar types: STONE, DIRT, GRASS, SAND, WATER, ICE, BEDROCK, TORCH
+        static const int hotbar_voxel[] = { 5, 3, 4, 2, 1, 6, 7, 8 };
+        int vtype = hotbar_voxel[r->hotbar_selected_slot % 8];
+        const char* name = (vtype < 9) ? block_names[vtype] : "???";
+        sdtx_color3f(1.0f, 0.8f, 0.4f);
+        sdtx_printf("[%d] %s\n", r->hotbar_selected_slot + 1, name);
+    }
+
     // ---- F3 Profiler overlay ----
     if (r->show_profiler) {
         ProfileStats* p = &r->profile;
@@ -904,6 +979,69 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
     }
     sdtx_draw();
 
+    // ---- 5. Hotbar UI overlay ----
+    {
+        // Atlas tile indices for each hotbar slot (matches hotbar_types[] in main.c)
+        // STONE=4, DIRT=2, GRASS=3, SAND=1, WATER=0, ICE=5, BEDROCK=4, TORCH=9
+        static const int hotbar_atlas[] = { 4, 2, 3, 1, 0, 5, 4, 9 };
+        static const int HOTBAR_SLOTS = 8;
+        static const float ATLAS_TILES = 10.0f;
+
+        float sw = sapp_widthf();
+        float sh = sapp_heightf();
+        float slot_size = 40.0f;   // pixels per slot
+        float padding = 4.0f;      // gap between slots
+        float total_w = HOTBAR_SLOTS * slot_size + (HOTBAR_SLOTS - 1) * padding;
+        float x0 = (sw - total_w) * 0.5f;
+        float y0 = sh - slot_size - 12.0f;  // 12px from bottom
+
+        // Build 8 quads (6 verts each): pos.xy + uv.xy = 4 floats per vert
+        float verts[8 * 6 * 4];
+        int vi = 0;
+        for (int i = 0; i < HOTBAR_SLOTS; i++) {
+            float sx = x0 + i * (slot_size + padding);
+            float sy = y0;
+            float u0 = (float)hotbar_atlas[i] / ATLAS_TILES;
+            float u1 = ((float)hotbar_atlas[i] + 1.0f) / ATLAS_TILES;
+
+            // Triangle 1: top-left, top-right, bottom-right
+            verts[vi++] = sx;             verts[vi++] = sy;               verts[vi++] = u0; verts[vi++] = 0.0f;
+            verts[vi++] = sx + slot_size; verts[vi++] = sy;               verts[vi++] = u1; verts[vi++] = 0.0f;
+            verts[vi++] = sx + slot_size; verts[vi++] = sy + slot_size;   verts[vi++] = u1; verts[vi++] = 1.0f;
+            // Triangle 2: top-left, bottom-right, bottom-left
+            verts[vi++] = sx;             verts[vi++] = sy;               verts[vi++] = u0; verts[vi++] = 0.0f;
+            verts[vi++] = sx + slot_size; verts[vi++] = sy + slot_size;   verts[vi++] = u1; verts[vi++] = 1.0f;
+            verts[vi++] = sx;             verts[vi++] = sy + slot_size;   verts[vi++] = u0; verts[vi++] = 1.0f;
+        }
+        sg_update_buffer(r->hotbar_buf, &(sg_range){ verts, sizeof(verts) });
+
+        // Orthographic projection for screen-space rendering
+        HMM_Mat4 ortho = HMM_Orthographic_LH_ZO(0.0f, sw, sh, 0.0f, -1.0f, 1.0f);
+
+        // Draw each slot (all as one batch, then highlight selected)
+        sg_apply_pipeline(r->hotbar_pip);
+
+        // Draw all slots with dim tint first
+        sg_bindings hotbar_bind = {
+            .vertex_buffers[0] = r->hotbar_buf,
+            .views[VIEW_hotbar_tex] = r->hex_atlas_view,
+            .samplers[SMP_hotbar_smp] = r->hex_atlas_smp,
+        };
+        sg_apply_bindings(&hotbar_bind);
+
+        hotbar_vs_params_t vs_p = { .ortho = ortho };
+        sg_apply_uniforms(UB_hotbar_vs_params, &SG_RANGE(vs_p));
+
+        // Draw unselected slots with semi-transparent tint
+        for (int i = 0; i < HOTBAR_SLOTS; i++) {
+            float brightness = (i == r->hotbar_selected_slot) ? 1.0f : 0.5f;
+            float alpha = (i == r->hotbar_selected_slot) ? 1.0f : 0.7f;
+            hotbar_fs_params_t fs_p = { .tint = {{ brightness, brightness, brightness, alpha }} };
+            sg_apply_uniforms(UB_hotbar_fs_params, &SG_RANGE(fs_p));
+            sg_draw(i * 6, 6, 1);
+        }
+    }
+
     sg_end_pass();
     sg_commit();
 }
@@ -912,6 +1050,7 @@ void render_shutdown(Renderer* r) {
     hex_terrain_destroy(&r->hex_terrain);
     atmosphere_destroy(&r->atmosphere);
     lod_tree_destroy(&r->lod_tree);
+    torch_destroy(&r->torch_system);
     if (r->wireframe_idx.id != SG_INVALID_ID) {
         sg_destroy_buffer(r->wireframe_idx);
     }
@@ -944,5 +1083,11 @@ void render_shutdown(Renderer* r) {
     }
     if (r->hex_atlas_smp.id != SG_INVALID_ID) {
         sg_destroy_sampler(r->hex_atlas_smp);
+    }
+    if (r->hotbar_pip.id != SG_INVALID_ID) {
+        sg_destroy_pipeline(r->hotbar_pip);
+    }
+    if (r->hotbar_buf.id != SG_INVALID_ID) {
+        sg_destroy_buffer(r->hotbar_buf);
     }
 }

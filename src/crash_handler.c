@@ -122,6 +122,12 @@ void crash_handler_install(void) {
     if (f) fclose(f);
 }
 
+#elif defined(__EMSCRIPTEN__)
+// Emscripten: no crash handler (no execinfo, no signals for crash recovery)
+void crash_handler_install(void) {
+    // No-op on web
+}
+
 #else
 // POSIX: use signal handlers
 #include <signal.h>

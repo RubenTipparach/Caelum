@@ -247,7 +247,7 @@ static HMM_Vec3 ht_terrain_color(float height_m) {
 }
 
 // ---- Texture atlas mapping ----
-#define HEX_ATLAS_TILES 9
+#define HEX_ATLAS_TILES 10
 #define ATLAS_WATER      0
 #define ATLAS_SAND       1
 #define ATLAS_DIRT       2
@@ -257,6 +257,12 @@ static HMM_Vec3 ht_terrain_color(float height_m) {
 #define ATLAS_SNOW       6
 #define ATLAS_DIRT_GRASS  7
 #define ATLAS_DIRT_SNOW   8
+#define ATLAS_TORCH      9
+
+// Transparent voxels: don't emit hex geometry, don't occlude neighbor faces
+static inline bool is_transparent(uint8_t vtype) {
+    return vtype == VOXEL_AIR || vtype == VOXEL_TORCH;
+}
 
 static int voxel_top_atlas(VoxelType type) {
     switch (type) {
@@ -267,6 +273,7 @@ static int voxel_top_atlas(VoxelType type) {
         case VOXEL_STONE:   return ATLAS_STONE;
         case VOXEL_ICE:     return ATLAS_ICE;
         case VOXEL_BEDROCK: return ATLAS_STONE;
+        case VOXEL_TORCH:   return ATLAS_TORCH;
         default:            return ATLAS_GRASS;
     }
 }
@@ -399,7 +406,8 @@ typedef struct HexMeshJob {
 
     // 3D voxel data (generated on worker thread)
     uint8_t* voxels;  // HEX_CHUNK_SIZE * HEX_CHUNK_SIZE * HEX_CHUNK_LAYERS (malloc'd)
-    uint8_t* sky_map; // Per-voxel sky light (0..SKY_MAX), same layout as voxels (malloc'd)
+    uint8_t* sky_map;   // Per-voxel sky light (0..SKY_MAX), same layout as voxels (malloc'd)
+    uint8_t* torch_map; // Per-voxel torch light (0..TORCH_LIGHT_MAX), same layout (malloc'd)
     int base_layer;
     bool has_voxels;  // true = voxels already populated (remesh only, skip terrain gen)
     int16_t col_min_solid[HEX_CHUNK_SIZE][HEX_CHUNK_SIZE];
@@ -513,7 +521,8 @@ static void hex_emit_tri(HexVertex** verts, int* count, int* cap,
                           HMM_Vec3 winding_normal,
                           HMM_Vec3 shading_normal,
                           HexUV uv0, HexUV uv1, HexUV uv2,
-                          HMM_Vec3 vtx_color, float sky_light) {
+                          HMM_Vec3 vtx_color, float sky_light,
+                          float torch_light) {
     HMM_Vec3 e1 = vec3_sub(p1, p0);
     HMM_Vec3 e2 = vec3_sub(p2, p0);
     HMM_Vec3 face_n = vec3_cross(e1, e2);
@@ -533,6 +542,7 @@ static void hex_emit_tri(HexVertex** verts, int* count, int* cap,
         v[i].color[1] = vtx_color.Y;
         v[i].color[2] = vtx_color.Z;
         v[i].sky_light = sky_light;
+        v[i].torch_light = torch_light;
     }
 
     v[0].pos[0] = p0.X; v[0].pos[1] = p0.Y; v[0].pos[2] = p0.Z;
@@ -715,9 +725,9 @@ static void compute_sky_light(HexMeshJob* job,
     // that have been dug out (col_max_solid is recalculated from voxels).
     for (int col = 0; col < HEX_CHUNK_SIZE; col++) {
         for (int row = 0; row < HEX_CHUNK_SIZE; row++) {
-            // Scan from the TOP of the chunk downward until we hit a solid block
+            // Scan from the TOP of the chunk downward until we hit a solid (opaque) block
             for (int l = HEX_CHUNK_LAYERS - 1; l >= 0; l--) {
-                if (HEX_VOXEL(job->voxels, col, row, l) != VOXEL_AIR) break;
+                if (!is_transparent(HEX_VOXEL(job->voxels, col, row, l))) break;
                 SKY_VOXEL(sky, col, row, l) = SKY_MAX;
             }
         }
@@ -777,7 +787,7 @@ static void compute_sky_light(HexMeshJob* job,
                         int nc = ncol_g - job->cx * HEX_CHUNK_SIZE;
                         int nr = nrow_g - job->cz * HEX_CHUNK_SIZE;
                         if (nc >= 0 && nc < HEX_CHUNK_SIZE && nr >= 0 && nr < HEX_CHUNK_SIZE &&
-                            HEX_VOXEL(job->voxels, nc, nr, l) == VOXEL_AIR &&
+                            is_transparent(HEX_VOXEL(job->voxels, nc, nr, l)) &&
                             SKY_VOXEL(sky, nc, nr, l) < SKY_MAX) {
                             needs_seed = true;
                         }
@@ -806,7 +816,7 @@ static void compute_sky_light(HexMeshJob* job,
         for (int dv = -1; dv <= 1; dv += 2) {
             int nl = l + dv;
             if (nl < 0 || nl >= HEX_CHUNK_LAYERS) continue;
-            if (HEX_VOXEL(job->voxels, c, r, nl) != VOXEL_AIR) continue;
+            if (!is_transparent(HEX_VOXEL(job->voxels, c, r, nl))) continue;
 
             // Sky column rule: downward from SKY_MAX stays SKY_MAX
             uint8_t new_light;
@@ -836,7 +846,7 @@ static void compute_sky_light(HexMeshJob* job,
 
             if (nc < 0 || nc >= HEX_CHUNK_SIZE || nr_local < 0 || nr_local >= HEX_CHUNK_SIZE)
                 continue;
-            if (HEX_VOXEL(job->voxels, nc, nr_local, l) != VOXEL_AIR) continue;
+            if (!is_transparent(HEX_VOXEL(job->voxels, nc, nr_local, l))) continue;
 
             uint8_t new_light = current - 1;
             if (new_light > SKY_VOXEL(sky, nc, nr_local, l)) {
@@ -859,6 +869,102 @@ static float read_sky_light(const HexMeshJob* job, int col, int row, int layer) 
     if (layer < 0 || layer >= HEX_CHUNK_LAYERS) return 1.0f;
     if (col < 0 || col >= HEX_CHUNK_SIZE || row < 0 || row >= HEX_CHUNK_SIZE) return 1.0f;
     return (float)SKY_VOXEL(job->sky_map, col, row, layer) / (float)SKY_MAX;
+}
+
+// ---- Torch BFS lighting ----
+
+#define TORCH_LIGHT_MAX   15
+#define TORCH_BFS_CAP     SKY_BFS_CAP
+#define TORCH_VOXEL(map, col, row, layer) \
+    ((map)[(col) * HEX_CHUNK_SIZE * HEX_CHUNK_LAYERS + (row) * HEX_CHUNK_LAYERS + (layer)])
+
+static void compute_torch_light(HexMeshJob* job) {
+    size_t voxel_count = (size_t)HEX_CHUNK_SIZE * HEX_CHUNK_SIZE * HEX_CHUNK_LAYERS;
+    uint8_t* torch = (uint8_t*)calloc(voxel_count, 1);
+    job->torch_map = torch;
+
+    int* queue = (int*)malloc(TORCH_BFS_CAP * sizeof(int));
+    int qhead = 0, qtail = 0;
+
+    // Seed from all VOXEL_TORCH positions in this chunk
+    for (int col = 0; col < HEX_CHUNK_SIZE; col++) {
+        for (int row = 0; row < HEX_CHUNK_SIZE; row++) {
+            int min_s = job->col_min_solid[col][row];
+            int max_s = job->col_max_solid[col][row];
+            if (min_s > max_s) continue;
+            for (int l = min_s; l <= max_s; l++) {
+                if (HEX_VOXEL(job->voxels, col, row, l) == VOXEL_TORCH) {
+                    TORCH_VOXEL(torch, col, row, l) = TORCH_LIGHT_MAX;
+                    if (qtail < TORCH_BFS_CAP) {
+                        queue[qtail++] = col * HEX_CHUNK_SIZE * HEX_CHUNK_LAYERS
+                                       + row * HEX_CHUNK_LAYERS + l;
+                    }
+                }
+            }
+        }
+    }
+
+    // BFS flood-fill (same structure as sky light Pass 3, but no sky-column rule)
+    while (qhead < qtail) {
+        int idx = queue[qhead++];
+        int c   = idx / (HEX_CHUNK_SIZE * HEX_CHUNK_LAYERS);
+        int rem = idx % (HEX_CHUNK_SIZE * HEX_CHUNK_LAYERS);
+        int r   = rem / HEX_CHUNK_LAYERS;
+        int l   = rem % HEX_CHUNK_LAYERS;
+
+        uint8_t current = TORCH_VOXEL(torch, c, r, l);
+        if (current <= 1) continue;
+
+        // Vertical neighbors (up and down) — always decay by 1
+        for (int dv = -1; dv <= 1; dv += 2) {
+            int nl = l + dv;
+            if (nl < 0 || nl >= HEX_CHUNK_LAYERS) continue;
+            uint8_t nv = HEX_VOXEL(job->voxels, c, r, nl);
+            if (!is_transparent(nv)) continue;
+
+            uint8_t new_light = current - 1;
+            if (new_light > TORCH_VOXEL(torch, c, r, nl)) {
+                TORCH_VOXEL(torch, c, r, nl) = new_light;
+                if (qtail < TORCH_BFS_CAP) {
+                    queue[qtail++] = c * HEX_CHUNK_SIZE * HEX_CHUNK_LAYERS
+                                   + r * HEX_CHUNK_LAYERS + nl;
+                }
+            }
+        }
+
+        // 6 lateral hex neighbors (in-chunk only)
+        int gcol = job->cx * HEX_CHUNK_SIZE + c;
+        int grow = job->cz * HEX_CHUNK_SIZE + r;
+        for (int dir = 0; dir < 6; dir++) {
+            int ncol_g, nrow_g;
+            hex_neighbor(gcol, grow, dir, &ncol_g, &nrow_g);
+            int nc = ncol_g - job->cx * HEX_CHUNK_SIZE;
+            int nr_local = nrow_g - job->cz * HEX_CHUNK_SIZE;
+
+            if (nc < 0 || nc >= HEX_CHUNK_SIZE || nr_local < 0 || nr_local >= HEX_CHUNK_SIZE)
+                continue;
+            uint8_t nv = HEX_VOXEL(job->voxels, nc, nr_local, l);
+            if (!is_transparent(nv)) continue;
+
+            uint8_t new_light = current - 1;
+            if (new_light > TORCH_VOXEL(torch, nc, nr_local, l)) {
+                TORCH_VOXEL(torch, nc, nr_local, l) = new_light;
+                if (qtail < TORCH_BFS_CAP) {
+                    queue[qtail++] = nc * HEX_CHUNK_SIZE * HEX_CHUNK_LAYERS
+                                   + nr_local * HEX_CHUNK_LAYERS + l;
+                }
+            }
+        }
+    }
+
+    free(queue);
+}
+
+static float read_torch_light(const HexMeshJob* job, int col, int row, int layer) {
+    if (!job->torch_map) return 0.0f;
+    if (layer < 0 || layer >= HEX_CHUNK_LAYERS) return 0.0f;
+    if (col < 0 || col >= HEX_CHUNK_SIZE || row < 0 || row >= HEX_CHUNK_SIZE) return 0.0f;
+    return (float)TORCH_VOXEL(job->torch_map, col, row, layer) / (float)TORCH_LIGHT_MAX;
 }
 
 // ---- Timing helper (thread-safe) ----
@@ -1048,6 +1154,8 @@ static void generate_chunk_mesh(HexMeshJob* job) {
     // Phase 2d: BFS sky light propagation
     double t_bedrock = timer_ms();
     compute_sky_light(job, &continental, &mountain, &warp, &detail);
+    // Phase 2e: BFS torch light propagation
+    compute_torch_light(job);
     double t_skylight = timer_ms();
 
     // Phase 3: Generate mesh geometry
@@ -1126,7 +1234,7 @@ static void generate_chunk_mesh(HexMeshJob* job) {
                     hex_emit_tri(&job->vertices, &job->vertex_count, &cap,
                         hex_verts_top[0], hex_verts_top[i + 1], hex_verts_top[i + 2],
                         local_up, slope_normal, top_uvs[0], top_uvs[i + 1], top_uvs[i + 2],
-                        col_color, 1.0f);
+                        col_color, 1.0f, 0.0f);
                 }
                 continue;
             }
@@ -1169,15 +1277,15 @@ static void generate_chunk_mesh(HexMeshJob* job) {
 
             for (int l = min_s; l <= max_s; l++) {
                 uint8_t vtype = HEX_VOXEL(job->voxels, col, row, l);
-                if (vtype == VOXEL_AIR) continue;
+                if (is_transparent(vtype)) continue;
 
                 int world_layer = l + job->base_layer;
                 float bot_r = job->planet_radius + world_layer * HEX_HEIGHT + HEX_SURFACE_BIAS;
                 float top_r = bot_r + HEX_HEIGHT;
 
-                // --- TOP FACE: emit if layer above is AIR ---
+                // --- TOP FACE: emit if layer above is transparent ---
                 uint8_t above = job_get_voxel(job, col, row, l + 1);
-                if (above == VOXEL_AIR) {
+                if (is_transparent(above)) {
                     // Column sky light from the air block above this face
                     float face_sky = read_sky_light(job, col, row, l + 1);
                     if (face_sky < 0.05f) face_sky = 0.05f;
@@ -1189,17 +1297,18 @@ static void generate_chunk_mesh(HexMeshJob* job) {
                         verts[i] = vec3_scale(hex_dirs[i], top_r);
                         uvs[i] = hex_top_uv(hex_vx[i], hex_vz[i], lx, lz, atlas);
                     }
+                    float face_torch = read_torch_light(job, col, row, l + 1);
                     for (int i = 0; i < 4; i++) {
                         hex_emit_tri(&job->vertices, &job->vertex_count, &cap,
                             verts[0], verts[i + 1], verts[i + 2],
                             local_up, slope_normal, uvs[0], uvs[i + 1], uvs[i + 2],
-                            col_color, face_sky);
+                            col_color, face_sky, face_torch);
                     }
                 }
 
-                // --- BOTTOM FACE: emit if layer below is AIR ---
+                // --- BOTTOM FACE: emit if layer below is transparent ---
                 uint8_t below = job_get_voxel(job, col, row, l - 1);
-                if (below == VOXEL_AIR) {
+                if (is_transparent(below)) {
                     // Column sky light from the air block below, with mild ceiling penalty
                     float face_sky = read_sky_light(job, col, row, l - 1) * 0.85f;
                     if (face_sky < 0.05f) face_sky = 0.05f;
@@ -1212,11 +1321,12 @@ static void generate_chunk_mesh(HexMeshJob* job) {
                         uvs[i] = hex_top_uv(hex_vx[i], hex_vz[i], lx, lz, atlas);
                     }
                     // Reversed winding for bottom face
+                    float face_torch = read_torch_light(job, col, row, l - 1);
                     for (int i = 0; i < 4; i++) {
                         hex_emit_tri(&job->vertices, &job->vertex_count, &cap,
                             verts[0], verts[i + 2], verts[i + 1],
                             local_down, local_down, uvs[0], uvs[i + 2], uvs[i + 1],
-                            col_color, face_sky);
+                            col_color, face_sky, face_torch);
                     }
                 }
 
@@ -1224,10 +1334,11 @@ static void generate_chunk_mesh(HexMeshJob* job) {
                 for (int dir = 0; dir < 6; dir++) {
                     uint8_t nv = job_get_neighbor_voxel(job, &continental, &mountain, &warp, &detail,
                                                          col, row, l, dir);
-                    if (nv != VOXEL_AIR) continue;
+                    if (!is_transparent(nv)) continue;
 
                     // Column sky light from the air block the side faces into
                     float face_sky = 1.0f;  // default for cross-chunk
+                    float face_torch = 0.0f;
                     {
                         int ncol_g, nrow_g;
                         hex_neighbor(job->cx * HEX_CHUNK_SIZE + col,
@@ -1237,6 +1348,7 @@ static void generate_chunk_mesh(HexMeshJob* job) {
                         if (nc >= 0 && nc < HEX_CHUNK_SIZE &&
                             nr_local >= 0 && nr_local < HEX_CHUNK_SIZE) {
                             face_sky = read_sky_light(job, nc, nr_local, l);
+                            face_torch = read_torch_light(job, nc, nr_local, l);
                         }
                     }
                     if (face_sky < 0.05f) face_sky = 0.05f;
@@ -1258,10 +1370,10 @@ static void generate_chunk_mesh(HexMeshJob* job) {
 
                     hex_emit_tri(&job->vertices, &job->vertex_count, &cap,
                         p0b, p1b, p1t, wall_outs[dir], local_up, wuv00, wuv10, wuv11,
-                        col_color, face_sky);
+                        col_color, face_sky, face_torch);
                     hex_emit_tri(&job->vertices, &job->vertex_count, &cap,
                         p0b, p1t, p0t, wall_outs[dir], local_up, wuv00, wuv11, wuv01,
-                        col_color, face_sky);
+                        col_color, face_sky, face_torch);
                 }
             }
         }
@@ -1296,7 +1408,7 @@ static void generate_chunk_mesh(HexMeshJob* job) {
 
             for (int l = min_s; l <= max_s; l++) {
                 uint8_t vtype = HEX_VOXEL(job->voxels, col, row, l);
-                if (vtype == VOXEL_AIR) continue;
+                if (is_transparent(vtype)) continue;
 
                 int world_layer = l + job->base_layer;
                 float bot_r = job->planet_radius + world_layer * HEX_HEIGHT + HEX_SURFACE_BIAS;
@@ -1305,7 +1417,7 @@ static void generate_chunk_mesh(HexMeshJob* job) {
                 // Top face outline: hexagon at top_r
                 uint8_t above = (l + 1 < HEX_CHUNK_LAYERS)
                     ? HEX_VOXEL(job->voxels, col, row, l + 1) : VOXEL_AIR;
-                if (above == VOXEL_AIR) {
+                if (is_transparent(above)) {
                     for (int i = 0; i < 6; i++) {
                         HMM_Vec3 a = vec3_scale(hex_wire_dirs[i], top_r);
                         HMM_Vec3 b = vec3_scale(hex_wire_dirs[(i + 1) % 6], top_r);
@@ -1317,7 +1429,7 @@ static void generate_chunk_mesh(HexMeshJob* job) {
                 // Bottom face outline: hexagon at bot_r
                 uint8_t below = (l - 1 >= 0)
                     ? HEX_VOXEL(job->voxels, col, row, l - 1) : VOXEL_AIR;
-                if (below == VOXEL_AIR) {
+                if (is_transparent(below)) {
                     for (int i = 0; i < 6; i++) {
                         HMM_Vec3 a = vec3_scale(hex_wire_dirs[i], bot_r);
                         HMM_Vec3 b = vec3_scale(hex_wire_dirs[(i + 1) % 6], bot_r);
@@ -1334,7 +1446,7 @@ static void generate_chunk_mesh(HexMeshJob* job) {
                     int nr = nrow_g - job->cz * HEX_CHUNK_SIZE;
                     bool exposed = true;
                     if (nc >= 0 && nc < HEX_CHUNK_SIZE && nr >= 0 && nr < HEX_CHUNK_SIZE) {
-                        exposed = (HEX_VOXEL(job->voxels, nc, nr, l) == VOXEL_AIR);
+                        exposed = is_transparent(HEX_VOXEL(job->voxels, nc, nr, l));
                     }
                     if (exposed) {
                         int edge = DIR_TO_EDGE[dir];
@@ -1368,10 +1480,14 @@ static void generate_chunk_mesh(HexMeshJob* job) {
         job->wire_verts[i + 2] -= job->origin[2];
     }
 
-    // Free sky_map (only needed during mesh gen, not after)
+    // Free light maps (only needed during mesh gen, not after)
     if (job->sky_map) {
         free(job->sky_map);
         job->sky_map = NULL;
+    }
+    if (job->torch_map) {
+        free(job->torch_map);
+        job->torch_map = NULL;
     }
 
     double t_end = timer_ms();
@@ -1417,6 +1533,7 @@ static void sweep_orphans(void) {
             if (job->vertices) free(job->vertices);
             if (job->voxels) free(job->voxels);
             if (job->sky_map) free(job->sky_map);
+            if (job->torch_map) free(job->torch_map);
             if (job->wire_verts) free(job->wire_verts);
             free(job);
         } else {
@@ -1489,6 +1606,7 @@ static void free_chunk(HexChunk* chunk) {
             if (job->vertices) free(job->vertices);
             if (job->voxels) free(job->voxels);
             if (job->sky_map) free(job->sky_map);
+            if (job->torch_map) free(job->torch_map);
             if (job->wire_verts) free(job->wire_verts);
             free(job);
         } else {
@@ -1500,6 +1618,7 @@ static void free_chunk(HexChunk* chunk) {
     chunk->active = false;
     chunk->dirty = false;
     chunk->generating = false;
+    chunk->torch_scanned = false;
 }
 
 // Update column min/max solid caches after voxel modification
@@ -1559,6 +1678,7 @@ void hex_terrain_destroy(HexTerrain* ht) {
         if (job->vertices) free(job->vertices);
         if (job->voxels) free(job->voxels);
         if (job->sky_map) free(job->sky_map);
+        if (job->torch_map) free(job->torch_map);
         if (job->wire_verts) free(job->wire_verts);
         free(job);
     }
@@ -1658,6 +1778,7 @@ void hex_terrain_update(HexTerrain* ht, HMM_Vec3 camera_pos,
             chunk->base_layer = job->base_layer;
             memcpy(chunk->col_min_solid, job->col_min_solid, sizeof(chunk->col_min_solid));
             memcpy(chunk->col_max_solid, job->col_max_solid, sizeof(chunk->col_max_solid));
+            chunk->torch_scanned = false;  // Re-scan for torch instances
         }
 
         free(job);
@@ -2092,7 +2213,8 @@ bool hex_terrain_break(HexTerrain* ht, const HexHitResult* hit) {
     if (local_layer < 0 || local_layer >= HEX_CHUNK_LAYERS) return false;
 
     // Bedrock is unbreakable
-    if (HEX_VOXEL(chunk->voxels, hit->col, hit->row, local_layer) == VOXEL_BEDROCK) return false;
+    uint8_t broken_type = HEX_VOXEL(chunk->voxels, hit->col, hit->row, local_layer);
+    if (broken_type == VOXEL_BEDROCK) return false;
 
     HEX_VOXEL(chunk->voxels, hit->col, hit->row, local_layer) = VOXEL_AIR;
     update_column_cache(chunk, hit->col, hit->row);
@@ -2106,19 +2228,30 @@ bool hex_terrain_break(HexTerrain* ht, const HexHitResult* hit) {
         edit_cache_record(&ht->edits, ux, uy, uz, hit->layer, VOXEL_AIR);
     }
 
-    // Dirty neighbor chunks if at chunk boundary
-    if (hit->col == 0 || hit->col == HEX_CHUNK_SIZE - 1 ||
-        hit->row == 0 || hit->row == HEX_CHUNK_SIZE - 1) {
-        for (int dir = 0; dir < 6; dir++) {
-            int ncol_g, nrow_g;
-            hex_neighbor(hit->gcol, hit->grow, dir, &ncol_g, &nrow_g);
-            int ncx = (int)floorf((float)ncol_g / HEX_CHUNK_SIZE);
-            int ncz = (int)floorf((float)nrow_g / HEX_CHUNK_SIZE);
-            if (ncx != chunk->cx || ncz != chunk->cz) {
-                int ni = find_chunk(ht, ncx, ncz);
-                if (ni >= 0) {
-                    ht->chunks[ni].dirty = true;
-                    ht->chunks[ni].edit_dirty = true;
+    // Dirty neighbor chunks if at chunk boundary OR breaking a torch (light bleeds across chunks)
+    bool at_boundary = (hit->col == 0 || hit->col == HEX_CHUNK_SIZE - 1 ||
+                        hit->row == 0 || hit->row == HEX_CHUNK_SIZE - 1);
+    if (at_boundary || broken_type == VOXEL_TORCH) {
+        for (int i = 0; i < HEX_MAX_CHUNKS; i++) {
+            if (!ht->chunks[i].active || i == hit->chunk_index) continue;
+            // For torch breaks, dirty all nearby chunks (light radius ~15 blocks)
+            if (broken_type == VOXEL_TORCH) {
+                int dx = ht->chunks[i].cx - chunk->cx;
+                int dz = ht->chunks[i].cz - chunk->cz;
+                if (dx >= -1 && dx <= 1 && dz >= -1 && dz <= 1) {
+                    ht->chunks[i].dirty = true;
+                }
+            } else if (at_boundary) {
+                // Original boundary-only logic for non-torch blocks
+                for (int dir = 0; dir < 6; dir++) {
+                    int ncol_g, nrow_g;
+                    hex_neighbor(hit->gcol, hit->grow, dir, &ncol_g, &nrow_g);
+                    int ncx = (int)floorf((float)ncol_g / HEX_CHUNK_SIZE);
+                    int ncz = (int)floorf((float)nrow_g / HEX_CHUNK_SIZE);
+                    if (ncx == ht->chunks[i].cx && ncz == ht->chunks[i].cz) {
+                        ht->chunks[i].dirty = true;
+                        ht->chunks[i].edit_dirty = true;
+                    }
                 }
             }
         }
@@ -2163,19 +2296,29 @@ bool hex_terrain_place(HexTerrain* ht, const HexHitResult* hit, uint8_t voxel_ty
         edit_cache_record(&ht->edits, ux, uy, uz, place_layer, voxel_type);
     }
 
-    // Dirty neighbor chunks if at boundary
-    if (local_col == 0 || local_col == HEX_CHUNK_SIZE - 1 ||
-        local_row == 0 || local_row == HEX_CHUNK_SIZE - 1) {
-        for (int dir = 0; dir < 6; dir++) {
-            int ncol_g, nrow_g;
-            hex_neighbor(place_gcol, place_grow, dir, &ncol_g, &nrow_g);
-            int ncx = (int)floorf((float)ncol_g / HEX_CHUNK_SIZE);
-            int ncz = (int)floorf((float)nrow_g / HEX_CHUNK_SIZE);
-            if (ncx != chunk->cx || ncz != chunk->cz) {
-                int ni = find_chunk(ht, ncx, ncz);
-                if (ni >= 0) {
-                    ht->chunks[ni].dirty = true;
-                    ht->chunks[ni].edit_dirty = true;
+    // Dirty neighbor chunks if at boundary OR placing a torch (light bleeds across chunks)
+    bool at_boundary = (local_col == 0 || local_col == HEX_CHUNK_SIZE - 1 ||
+                        local_row == 0 || local_row == HEX_CHUNK_SIZE - 1);
+    if (at_boundary || voxel_type == VOXEL_TORCH) {
+        for (int i = 0; i < HEX_MAX_CHUNKS; i++) {
+            if (!ht->chunks[i].active) continue;
+            if (ht->chunks[i].cx == cx && ht->chunks[i].cz == cz) continue;
+            if (voxel_type == VOXEL_TORCH) {
+                int dx = ht->chunks[i].cx - cx;
+                int dz = ht->chunks[i].cz - cz;
+                if (dx >= -1 && dx <= 1 && dz >= -1 && dz <= 1) {
+                    ht->chunks[i].dirty = true;
+                }
+            } else if (at_boundary) {
+                for (int dir = 0; dir < 6; dir++) {
+                    int ncol_g, nrow_g;
+                    hex_neighbor(place_gcol, place_grow, dir, &ncol_g, &nrow_g);
+                    int ncx = (int)floorf((float)ncol_g / HEX_CHUNK_SIZE);
+                    int ncz = (int)floorf((float)nrow_g / HEX_CHUNK_SIZE);
+                    if (ncx == ht->chunks[i].cx && ncz == ht->chunks[i].cz) {
+                        ht->chunks[i].dirty = true;
+                        ht->chunks[i].edit_dirty = true;
+                    }
                 }
             }
         }
@@ -2465,11 +2608,11 @@ float hex_terrain_ground_height(const HexTerrain* ht, int gcol, int grow) {
     if (max_s < 0) return ht->planet_radius + chunk->base_layer * HEX_HEIGHT;
 
     for (int l = max_s; l >= 0; l--) {
-        if (HEX_VOXEL(chunk->voxels, local_col, local_row, l) != VOXEL_AIR) {
+        if (!is_transparent(HEX_VOXEL(chunk->voxels, local_col, local_row, l))) {
             uint8_t above = (l + 1 < HEX_CHUNK_LAYERS)
                 ? HEX_VOXEL(chunk->voxels, local_col, local_row, l + 1)
                 : VOXEL_AIR;
-            if (above == VOXEL_AIR) {
+            if (is_transparent(above)) {
                 int world_layer = l + chunk->base_layer;
                 return ht->planet_radius + (world_layer + 1) * HEX_HEIGHT;
             }
@@ -2499,13 +2642,13 @@ float hex_terrain_ground_height_below(const HexTerrain* ht, int gcol, int grow,
     if (start_local >= HEX_CHUNK_LAYERS) start_local = HEX_CHUNK_LAYERS - 1;
     if (start_local < 0) return ht->planet_radius + chunk->base_layer * HEX_HEIGHT;
 
-    // Scan downward from start_local to find topmost solid with air above
+    // Scan downward from start_local to find topmost solid with transparent above
     for (int l = start_local; l >= 0; l--) {
-        if (HEX_VOXEL(chunk->voxels, local_col, local_row, l) != VOXEL_AIR) {
+        if (!is_transparent(HEX_VOXEL(chunk->voxels, local_col, local_row, l))) {
             uint8_t above = (l + 1 < HEX_CHUNK_LAYERS)
                 ? HEX_VOXEL(chunk->voxels, local_col, local_row, l + 1)
                 : VOXEL_AIR;
-            if (above == VOXEL_AIR) {
+            if (is_transparent(above)) {
                 int world_layer = l + chunk->base_layer;
                 return ht->planet_radius + (world_layer + 1) * HEX_HEIGHT;
             }
@@ -2534,4 +2677,25 @@ void hex_terrain_world_to_hex(const HexTerrain* ht, HMM_Vec3 world_pos,
     float point_r = sqrtf(vec3_dot(world_pos, world_pos));
     float altitude = point_r - ht->planet_radius;
     *out_layer = (int)floorf(altitude / HEX_HEIGHT);
+}
+
+void hex_terrain_hex_to_world(const HexTerrain* ht, int gcol, int grow, int layer,
+                               float* out_x, float* out_y, float* out_z,
+                               float* out_up_x, float* out_up_y, float* out_up_z) {
+    if (!ht->frame_valid) {
+        *out_x = *out_y = *out_z = 0.0f;
+        *out_up_x = 0.0f; *out_up_y = 1.0f; *out_up_z = 0.0f;
+        return;
+    }
+    float lx, lz;
+    hex_local_pos(gcol, grow, &lx, &lz);
+    float radius = ht->planet_radius + layer * HEX_HEIGHT + HEX_SURFACE_BIAS;
+    HMM_Vec3 pos = tangent_to_world(ht, lx, lz, radius);
+    *out_x = pos.X;
+    *out_y = pos.Y;
+    *out_z = pos.Z;
+    HMM_Vec3 up = vec3_normalize(pos);
+    *out_up_x = up.X;
+    *out_up_y = up.Y;
+    *out_up_z = up.Z;
 }

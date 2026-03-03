@@ -159,8 +159,46 @@ void job_system_destroy(JobSystem* sys) {
     fflush(stdout);
 }
 
+#elif defined(__EMSCRIPTEN__)
+// ---- Emscripten single-threaded fallback (no pthreads) ----
+// Jobs execute synchronously on submit — no worker threads.
+
+struct JobSystem {
+    int dummy;
+};
+
+JobSystem* job_system_create(int num_workers) {
+    (void)num_workers;
+    JobSystem* sys = (JobSystem*)calloc(1, sizeof(JobSystem));
+    printf("[JOBS] Created single-threaded job system (Emscripten)\n");
+    fflush(stdout);
+    return sys;
+}
+
+void job_system_submit(JobSystem* sys, JobFunc func, void* data) {
+    (void)sys;
+    if (func) func(data);
+}
+
+bool job_system_try_submit(JobSystem* sys, JobFunc func, void* data) {
+    (void)sys;
+    if (func) func(data);
+    return true;
+}
+
+int job_system_pending(JobSystem* sys) {
+    (void)sys;
+    return 0;
+}
+
+void job_system_destroy(JobSystem* sys) {
+    free(sys);
+    printf("[JOBS] Job system destroyed\n");
+    fflush(stdout);
+}
+
 #else
-// ---- POSIX / Emscripten fallback (pthreads) ----
+// ---- POSIX fallback (pthreads) ----
 
 #include <pthread.h>
 
