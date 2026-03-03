@@ -10,6 +10,7 @@
 #include "HandmadeMath.h"
 
 #include <stdio.h>
+#include <string.h>
 #include <math.h>
 
 #ifdef _WIN32
