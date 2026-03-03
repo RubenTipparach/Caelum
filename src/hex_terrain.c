@@ -361,19 +361,26 @@ static void pixel_to_hex(float px, float pz, int* out_col, int* out_row) {
     axial_to_offset(qi, ri, out_col, out_row);
 }
 
-// ---- Spherical coordinate helpers (for voxel edit persistence) ----
+// ---- Unit-sphere helpers (for voxel edit persistence) ----
 
-// Convert hex grid (gcol, grow) to spherical (lon, lat) using current tangent frame
-static void gcol_grow_to_lonlat(const HexTerrain* ht, int gcol, int grow,
-                                 float* out_lon, float* out_lat) {
+// Convert hex grid (gcol, grow) to 64-bit unit-sphere direction.
+// No polar singularity — doubles preserve full precision everywhere.
+static void gcol_grow_to_unit(const HexTerrain* ht, int gcol, int grow,
+                               double* out_ux, double* out_uy, double* out_uz) {
     float lx, lz;
     hex_local_pos(gcol, grow, &lx, &lz);
     HMM_Vec3 world_dir = vec3_normalize(
         vec3_add(ht->tangent_origin,
             vec3_add(vec3_scale(ht->tangent_east, lx),
                      vec3_scale(ht->tangent_north, lz))));
-    *out_lon = atan2f(world_dir.Z, world_dir.X);
-    *out_lat = asinf(world_dir.Y);
+    // Promote to double for stable storage
+    double dx = (double)world_dir.X;
+    double dy = (double)world_dir.Y;
+    double dz = (double)world_dir.Z;
+    double len = sqrt(dx*dx + dy*dy + dz*dz);
+    *out_ux = dx / len;
+    *out_uy = dy / len;
+    *out_uz = dz / len;
 }
 
 // ---- Mesh generation job ----
@@ -418,17 +425,13 @@ typedef struct HexMeshJob {
     const EditCache* edit_cache;
 } HexMeshJob;
 
-// ---- Spherical → hex grid under job's tangent frame ----
+// ---- Unit-sphere → hex grid under job's tangent frame ----
 
-static void lonlat_to_gcol_grow(const HexMeshJob* job, float lon, float lat,
-                                 int* out_gcol, int* out_grow) {
-    float cos_lat = cosf(lat);
-    HMM_Vec3 unit_pos;
-    unit_pos.X = cos_lat * cosf(lon);
-    unit_pos.Y = sinf(lat);
-    unit_pos.Z = cos_lat * sinf(lon);
+static void unit_to_gcol_grow(const HexMeshJob* job, double ux, double uy, double uz,
+                               int* out_gcol, int* out_grow) {
+    // Use float tangent-plane projection (sufficient for local hex lookup)
+    HMM_Vec3 unit_pos = {{(float)ux, (float)uy, (float)uz}};
 
-    // Project onto tangent plane (same math as world_to_tangent)
     HMM_Vec3 tangent_up = vec3_normalize(job->tangent_origin);
     float cos_theta = vec3_dot(unit_pos, tangent_up);
     if (cos_theta < 0.01f) { *out_gcol = 0; *out_grow = 0; return; }
@@ -440,13 +443,30 @@ static void lonlat_to_gcol_grow(const HexMeshJob* job, float lon, float lat,
     pixel_to_hex(lx, lz, out_gcol, out_grow);
 }
 
-static void compute_chunk_lonlat_bounds(const HexMeshJob* job,
-                                         float* lon_min, float* lon_max,
-                                         float* lat_min, float* lat_max) {
-    *lon_min = 1e9f; *lon_max = -1e9f;
-    *lat_min = 1e9f; *lat_max = -1e9f;
+// Compute cube-map sector key range for a chunk (for edit queries).
+static void compute_chunk_sector_bounds(const HexMeshJob* job,
+                                         int8_t* out_face,
+                                         int16_t* u_min, int16_t* u_max,
+                                         int16_t* v_min, int16_t* v_max) {
+    // Compute chunk center unit vector for cube-map face determination
+    int center_gcol = job->cx * HEX_CHUNK_SIZE + HEX_CHUNK_SIZE / 2;
+    int center_grow = job->cz * HEX_CHUNK_SIZE + HEX_CHUNK_SIZE / 2;
+    float clx, clz;
+    hex_local_pos(center_gcol, center_grow, &clx, &clz);
+    HMM_Vec3 center_dir = vec3_normalize(
+        vec3_add(job->tangent_origin,
+            vec3_add(vec3_scale(job->tangent_east, clx),
+                     vec3_scale(job->tangent_north, clz))));
 
-    // Sample 4 corners of the chunk
+    int8_t face;
+    float center_u, center_v;
+    edit_unit_to_cubemap(center_dir, &face, &center_u, &center_v);
+    *out_face = face;
+
+    // Project all 4 corners to cube-map UV on the same face
+    float uv_min_u = center_u, uv_max_u = center_u;
+    float uv_min_v = center_v, uv_max_v = center_v;
+
     int corners[4][2] = { {0, 0}, {HEX_CHUNK_SIZE - 1, 0},
                           {0, HEX_CHUNK_SIZE - 1}, {HEX_CHUNK_SIZE - 1, HEX_CHUNK_SIZE - 1} };
     for (int c = 0; c < 4; c++) {
@@ -458,18 +478,30 @@ static void compute_chunk_lonlat_bounds(const HexMeshJob* job,
             vec3_add(job->tangent_origin,
                 vec3_add(vec3_scale(job->tangent_east, lx),
                          vec3_scale(job->tangent_north, lz))));
-        float lon = atan2f(dir.Z, dir.X);
-        float lat = asinf(dir.Y);
-        if (lon < *lon_min) *lon_min = lon;
-        if (lon > *lon_max) *lon_max = lon;
-        if (lat < *lat_min) *lat_min = lat;
-        if (lat > *lat_max) *lat_max = lat;
+
+        int8_t cf;
+        float cu, cv;
+        edit_unit_to_cubemap(dir, &cf, &cu, &cv);
+        // If corner is on same face, use its UV; otherwise ignore (chunk is tiny)
+        if (cf == face) {
+            if (cu < uv_min_u) uv_min_u = cu;
+            if (cu > uv_max_u) uv_max_u = cu;
+            if (cv < uv_min_v) uv_min_v = cv;
+            if (cv > uv_max_v) uv_max_v = cv;
+        }
     }
 
-    // Pad to handle hex columns straddling the boundary
+    // Pad by 2 hex spacings to catch edits at chunk edges
     float pad = 2.0f * HEX_ROW_SPACING / job->planet_radius;
-    *lon_min -= pad; *lon_max += pad;
-    *lat_min -= pad; *lat_max += pad;
+    uv_min_u -= pad; uv_max_u += pad;
+    uv_min_v -= pad; uv_max_v += pad;
+
+    // Convert UV to sector indices
+    float sector_uv = EDIT_SECTOR_SIZE_M / job->planet_radius;
+    *u_min = (int16_t)floorf(uv_min_u / sector_uv);
+    *u_max = (int16_t)floorf(uv_max_u / sector_uv);
+    *v_min = (int16_t)floorf(uv_min_v / sector_uv);
+    *v_max = (int16_t)floorf(uv_max_v / sector_uv);
 }
 
 // ---- Emit triangle helper (textured) ----
@@ -961,18 +993,19 @@ static void generate_chunk_mesh(HexMeshJob* job) {
 
         // Phase 2b2: Apply persisted voxel edits from disk cache
         if (job->edit_cache) {
-            float lon_min, lon_max, lat_min, lat_max;
-            compute_chunk_lonlat_bounds(job, &lon_min, &lon_max, &lat_min, &lat_max);
+            int8_t qface;
+            int16_t qu_min, qu_max, qv_min, qv_max;
+            compute_chunk_sector_bounds(job, &qface, &qu_min, &qu_max, &qv_min, &qv_max);
 
             VoxelEdit chunk_edits[512];
             int num_edits = edit_cache_query_area(job->edit_cache,
-                lon_min, lon_max, lat_min, lat_max,
+                qface, qu_min, qu_max, qv_min, qv_max,
                 chunk_edits, 512);
 
             for (int e = 0; e < num_edits; e++) {
                 int egcol, egrow;
-                lonlat_to_gcol_grow(job, chunk_edits[e].lon, chunk_edits[e].lat,
-                                     &egcol, &egrow);
+                unit_to_gcol_grow(job, chunk_edits[e].ux, chunk_edits[e].uy,
+                                   chunk_edits[e].uz, &egcol, &egrow);
 
                 int local_col = egcol - job->cx * HEX_CHUNK_SIZE;
                 int local_row = egrow - job->cz * HEX_CHUNK_SIZE;
@@ -2068,9 +2101,9 @@ bool hex_terrain_break(HexTerrain* ht, const HexHitResult* hit) {
 
     // Persist edit to disk-backed sector cache
     {
-        float lon, lat;
-        gcol_grow_to_lonlat(ht, hit->gcol, hit->grow, &lon, &lat);
-        edit_cache_record(&ht->edits, lon, lat, hit->layer, VOXEL_AIR);
+        double ux, uy, uz;
+        gcol_grow_to_unit(ht, hit->gcol, hit->grow, &ux, &uy, &uz);
+        edit_cache_record(&ht->edits, ux, uy, uz, hit->layer, VOXEL_AIR);
     }
 
     // Dirty neighbor chunks if at chunk boundary
@@ -2125,9 +2158,9 @@ bool hex_terrain_place(HexTerrain* ht, const HexHitResult* hit, uint8_t voxel_ty
 
     // Persist edit to disk-backed sector cache
     {
-        float lon, lat;
-        gcol_grow_to_lonlat(ht, place_gcol, place_grow, &lon, &lat);
-        edit_cache_record(&ht->edits, lon, lat, place_layer, voxel_type);
+        double ux, uy, uz;
+        gcol_grow_to_unit(ht, place_gcol, place_grow, &ux, &uy, &uz);
+        edit_cache_record(&ht->edits, ux, uy, uz, place_layer, voxel_type);
     }
 
     // Dirty neighbor chunks if at boundary
