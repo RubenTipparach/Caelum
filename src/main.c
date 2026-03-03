@@ -4,6 +4,7 @@
 #include "sokol_log.h"
 #include "sokol_time.h"
 #include "util/sokol_debugtext.h"
+#include "util/sokol_gl.h"
 
 #define HANDMADE_MATH_IMPLEMENTATION
 #include "HandmadeMath.h"
@@ -83,8 +84,9 @@ static struct {
 bool log_verbose = false;
 
 // Menu state
-static int menu_selected = 0;   // 0 = single player, 1 = multiplayer
+static int menu_selected = 0;   // keyboard selection: 0 = single player, 1 = multiplayer
 static int menu_hover = -1;     // -1 = none (mouse not over any button)
+static int menu_pressed = -1;   // button being held down by mouse (-1 = none)
 static float menu_mouse_x = 0;
 static float menu_mouse_y = 0;
 #define MENU_BUTTON_COUNT 2
@@ -151,6 +153,8 @@ static void init(void) {
         .logger.func = crash_log_func,
         .buffer_pool_size = 16384,  // LOD tree needs thousands of vertex buffers
     });
+
+    sgl_setup(&(sgl_desc_t){ .logger.func = crash_log_func });
 
     printf("[GAME] init: stm_setup...\n"); fflush(stdout);
     stm_setup();
@@ -256,54 +260,122 @@ static void frame(void) {
             .swapchain = sglue_swapchain()
         });
 
-        // Draw menu text
-        // Canvas is half window size; each char cell = 2 screen pixels.
-        float canvas_w = sapp_widthf() * 0.5f;
-        float canvas_h = sapp_heightf() * 0.5f;
-        sdtx_canvas(canvas_w, canvas_h);
-        float origin_x = 3.0f, origin_y = 3.0f;
-        sdtx_origin(origin_x, origin_y);
-        sdtx_font(0);
+        // ---- Pixel-based button layout ----
+        float win_w = sapp_widthf();
+        float win_h = sapp_heightf();
+        float canvas_w = win_w * 0.5f;
+        float canvas_h = win_h * 0.5f;
+        // sdtx canvas is half-window → each char cell = 8 canvas px = 16 screen px
+        float char_px = win_w / (canvas_w / 8.0f);
 
-        // Mouse hit-test: convert pixel coords to character grid coords
-        // sdtx char cell = 8 pixels in canvas space; canvas maps to full window
-        float px_per_char_x = sapp_widthf() / (canvas_w / 8.0f);
-        float px_per_char_y = sapp_heightf() / (canvas_h / 8.0f);
-        float char_x = menu_mouse_x / px_per_char_x - origin_x;
-        float char_y = menu_mouse_y / px_per_char_y - origin_y;
+        const char* btn_labels[MENU_BUTTON_COUNT] = {
+            "[1] Single Player",
+            "[2] Multiplayer",
+        };
 
-        // Button layout: row 2 = "Single Player", row 4 = "Multiplayer"
-        // (row 0-1 = title + blank line)
+        // All buttons same size (based on widest label + padding)
+        int max_label_len = 0;
+        for (int i = 0; i < MENU_BUTTON_COUNT; i++) {
+            int len = (int)strlen(btn_labels[i]);
+            if (len > max_label_len) max_label_len = len;
+        }
+        float btn_w = (max_label_len + 4) * char_px;   // 2 char padding each side
+        float btn_h = 3.0f * char_px;                    // 3 char-heights tall
+        float btn_gap = 10.0f;                            // 10px vertical gap
+        float margin_x = 3.0f * char_px;                 // left margin
+        float title_y = 3.0f * char_px;                  // title top
+        float btn_y0 = title_y + 2.0f * char_px;         // below title + blank line
+
+        // ---- Mouse hit-test (screen pixels) ----
         menu_hover = -1;
         for (int i = 0; i < MENU_BUTTON_COUNT; i++) {
-            float btn_row = 2.0f + (float)i * 2.0f;  // rows 2, 4
-            if (char_y >= btn_row && char_y < btn_row + 1.0f &&
-                char_x >= 0.0f && char_x < 20.0f) {
+            float by = btn_y0 + i * (btn_h + btn_gap);
+            if (menu_mouse_x >= margin_x && menu_mouse_x < margin_x + btn_w &&
+                menu_mouse_y >= by && menu_mouse_y < by + btn_h) {
                 menu_hover = i;
             }
         }
 
-        // Use hover for highlight; fall back to keyboard selection
-        int active = (menu_hover >= 0) ? menu_hover : menu_selected;
+        // ---- Draw sgl rectangles (behind text) ----
+        sgl_defaults();
+        sgl_matrix_mode_projection();
+        sgl_load_identity();
+        sgl_ortho(0.0f, win_w, win_h, 0.0f, -1.0f, 1.0f);
+        sgl_matrix_mode_modelview();
+        sgl_load_identity();
 
+        for (int i = 0; i < MENU_BUTTON_COUNT; i++) {
+            bool pressed = (menu_pressed == i && menu_hover == i);
+            bool hovered = (menu_hover == i);
+
+            float x0 = margin_x;
+            float y0 = btn_y0 + i * (btn_h + btn_gap);
+            float x1 = x0 + btn_w;
+            float y1 = y0 + btn_h;
+
+            // Fill color
+            float fr, fg, fb, fa;
+            if (pressed)      { fr = 0.25f; fg = 0.25f; fb = 0.3f; fa = 0.9f; }
+            else if (hovered) { fr = 0.12f; fg = 0.14f; fb = 0.2f; fa = 0.8f; }
+            else              { fr = 0.08f; fg = 0.08f; fb = 0.12f; fa = 0.6f; }
+
+            sgl_begin_quads();
+            sgl_c4f(fr, fg, fb, fa);
+            sgl_v2f(x0, y0); sgl_v2f(x1, y0); sgl_v2f(x1, y1); sgl_v2f(x0, y1);
+            sgl_end();
+
+            // Border color
+            float br, bg_, bb;
+            if (pressed)      { br = 1.0f; bg_ = 1.0f; bb = 1.0f; }
+            else if (hovered) { br = 1.0f; bg_ = 1.0f; bb = 0.3f; }
+            else              { br = 0.3f; bg_ = 0.3f; bb = 0.4f; }
+
+            float bw = 2.0f;  // border thickness in pixels
+            sgl_begin_quads();
+            sgl_c3f(br, bg_, bb);
+            // Top edge
+            sgl_v2f(x0, y0); sgl_v2f(x1, y0); sgl_v2f(x1, y0 + bw); sgl_v2f(x0, y0 + bw);
+            // Bottom edge
+            sgl_v2f(x0, y1 - bw); sgl_v2f(x1, y1 - bw); sgl_v2f(x1, y1); sgl_v2f(x0, y1);
+            // Left edge
+            sgl_v2f(x0, y0); sgl_v2f(x0 + bw, y0); sgl_v2f(x0 + bw, y1); sgl_v2f(x0, y1);
+            // Right edge
+            sgl_v2f(x1 - bw, y0); sgl_v2f(x1, y0); sgl_v2f(x1, y1); sgl_v2f(x1 - bw, y1);
+            sgl_end();
+        }
+
+        sgl_draw();
+
+        // ---- Draw text (on top of rectangles) ----
+        sdtx_canvas(canvas_w, canvas_h);
+        sdtx_origin(0.0f, 0.0f);
+        sdtx_font(0);
+
+        // Title
+        sdtx_pos(margin_x / char_px, title_y / char_px);
         sdtx_color3f(0.8f, 0.9f, 1.0f);
-        sdtx_puts("=== HEX PLANETS ===\n\n");
+        sdtx_puts("=== HEX PLANETS ===");
 
-        // Button 0: Single Player
-        {
-            bool lit = (active == 0);
-            if (lit) sdtx_color3f(1.0f, 1.0f, 0.3f);
-            else     sdtx_color3f(0.6f, 0.6f, 0.6f);
-            sdtx_printf("%s [1] Single Player\n\n", lit ? ">" : " ");
-        }
-        // Button 1: Multiplayer
-        {
-            bool lit = (active == 1);
-            if (lit) sdtx_color3f(1.0f, 1.0f, 0.3f);
-            else     sdtx_color3f(0.6f, 0.6f, 0.6f);
-            sdtx_printf("%s [2] Multiplayer\n\n\n", lit ? ">" : " ");
+        // Button labels (centered in each button)
+        for (int i = 0; i < MENU_BUTTON_COUNT; i++) {
+            bool pressed = (menu_pressed == i && menu_hover == i);
+            bool hovered = (menu_hover == i);
+            if (pressed)      sdtx_color3f(1.0f, 1.0f, 1.0f);
+            else if (hovered) sdtx_color3f(1.0f, 1.0f, 0.3f);
+            else              sdtx_color3f(0.6f, 0.6f, 0.6f);
+
+            int label_len = (int)strlen(btn_labels[i]);
+            float by = btn_y0 + i * (btn_h + btn_gap);
+            float tx = margin_x + (btn_w - label_len * char_px) * 0.5f;
+            float ty = by + (btn_h - char_px) * 0.5f;
+            sdtx_pos(tx / char_px, ty / char_px);
+            sdtx_puts(btn_labels[i]);
         }
 
+        // Help text below buttons
+        float help_y = btn_y0 + MENU_BUTTON_COUNT * (btn_h + btn_gap) + char_px;
+        sdtx_origin(margin_x / char_px, help_y / char_px);
+        sdtx_home();
         sdtx_color3f(0.4f, 0.4f, 0.5f);
         sdtx_puts("WASD to move, Mouse to look\n");
         sdtx_puts("Click to lock mouse\n");
@@ -559,11 +631,20 @@ static void event(const sapp_event* ev) {
             } \
         } while(0)
 
-        // Mouse click
+        // Mouse down: start press visual
         if (ev->type == SAPP_EVENTTYPE_MOUSE_DOWN &&
-            ev->mouse_button == SAPP_MOUSEBUTTON_LEFT && menu_hover >= 0) {
-            menu_selected = menu_hover;
-            MENU_ACTIVATE(menu_selected);
+            ev->mouse_button == SAPP_MOUSEBUTTON_LEFT) {
+            menu_pressed = menu_hover;  // -1 if not on a button
+            return;
+        }
+
+        // Mouse up: activate if released on the same button that was pressed
+        if (ev->type == SAPP_EVENTTYPE_MOUSE_UP &&
+            ev->mouse_button == SAPP_MOUSEBUTTON_LEFT) {
+            if (menu_pressed >= 0 && menu_pressed == menu_hover) {
+                MENU_ACTIVATE(menu_pressed);
+            }
+            menu_pressed = -1;
             return;
         }
 
@@ -767,6 +848,7 @@ static void cleanup(void) {
         render_shutdown(&app.renderer);
         planet_destroy(&app.planet);
     }
+    sgl_shutdown();
     sdtx_shutdown();
 }
 
