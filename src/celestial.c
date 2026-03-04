@@ -7,6 +7,7 @@
 #include "util/sokol_debugtext.h"
 #include "util/sokol_gl.h"
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 
