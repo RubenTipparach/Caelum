@@ -10,6 +10,10 @@
 #include "hex_terrain.h"
 #include "config.h"
 #include "torch.h"
+#include "celestial.h"
+
+/* Forward declaration for touch overlay */
+typedef struct TouchControls TouchControls;
 
 // ---- Profiler stats (F3 overlay) ----
 typedef struct ProfileStats {
@@ -108,13 +112,19 @@ typedef struct Renderer {
     sg_pipeline hotbar_pip;
     sg_buffer hotbar_buf;
 
+    // Touch controls overlay (set by main.c, NULL on desktop until first touch)
+    const TouchControls* touch;
+
+    // Celestial bodies (moons)
+    SolarSystem solar_system;
+
     // Debug modes
     bool show_profiler;     // F3: performance overlay
     bool show_wireframe;    // P: wireframe overlay for physics debug
     ProfileStats profile;
 } Renderer;
 
-void render_init(Renderer* r, Planet* planet, const Camera* cam);
+void render_init(Renderer* r, Planet* planet, const Camera* cam, const char* edits_dir);
 void render_update_mesh(Renderer* r, Planet* planet, const Camera* cam);
 void render_frame(Renderer* r, const Camera* cam, float dt);
 void render_shutdown(Renderer* r);
