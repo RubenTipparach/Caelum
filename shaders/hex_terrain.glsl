@@ -68,6 +68,17 @@ in float fs_torch_light;
 
 out vec4 frag_color;
 
+// Ray-sphere intersection: distance from ray origin to sphere entry point.
+// Returns 0 if ray origin is inside the sphere.
+float atmosEntryDist(vec3 ro, vec3 rd, float r) {
+    float b = dot(ro, rd);
+    float c = dot(ro, ro) - r * r;
+    if (c < 0.0) return 0.0;  // inside sphere
+    float disc = b * b - c;
+    if (disc < 0.0) return 0.0;  // ray misses sphere
+    return max(0.0, -b - sqrt(disc));
+}
+
 void main() {
     vec3 N = normalize(fs_normal);
     vec3 L = normalize(sun_direction.xyz);
@@ -152,8 +163,15 @@ void main() {
     float fragAlt = clamp((length(world_pos_approx) - pR) / aThick, 0.0, 1.0);
     float avgDensity = exp(-((camAlt + fragAlt) * 0.5) / fogScaleH);
 
+    // Only fog through the atmosphere shell, not through vacuum above it.
     float dist = length(fs_cam_rel_pos);
-    vec3 tau = rScale * wl4 * avgDensity * (dist / aThick);
+    float fog_dist = dist;
+    if (length(camera_pos.xyz) > aR) {
+        vec3 ray_dir = normalize(fs_cam_rel_pos);
+        float entry = atmosEntryDist(camera_pos.xyz, ray_dir, aR);
+        fog_dist = max(0.0, dist - entry);
+    }
+    vec3 tau = rScale * wl4 * avgDensity * (fog_dist / aThick);
     vec3 transmittance = exp(-tau);
 
     float cosTheta = dot(normalize(fs_cam_rel_pos), L);

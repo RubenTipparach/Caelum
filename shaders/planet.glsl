@@ -49,13 +49,28 @@ layout(binding=1) uniform planet_fs_params {
     vec4 lod_debug;         // x = LOD depth (0 = off/normal), y = max_depth for color mapping
     vec4 dusk_sun_color;    // xyz = warm sunset color (from config.yaml)
     vec4 day_sun_color;     // xyz = neutral daylight color (from config.yaml)
+    vec4 planet_tex_params; // x = enabled (>0), y = blend_start, z = blend_end, w = unused
 };
+
+layout(binding=0) uniform texture2D planet_color_tex;
+layout(binding=0) uniform sampler planet_color_smp;
 
 in vec3 fs_normal;
 in vec3 fs_color;
 in vec3 fs_cam_rel_pos;
 
 out vec4 frag_color;
+
+// Ray-sphere intersection: distance from ray origin to sphere entry point.
+// Returns 0 if ray origin is inside the sphere.
+float atmosEntryDist(vec3 ro, vec3 rd, float r) {
+    float b = dot(ro, rd);
+    float c = dot(ro, ro) - r * r;
+    if (c < 0.0) return 0.0;  // inside sphere
+    float disc = b * b - c;
+    if (disc < 0.0) return 0.0;  // ray misses sphere
+    return max(0.0, -b - sqrt(disc));
+}
 
 void main() {
     // Discard LOD fragments inside hex terrain range (hex terrain renders its own voxels there)
@@ -98,6 +113,21 @@ void main() {
 
     // LOD debug mode: color by depth level
     vec3 base_color = fs_color;
+
+    // Planet texture: sample baked equirectangular map using spherical coords
+    if (planet_tex_params.x > 0.0) {
+        // Spherical UV from surface direction (lat/lon mapping)
+        float lon = atan(surface_dir.z, surface_dir.x);             // [-pi, pi]
+        float lat = asin(clamp(surface_dir.y, -1.0, 1.0));         // [-pi/2, pi/2]
+        vec2 uv = vec2(lon / 6.28318530718 + 0.5, lat / 3.14159265359 + 0.5);
+        vec3 tex_color = texture(sampler2D(planet_color_tex, planet_color_smp), uv).rgb;
+
+        // Blend: vertex color at close range, texture at distance
+        float fragDist = length(fs_cam_rel_pos);
+        float blend = smoothstep(planet_tex_params.y, planet_tex_params.z, fragDist);
+        base_color = mix(base_color, tex_color, blend);
+    }
+
     if (lod_debug.x > 0.0) {
         float t = clamp(lod_debug.x / max(lod_debug.y, 1.0), 0.0, 1.0);
         base_color.r = clamp(1.0 - t * 2.0, 0.0, 1.0) + clamp(t * 4.0 - 3.0, 0.0, 1.0);
@@ -146,8 +176,16 @@ void main() {
     float avgDensity = exp(-((camAlt + fragAlt) * 0.5) / fogScaleH);
 
     // Optical depth: wavelength-dependent (blue extinguishes faster → warm at distance)
+    // Only fog through the atmosphere shell, not through vacuum above it.
     float dist = length(fs_cam_rel_pos);
-    vec3 tau = rScale * wl4 * avgDensity * (dist / aThick);
+    float fog_dist = dist;
+    if (length(camera_pos.xyz) > aR) {
+        // Camera is above atmosphere: clip the vacuum portion of the ray
+        vec3 ray_dir = normalize(fs_cam_rel_pos);
+        float entry = atmosEntryDist(camera_pos.xyz, ray_dir, aR);
+        fog_dist = max(0.0, dist - entry);
+    }
+    vec3 tau = rScale * wl4 * avgDensity * (fog_dist / aThick);
     vec3 transmittance = exp(-tau);
 
     // Inscatter: single-scatter Rayleigh approximation

@@ -800,8 +800,12 @@ static void frame(void) {
             render_init(&app.renderer, &app.planet, &app.camera, app.active_edits_dir);
             printf("[GAME] PHASE 2: render_init done\n"); fflush(stdout);
 
-            // Initialize solar system (moons)
+            // Initialize solar system (moons + Tenebris fallback mesh)
             solar_system_init(&app.renderer.solar_system);
+            {
+                float surface_r = app.planet.radius + app.planet.sea_level * app.planet.layer_thickness;
+                solar_system_generate_planet_mesh(&app.renderer.solar_system, surface_r, 42);
+            }
             printf("[GAME] Solar system initialized: %d moons\n",
                    app.renderer.solar_system.moon_count);
             fflush(stdout);
@@ -902,6 +906,56 @@ static void frame(void) {
         if (++autosave_counter >= 300) {
             autosave_counter = 0;
             player_save();
+        }
+
+        // ---- LOD retarget: switch body when gravity changes ----
+        if (app.camera.gravity_body != app.renderer.lod_current_body) {
+            SolarSystem* ss = &app.renderer.solar_system;
+            if (app.camera.gravity_body == -1) {
+                // Retarget to Tenebris — moon is no longer pinned
+                double center[3] = {0, 0, 0};
+                lod_tree_retarget(&app.renderer.lod_tree, LOD_BODY_PLANET,
+                    center, app.planet.radius, app.planet.layer_thickness,
+                    app.planet.sea_level, 42, NULL, NULL);
+                ss->pinned_body = -1;
+            } else {
+                // Retarget to moon — pin it as stationary reference frame
+                const CelestialBody* moon = &ss->moons[app.camera.gravity_body];
+                lod_tree_retarget(&app.renderer.lod_tree, LOD_BODY_MOON,
+                    moon->pos_d, moon->radius, 1.0f, 0,
+                    moon->shape.noise_seed,
+                    &moon->shape, &moon->palette);
+                ss->pinned_body = app.camera.gravity_body;
+                ss->pinned_center_d[0] = moon->pos_d[0];
+                ss->pinned_center_d[1] = moon->pos_d[1];
+                ss->pinned_center_d[2] = moon->pos_d[2];
+            }
+            app.renderer.lod_current_body = app.camera.gravity_body;
+        }
+
+        // Track orbital delta: shift ALL reference-frame anchors so the moon
+        // stays fixed relative to the camera (which also tracks via camera_update).
+        if (app.renderer.lod_current_body >= 0) {
+            SolarSystem* ss = &app.renderer.solar_system;
+            const CelestialBody* moon = &ss->moons[app.renderer.lod_current_body];
+            double dx = moon->pos_d[0] - moon->prev_pos_d[0];
+            double dy = moon->pos_d[1] - moon->prev_pos_d[1];
+            double dz = moon->pos_d[2] - moon->prev_pos_d[2];
+
+            // Keep pinned center in sync (SOI checks use this)
+            ss->pinned_center_d[0] += dx;
+            ss->pinned_center_d[1] += dy;
+            ss->pinned_center_d[2] += dz;
+
+            // Keep LOD body center in sync (mesh generation uses this)
+            app.renderer.lod_tree.body_center_d[0] += dx;
+            app.renderer.lod_tree.body_center_d[1] += dy;
+            app.renderer.lod_tree.body_center_d[2] += dz;
+
+            // Shift world_origin by same delta to prevent spurious recenters
+            app.renderer.lod_tree.world_origin[0] += dx;
+            app.renderer.lod_tree.world_origin[1] += dy;
+            app.renderer.lod_tree.world_origin[2] += dz;
         }
 
         lod_tree_update_origin(&app.renderer.lod_tree, app.camera.pos_d);
@@ -1250,8 +1304,9 @@ static void event(const sapp_event* ev) {
         }
     }
 
-    // Scroll wheel cycles hotbar when mouse is locked
-    if (ev->type == SAPP_EVENTTYPE_MOUSE_SCROLL && app.camera.mouse_locked) {
+    // Scroll wheel cycles hotbar when mouse is locked (but not while holding space for jetpack speed)
+    if (ev->type == SAPP_EVENTTYPE_MOUSE_SCROLL && app.camera.mouse_locked
+        && !app.camera.key_space && !app.camera.jetpack_active && !app.camera.space_mode) {
         int dir = (ev->scroll_y > 0.0f) ? -1 : 1;
         app.hotbar_slot = (app.hotbar_slot + dir + HOTBAR_COUNT) % HOTBAR_COUNT;
         app.selected_block_type = hotbar_types[app.hotbar_slot];
