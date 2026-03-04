@@ -22,7 +22,7 @@ target_include_directories(sokol PUBLIC ${SOKOL_DIR})
 target_compile_definitions(sokol PUBLIC ${SOKOL_BACKEND})
 
 if(WIN32)
-    target_link_libraries(sokol PUBLIC kernel32 user32 gdi32 d3d11 dxgi dxguid ole32 dbghelp)
+    target_link_libraries(sokol PUBLIC kernel32 user32 gdi32 d3d11 dxgi dxguid ole32 dbghelp winhttp)
 elseif(APPLE)
     target_link_libraries(sokol PUBLIC
         "-framework Metal" "-framework Cocoa" "-framework QuartzCore"
@@ -42,12 +42,16 @@ add_executable(hex-planets
     src/lod.c
     src/hex_terrain.c
     src/torch.c
+    src/touch_controls.c
     src/voxel_edits.c
     src/job_system.c
     src/math_utils.c
     src/screenshot.c
     src/crash_handler.c
     src/config.c
+    src/world.c
+    src/lobby.c
+    src/celestial.c
 )
 
 target_include_directories(hex-planets PRIVATE

@@ -9,6 +9,9 @@
 #include "lod.h"
 #include "hex_terrain.h"
 
+/* Forward declaration */
+typedef struct SolarSystem SolarSystem;
+
 typedef struct Camera {
     HMM_Vec3 position;   // float copy for rendering (derived from pos_d each frame)
     double pos_d[3];     // double-precision position accumulator (sub-mm at any distance)
@@ -41,11 +44,20 @@ typedef struct Camera {
 
     // Movement keys held
     bool key_w, key_s, key_a, key_d, key_space, key_shift, key_ctrl;
+
+    // Space flight mode
+    bool space_mode;              // true when >50km from any surface
+    float roll;                   // accumulated roll angle (Q/E)
+    HMM_Vec3 space_up;           // free-form up vector in space mode
+    bool key_q, key_e;           // roll keys
+    int gravity_body;             // -1 = Tenebris, 0-9 = moon index
+    float transition_alpha;       // 0.0 = space, 1.0 = grounded (lerps over 0.5s)
 } Camera;
 
 void camera_init(Camera* cam);
 void camera_update(Camera* cam, Planet* planet, const LodTree* lod,
-                   const HexTerrain* hex, float dt);
+                   const HexTerrain* hex, float dt,
+                   const SolarSystem* solar);
 void camera_handle_event(Camera* cam, const sapp_event* ev);
 
 #endif

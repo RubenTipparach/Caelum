@@ -2278,7 +2278,8 @@ static void update_column_cache(HexChunk* chunk, int col, int row) {
 // ---- Public API ----
 
 void hex_terrain_init(HexTerrain* ht, float planet_radius, float layer_thickness,
-                      int sea_level, int seed, JobSystem* jobs) {
+                      int sea_level, int seed, JobSystem* jobs,
+                      const char* edits_dir) {
     memset(ht, 0, sizeof(HexTerrain));
     ht->planet_radius = planet_radius;
     ht->layer_thickness = layer_thickness;
@@ -2294,7 +2295,8 @@ void hex_terrain_init(HexTerrain* ht, float planet_radius, float layer_thickness
     }
 
     // Initialize voxel edit persistence
-    edit_cache_init(&ht->edits, seed, planet_radius, "cache/edits");
+    const char* dir = edits_dir ? edits_dir : "cache/edits";
+    edit_cache_init(&ht->edits, seed, planet_radius, dir);
 
     printf("[HEX] 3D voxel terrain initialized: radius=%.0f, range=%.0fm, chunk=%dx%dx%d\n",
         planet_radius, HEX_RANGE, HEX_CHUNK_SIZE, HEX_CHUNK_SIZE, HEX_CHUNK_LAYERS);

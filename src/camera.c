@@ -1,4 +1,5 @@
 #include "camera.h"
+#include "celestial.h"
 #include "math_utils.h"
 #include "sokol_time.h"
 #include "log_config.h"
@@ -129,12 +130,20 @@ void camera_init(Camera* cam) {
     cam->jetpack_speed_mult = 1.0f;
     cam->last_space_time = 0;
 
+    cam->space_mode = false;
+    cam->roll = 0.0f;
+    cam->space_up = (HMM_Vec3){{0, 1, 0}};
+    cam->key_q = cam->key_e = false;
+    cam->gravity_body = -1;
+    cam->transition_alpha = 1.0f;
+
     cam->view = HMM_M4D(1.0f);
     cam->proj = HMM_M4D(1.0f);
 }
 
 void camera_update(Camera* cam, Planet* planet, const LodTree* lod,
-                   const HexTerrain* hex, float dt) {
+                   const HexTerrain* hex, float dt,
+                   const SolarSystem* solar) {
     double dd = (double)dt;
 
     // ---- Teleport detection: capture radius before movement ----
@@ -145,17 +154,106 @@ void camera_update(Camera* cam, Planet* planet, const LodTree* lod,
     // ---- Sync float position from double (authoritative) ----
     cam->position = (HMM_Vec3){{(float)cam->pos_d[0], (float)cam->pos_d[1], (float)cam->pos_d[2]}};
 
-    // Local "up" computed from double-precision position (smooth even at 800 km)
-    double pos_len_d = sqrt(cam->pos_d[0]*cam->pos_d[0] +
-                            cam->pos_d[1]*cam->pos_d[1] +
-                            cam->pos_d[2]*cam->pos_d[2]);
-    if (pos_len_d < 0.001) pos_len_d = 0.001;
-    float pos_len = (float)pos_len_d;
-    cam->local_up = (HMM_Vec3){{
-        (float)(cam->pos_d[0] / pos_len_d),
-        (float)(cam->pos_d[1] / pos_len_d),
-        (float)(cam->pos_d[2] / pos_len_d)
-    }};
+    // ---- Determine gravity body (planet vs moon) ----
+    float planet_surface_r = 0.0f;
+    if (planet) {
+        planet_surface_r = planet->radius + planet->sea_level * planet->layer_thickness;
+    }
+    int prev_gravity = cam->gravity_body;
+    if (solar) {
+        cam->gravity_body = solar_system_find_gravity_body(solar, cam->pos_d, planet_surface_r);
+    } else {
+        cam->gravity_body = -1;
+    }
+
+    // ---- Compute local_up based on gravity body ----
+    double pos_len_d;
+    float pos_len;
+
+    if (cam->gravity_body >= 0 && solar) {
+        // On a moon: up points away from moon center
+        const CelestialBody* moon = &solar->moons[cam->gravity_body];
+        double dx = cam->pos_d[0] - moon->pos_d[0];
+        double dy = cam->pos_d[1] - moon->pos_d[1];
+        double dz = cam->pos_d[2] - moon->pos_d[2];
+        double dist = sqrt(dx*dx + dy*dy + dz*dz);
+        if (dist < 0.001) dist = 0.001;
+        cam->local_up = (HMM_Vec3){{(float)(dx/dist), (float)(dy/dist), (float)(dz/dist)}};
+
+        pos_len_d = sqrt(cam->pos_d[0]*cam->pos_d[0] +
+                         cam->pos_d[1]*cam->pos_d[1] +
+                         cam->pos_d[2]*cam->pos_d[2]);
+        pos_len = (float)pos_len_d;
+    } else {
+        // On Tenebris or in space: up points away from planet center
+        pos_len_d = sqrt(cam->pos_d[0]*cam->pos_d[0] +
+                         cam->pos_d[1]*cam->pos_d[1] +
+                         cam->pos_d[2]*cam->pos_d[2]);
+        if (pos_len_d < 0.001) pos_len_d = 0.001;
+        pos_len = (float)pos_len_d;
+        cam->local_up = (HMM_Vec3){{
+            (float)(cam->pos_d[0] / pos_len_d),
+            (float)(cam->pos_d[1] / pos_len_d),
+            (float)(cam->pos_d[2] / pos_len_d)
+        }};
+    }
+
+    // ---- Space mode detection ----
+    // Check if we're more than 50km from ALL surfaces
+    {
+        double planet_alt = pos_len_d - (double)planet_surface_r;
+        bool within_any_soi = (planet_alt < (double)MOON_SOI_RADIUS);
+
+        if (!within_any_soi && solar) {
+            for (int i = 0; i < solar->moon_count; i++) {
+                const CelestialBody* m = &solar->moons[i];
+                double dx = cam->pos_d[0] - m->pos_d[0];
+                double dy = cam->pos_d[1] - m->pos_d[1];
+                double dz = cam->pos_d[2] - m->pos_d[2];
+                double dist = sqrt(dx*dx + dy*dy + dz*dz);
+                if (dist - (double)m->radius < (double)MOON_SOI_RADIUS) {
+                    within_any_soi = true;
+                    break;
+                }
+            }
+        }
+
+        bool was_space = cam->space_mode;
+        cam->space_mode = !within_any_soi;
+
+        // Transition: entering space
+        if (cam->space_mode && !was_space) {
+            cam->space_up = cam->local_up;  // Snapshot current orientation
+            cam->transition_alpha = 0.0f;
+            cam->roll = 0.0f;
+        }
+        // Transition: leaving space (entering SOI)
+        if (!cam->space_mode && was_space) {
+            cam->transition_alpha = 0.0f;  // Will lerp to 1.0
+        }
+
+        // Transition gravity body change (moon to moon or moon to planet)
+        if (!cam->space_mode && prev_gravity != cam->gravity_body) {
+            cam->transition_alpha = 0.0f;
+        }
+    }
+
+    // ---- Update transition alpha ----
+    if (cam->space_mode) {
+        cam->transition_alpha = 0.0f;
+    } else {
+        if (cam->transition_alpha < 1.0f) {
+            cam->transition_alpha += dt * 2.0f;  // 0.5s transition
+            if (cam->transition_alpha > 1.0f) cam->transition_alpha = 1.0f;
+            // Lerp space_up toward radial local_up during transition
+            cam->space_up = HMM_NormV3(HMM_LerpV3(cam->space_up, cam->transition_alpha, cam->local_up));
+        }
+    }
+
+    // In space mode: use space_up as local_up (roll applied after forward is computed)
+    if (cam->space_mode) {
+        cam->local_up = cam->space_up;
+    }
 
     // Build a local reference frame on the sphere's tangent plane
     // using parallel transport to avoid rotation snapping.
@@ -228,6 +326,32 @@ void camera_update(Camera* cam, Planet* planet, const LodTree* lod,
     cam->right = flat_right;
     cam->up = cam->local_up;
 
+    // ---- In space mode, apply Q/E roll around the current forward vector ----
+    if (cam->space_mode) {
+        float roll_speed = 2.0f;  // radians/sec
+        if (cam->key_q) cam->roll -= roll_speed * dt;
+        if (cam->key_e) cam->roll += roll_speed * dt;
+
+        if (fabsf(cam->roll) > 0.001f) {
+            // Rodrigues rotation of space_up around current forward
+            float c = cosf(cam->roll);
+            float s = sinf(cam->roll);
+            HMM_Vec3 fwd = cam->forward;
+            float dot_fu = HMM_DotV3(fwd, cam->space_up);
+            HMM_Vec3 cross_fu = HMM_Cross(fwd, cam->space_up);
+            cam->space_up = HMM_NormV3(HMM_AddV3(
+                HMM_AddV3(HMM_MulV3F(cam->space_up, c), HMM_MulV3F(cross_fu, s)),
+                HMM_MulV3F(fwd, dot_fu * (1.0f - c))
+            ));
+            cam->roll = 0.0f;  // Consumed
+        }
+
+        // Update local_up/up/right to reflect the roll
+        cam->local_up = cam->space_up;
+        cam->up = cam->space_up;
+        cam->right = HMM_NormV3(HMM_Cross(cam->forward, cam->up));
+    }
+
     // ---- Get current ground info for collision ----
     float current_ground_r = pos_len;
     if (lod) {
@@ -258,7 +382,9 @@ void camera_update(Camera* cam, Planet* planet, const LodTree* lod,
 
     // ---- Movement (accumulated in double precision) ----
     float move_speed;
-    if (cam->jetpack_active) {
+    if (cam->space_mode) {
+        move_speed = JETPACK_FLY_SPEED * cam->jetpack_speed_mult;
+    } else if (cam->jetpack_active) {
         move_speed = JETPACK_FLY_SPEED * cam->jetpack_speed_mult;
     } else {
         move_speed = cam->key_shift ? SPRINT_SPEED : WALK_SPEED;
@@ -266,10 +392,18 @@ void camera_update(Camera* cam, Planet* planet, const LodTree* lod,
 
     HMM_Vec3 forward_input = (HMM_Vec3){{0, 0, 0}};
     HMM_Vec3 side_input = (HMM_Vec3){{0, 0, 0}};
-    if (cam->key_w) forward_input = HMM_AddV3(forward_input, flat_forward);
-    if (cam->key_s) forward_input = HMM_SubV3(forward_input, flat_forward);
-    if (cam->key_a) side_input = HMM_AddV3(side_input, flat_right);
-    if (cam->key_d) side_input = HMM_SubV3(side_input, flat_right);
+    if (cam->space_mode) {
+        // Space mode: WASD moves in look direction (full 3D, not projected)
+        if (cam->key_w) forward_input = HMM_AddV3(forward_input, cam->forward);
+        if (cam->key_s) forward_input = HMM_SubV3(forward_input, cam->forward);
+        if (cam->key_a) side_input = HMM_AddV3(side_input, flat_right);
+        if (cam->key_d) side_input = HMM_SubV3(side_input, flat_right);
+    } else {
+        if (cam->key_w) forward_input = HMM_AddV3(forward_input, flat_forward);
+        if (cam->key_s) forward_input = HMM_SubV3(forward_input, flat_forward);
+        if (cam->key_a) side_input = HMM_AddV3(side_input, flat_right);
+        if (cam->key_d) side_input = HMM_SubV3(side_input, flat_right);
+    }
 
     float fwd_len = HMM_LenV3(forward_input);
     float side_len = HMM_LenV3(side_input);
@@ -439,8 +573,129 @@ void camera_update(Camera* cam, Planet* planet, const LodTree* lod,
             // Feet above ground: freefall (gravity pulls player down naturally)
             cam->on_ground = false;
         }
+    } else if (cam->space_mode) {
+        // ---- Space flight mode: no gravity, free movement ----
+        HMM_Vec3 full_input = HMM_AddV3(forward_input, side_input);
+        bool has_input = HMM_LenV3(full_input) > 0.001f;
+        if (has_input) {
+            HMM_Vec3 full_dir = HMM_NormV3(full_input);
+            double step = (double)move_speed * dd;
+            cam->pos_d[0] += (double)full_dir.X * step;
+            cam->pos_d[1] += (double)full_dir.Y * step;
+            cam->pos_d[2] += (double)full_dir.Z * step;
+        }
+
+        // Space/Ctrl for vertical thrust (relative to space_up)
+        float sm = cam->jetpack_speed_mult;
+        if (cam->key_space) {
+            float radial_vel = HMM_DotV3(cam->velocity, cam->local_up);
+            if (radial_vel < JETPACK_MAX_SPEED * sm) {
+                cam->velocity = HMM_AddV3(cam->velocity,
+                    HMM_MulV3F(cam->local_up, JETPACK_THRUST * sm * dt));
+            }
+        } else if (cam->key_ctrl) {
+            float radial_vel = HMM_DotV3(cam->velocity, cam->local_up);
+            if (radial_vel > -JETPACK_MAX_SPEED * sm) {
+                cam->velocity = HMM_SubV3(cam->velocity,
+                    HMM_MulV3F(cam->local_up, JETPACK_THRUST * sm * dt));
+            }
+        }
+        cam->velocity = HMM_MulV3F(cam->velocity, JETPACK_DRAG);
+        cam->on_ground = false;
+
+        // Apply velocity
+        if (HMM_LenV3(cam->velocity) > 0.001f) {
+            cam->pos_d[0] += (double)cam->velocity.X * dd;
+            cam->pos_d[1] += (double)cam->velocity.Y * dd;
+            cam->pos_d[2] += (double)cam->velocity.Z * dd;
+        }
+        cam->position = (HMM_Vec3){{(float)cam->pos_d[0], (float)cam->pos_d[1], (float)cam->pos_d[2]}};
+
+    } else if (cam->gravity_body >= 0 && solar) {
+        // ---- On a moon: simplified gravity + ground collision ----
+        HMM_Vec3 full_input = HMM_AddV3(forward_input, side_input);
+        bool has_input = HMM_LenV3(full_input) > 0.001f;
+        if (has_input) {
+            HMM_Vec3 full_dir = HMM_NormV3(full_input);
+            double step = (double)move_speed * dd;
+            cam->pos_d[0] += (double)full_dir.X * step;
+            cam->pos_d[1] += (double)full_dir.Y * step;
+            cam->pos_d[2] += (double)full_dir.Z * step;
+        }
+
+        // Jetpack / Jump / Gravity (same as planet but toward moon center)
+        if (cam->jetpack_active) {
+            float sm = cam->jetpack_speed_mult;
+            if (cam->key_space) {
+                float radial_vel = HMM_DotV3(cam->velocity, cam->local_up);
+                if (radial_vel < JETPACK_MAX_SPEED * sm) {
+                    cam->velocity = HMM_AddV3(cam->velocity,
+                        HMM_MulV3F(cam->local_up, JETPACK_THRUST * sm * dt));
+                }
+            } else if (cam->key_ctrl) {
+                float radial_vel = HMM_DotV3(cam->velocity, cam->local_up);
+                if (radial_vel > -JETPACK_MAX_SPEED * sm) {
+                    cam->velocity = HMM_SubV3(cam->velocity,
+                        HMM_MulV3F(cam->local_up, JETPACK_THRUST * sm * dt));
+                }
+            } else {
+                cam->velocity = HMM_SubV3(cam->velocity,
+                    HMM_MulV3F(cam->local_up, cam->gravity * 0.3f * dt));
+            }
+            cam->velocity = HMM_MulV3F(cam->velocity, JETPACK_DRAG);
+            cam->on_ground = false;
+        } else {
+            if (cam->key_space && cam->on_ground) {
+                cam->velocity = HMM_MulV3F(cam->local_up, JUMP_FORCE);
+                cam->on_ground = false;
+            }
+            if (!cam->on_ground) {
+                cam->velocity = HMM_SubV3(cam->velocity,
+                    HMM_MulV3F(cam->local_up, cam->gravity * dt));
+            }
+        }
+
+        // Apply velocity
+        if (HMM_LenV3(cam->velocity) > 0.001f) {
+            cam->pos_d[0] += (double)cam->velocity.X * dd;
+            cam->pos_d[1] += (double)cam->velocity.Y * dd;
+            cam->pos_d[2] += (double)cam->velocity.Z * dd;
+        }
+        cam->position = (HMM_Vec3){{(float)cam->pos_d[0], (float)cam->pos_d[1], (float)cam->pos_d[2]}};
+
+        // Moon ground collision: use moon_surface_radius
+        const CelestialBody* moon = &solar->moons[cam->gravity_body];
+        double dx = cam->pos_d[0] - moon->pos_d[0];
+        double dy = cam->pos_d[1] - moon->pos_d[1];
+        double dz = cam->pos_d[2] - moon->pos_d[2];
+        double dist_from_moon = sqrt(dx*dx + dy*dy + dz*dz);
+        HMM_Vec3 dir_from_moon = {{(float)(dx/dist_from_moon), (float)(dy/dist_from_moon), (float)(dz/dist_from_moon)}};
+        float ground_r = moon_surface_radius(&moon->shape, dir_from_moon);
+        double feet_dist = dist_from_moon - (double)cam->eye_height;
+        float radial_vel = HMM_DotV3(cam->velocity, cam->local_up);
+
+        if (feet_dist <= (double)ground_r + (double)GROUND_SNAP_THRESHOLD) {
+            if (radial_vel <= 0.0f) {
+                double target_dist = (double)ground_r + (double)cam->eye_height;
+                double scale = target_dist / dist_from_moon;
+                // Scale position relative to moon center
+                cam->pos_d[0] = moon->pos_d[0] + dx * scale;
+                cam->pos_d[1] = moon->pos_d[1] + dy * scale;
+                cam->pos_d[2] = moon->pos_d[2] + dz * scale;
+                cam->velocity = (HMM_Vec3){{0, 0, 0}};
+                cam->on_ground = true;
+                if (cam->jetpack_active) {
+                    cam->jetpack_active = false;
+                    cam->jetpack_speed_mult = 1.0f;
+                    LOG(PLAYER, "Jetpack OFF (landed on moon)\n");
+                }
+            }
+        } else {
+            cam->on_ground = false;
+        }
+
     } else {
-        // ---- No hex collision: jetpack or outside hex range ----
+        // ---- No hex collision: jetpack or outside hex range (on Tenebris) ----
         HMM_Vec3 full_input = HMM_AddV3(forward_input, side_input);
         bool has_input = HMM_LenV3(full_input) > 0.001f;
         if (has_input) {
@@ -592,8 +847,8 @@ void camera_update(Camera* cam, Planet* planet, const LodTree* lod,
     cam->position = (HMM_Vec3){{(float)cam->pos_d[0], (float)cam->pos_d[1], (float)cam->pos_d[2]}};
 
     // ---- Teleport detection: check for unexpected upward position jumps ----
-    // Only active when jetpack is OFF — jetpack can legitimately cause large movements.
-    if (!cam->jetpack_active) {
+    // Only active when jetpack is OFF and not in space/moon mode.
+    if (!cam->jetpack_active && !cam->space_mode && cam->gravity_body < 0) {
         double radius_after = sqrt(cam->pos_d[0]*cam->pos_d[0] +
                                    cam->pos_d[1]*cam->pos_d[1] +
                                    cam->pos_d[2]*cam->pos_d[2]);
@@ -695,7 +950,7 @@ void camera_handle_event(Camera* cam, const sapp_event* ev) {
             break;
 
         case SAPP_EVENTTYPE_MOUSE_SCROLL:
-            if (cam->jetpack_active) {
+            if (cam->jetpack_active || cam->space_mode) {
                 // Scroll wheel adjusts jetpack speed multiplier (floor = 1.0)
                 float scroll = ev->scroll_y;
                 if (scroll > 0.0f) {
@@ -728,6 +983,8 @@ void camera_handle_event(Camera* cam, const sapp_event* ev) {
                 }
                 cam->key_space = true;
             }
+            if (ev->key_code == SAPP_KEYCODE_Q) cam->key_q = true;
+            if (ev->key_code == SAPP_KEYCODE_E) cam->key_e = true;
             if (ev->key_code == SAPP_KEYCODE_LEFT_SHIFT) cam->key_shift = true;
             if (ev->key_code == SAPP_KEYCODE_LEFT_CONTROL || ev->key_code == SAPP_KEYCODE_C) cam->key_ctrl = true;
             if (ev->key_code == SAPP_KEYCODE_ESCAPE) {
@@ -742,6 +999,8 @@ void camera_handle_event(Camera* cam, const sapp_event* ev) {
             if (ev->key_code == SAPP_KEYCODE_A) cam->key_a = false;
             if (ev->key_code == SAPP_KEYCODE_D) cam->key_d = false;
             if (ev->key_code == SAPP_KEYCODE_SPACE) cam->key_space = false;
+            if (ev->key_code == SAPP_KEYCODE_Q) cam->key_q = false;
+            if (ev->key_code == SAPP_KEYCODE_E) cam->key_e = false;
             if (ev->key_code == SAPP_KEYCODE_LEFT_SHIFT) cam->key_shift = false;
             if (ev->key_code == SAPP_KEYCODE_LEFT_CONTROL || ev->key_code == SAPP_KEYCODE_C) cam->key_ctrl = false;
             break;

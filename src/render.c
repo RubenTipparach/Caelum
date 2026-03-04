@@ -1,4 +1,5 @@
 #include "render.h"
+#include "touch_controls.h"
 #include "sokol_gfx.h"
 #include "sokol_app.h"
 #include "sokol_glue.h"
@@ -32,7 +33,7 @@ static void lod_debug_pre_draw(int depth, void* user_data) {
     sg_apply_uniforms(UB_planet_fs_params, &SG_RANGE(state->fs_params));
 }
 
-void render_init(Renderer* r, Planet* planet, const Camera* cam) {
+void render_init(Renderer* r, Planet* planet, const Camera* cam, const char* edits_dir) {
     // ---- Planet pipeline ----
     printf("[RENDER] render_init: creating planet shader...\n"); fflush(stdout);
     r->show_lod_debug = false;
@@ -112,7 +113,7 @@ void render_init(Renderer* r, Planet* planet, const Camera* cam) {
     // ---- Hex terrain (close-range voxel grid) ----
     printf("[RENDER] render_init: creating hex terrain...\n"); fflush(stdout);
     hex_terrain_init(&r->hex_terrain, planet->radius, planet->layer_thickness,
-                     planet->sea_level, 42, r->lod_tree.jobs);
+                     planet->sea_level, 42, r->lod_tree.jobs, edits_dir);
     printf("[RENDER] render_init: hex terrain done\n"); fflush(stdout);
 
     r->lod_tree.suppress_range = 0.0f;  // Updated dynamically each frame
@@ -691,6 +692,12 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
         lod_tree_render(&r->lod_tree, r->pip, vp, NULL, NULL, planet_ub, &hex_info);
     }
 
+    // ---- 3a+. Draw moons ----
+    solar_system_render(&r->solar_system, cam, r->sun_direction,
+                        vp_terrain, r->pip,
+                        Fcoef, far_plane, z_bias,
+                        r->lod_tree.world_origin);
+
     // ---- 3b. Draw hex terrain (close-range 3D voxel chunks) ----
     if (r->hex_terrain.active_count > 0) {
         sg_apply_pipeline(r->hex_pip);
@@ -840,28 +847,8 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
 
     // ---- 4. HUD overlay ----
 
-    // Crosshair dot at screen center (tiny white dot)
-    {
-        // sdtx uses a virtual canvas; set it to full pixel resolution
-        // so we can position the dot precisely at center.
-        // Font 0 chars are 8x8 in the virtual canvas.
-        float cw = sapp_widthf() * 0.5f;   // virtual canvas width
-        float ch = sapp_heightf() * 0.5f;  // virtual canvas height
-        // Each sdtx character cell = 1.0 unit in the virtual canvas
-        // Canvas is cw x ch units, center = (cw/2, ch/2) in canvas units
-        // sdtx_origin sets top-left of text output
-        // To place a '.' at screen center, position origin so the char lands there
-        // Character width = 8 pixels = (8 / sapp_widthf()) * cw canvas units
-        float char_w = 8.0f / sapp_widthf() * cw;
-        float char_h = 8.0f / sapp_heightf() * ch;
-        float cx = cw * 0.5f - char_w * 0.5f;
-        float cy = ch * 0.5f - char_h * 0.5f;
-        sdtx_canvas(cw, ch);
-        sdtx_origin(cx / char_w, cy / char_h);
-        sdtx_font(0);
-        sdtx_color3f(1.0f, 1.0f, 1.0f);
-        sdtx_putc('.');
-    }
+    // Crosshair: small white filled circle via sgl
+    touch_render_crosshair();
 
     sdtx_canvas(sapp_widthf() * 0.5f, sapp_heightf() * 0.5f);
     sdtx_origin(0.5f, 0.5f);
@@ -978,6 +965,21 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
                 r->lod_tree.level_stats[d].max_distance / 1000.0f);
         }
     }
+
+    // ---- 4b. Moon name labels (space mode only) ----
+    solar_system_draw_labels(&r->solar_system, cam, vp_rot);
+
+    // Space mode indicator
+    if (cam->space_mode) {
+        sdtx_color3f(0.3f, 0.8f, 1.0f);
+        sdtx_pos(0.5f, 0.5f + 4.0f);
+        sdtx_puts("SPACE FLIGHT  Q/E roll  Scroll=speed");
+    } else if (cam->gravity_body >= 0 && cam->gravity_body < r->solar_system.moon_count) {
+        sdtx_color3f(0.4f, 1.0f, 0.6f);
+        sdtx_pos(0.5f, 0.5f + 4.0f);
+        sdtx_printf("Moon: %s", r->solar_system.moons[cam->gravity_body].name);
+    }
+
     sdtx_draw();
 
     // ---- 5. Hotbar UI overlay ----
@@ -1043,11 +1045,17 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
         }
     }
 
+    // Touch controls overlay (joysticks + buttons)
+    if (r->touch) {
+        touch_render(r->touch, r->hotbar_selected_slot, 7);
+    }
+
     sg_end_pass();
     sg_commit();
 }
 
 void render_shutdown(Renderer* r) {
+    solar_system_shutdown(&r->solar_system);
     hex_terrain_destroy(&r->hex_terrain);
     atmosphere_destroy(&r->atmosphere);
     lod_tree_destroy(&r->lod_tree);

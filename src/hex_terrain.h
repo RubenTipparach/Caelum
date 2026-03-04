@@ -139,7 +139,8 @@ typedef struct HexHitResult {
 // ---- API ----
 
 void hex_terrain_init(HexTerrain* ht, float planet_radius, float layer_thickness,
-                      int sea_level, int seed, JobSystem* jobs);
+                      int sea_level, int seed, JobSystem* jobs,
+                      const char* edits_dir);
 
 void hex_terrain_destroy(HexTerrain* ht);
 
