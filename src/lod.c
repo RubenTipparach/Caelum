@@ -1502,17 +1502,14 @@ static void process_completed_jobs(LodTree* tree) {
         MeshGenJob* job = (MeshGenJob*)node->pending_job;
         if (!job->completed) continue;
 
-        // Check if job's origin matches current tree origin (may be stale after recenter).
-        // Use distance threshold instead of exact equality: orbital delta shifts the
-        // origin by small amounts each frame, which is NOT a real recenter. Only discard
-        // when the origin has shifted by >1km (a real floating-origin recenter).
+        // Check if job's origin matches current tree origin (stale after a floating-origin recenter).
+        // world_origin only changes on recenters (large jumps), so exact equality is safe.
         float cur_origin[3] = {(float)tree->world_origin[0],
                                (float)tree->world_origin[1],
                                (float)tree->world_origin[2]};
-        float odx = job->origin[0] - cur_origin[0];
-        float ody = job->origin[1] - cur_origin[1];
-        float odz = job->origin[2] - cur_origin[2];
-        bool stale = (odx*odx + ody*ody + odz*odz) > 1000.0f * 1000.0f;
+        bool stale = (job->origin[0] != cur_origin[0] ||
+                      job->origin[1] != cur_origin[1] ||
+                      job->origin[2] != cur_origin[2]);
 
         if (stale) {
             // Discard stale mesh and reset node for regeneration
