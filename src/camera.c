@@ -27,6 +27,18 @@
 #define JETPACK_DRAG        0.97f   // velocity damping per frame (air resistance)
 #define DOUBLE_TAP_MS       300.0   // ms window for double-tap detection
 
+// Rodrigues rotation: rotate vector v around unit axis k by angle theta
+static HMM_Vec3 rodrigues(HMM_Vec3 v, HMM_Vec3 k, float theta) {
+    float c = cosf(theta);
+    float s = sinf(theta);
+    float dot = HMM_DotV3(k, v);
+    HMM_Vec3 cross = HMM_Cross(k, v);
+    return HMM_AddV3(
+        HMM_AddV3(HMM_MulV3F(v, c), HMM_MulV3F(cross, s)),
+        HMM_MulV3F(k, dot * (1.0f - c))
+    );
+}
+
 // Logging throttle
 static int log_frame_counter = 0;
 
@@ -133,8 +145,14 @@ void camera_init(Camera* cam) {
     cam->space_mode = false;
     cam->roll = 0.0f;
     cam->space_up = (HMM_Vec3){{0, 1, 0}};
+    cam->space_forward = (HMM_Vec3){{0, 0, -1}};
+    cam->space_prev_yaw = 0.0f;
+    cam->space_prev_pitch = 0.0f;
     cam->key_q = cam->key_e = false;
     cam->gravity_body = -1;
+    cam->gravity_center_d[0] = 0.0;
+    cam->gravity_center_d[1] = 0.0;
+    cam->gravity_center_d[2] = 0.0;
     cam->transition_alpha = 1.0f;
 
     cam->view = HMM_M4D(1.0f);
@@ -166,37 +184,57 @@ void camera_update(Camera* cam, Planet* planet, const LodTree* lod,
         cam->gravity_body = -1;
     }
 
-    // ---- Compute local_up based on gravity body ----
-    double pos_len_d;
-    float pos_len;
-
-    if (cam->gravity_body >= 0 && solar) {
-        // On a moon: up points away from moon center
+    // ---- Gravity body center tracking ----
+    if (prev_gravity != cam->gravity_body) {
+        // Transition: latch gravity center to current body position
+        if (cam->gravity_body >= 0 && solar) {
+            const CelestialBody* moon = &solar->moons[cam->gravity_body];
+            cam->gravity_center_d[0] = moon->pos_d[0];
+            cam->gravity_center_d[1] = moon->pos_d[1];
+            cam->gravity_center_d[2] = moon->pos_d[2];
+        } else {
+            cam->gravity_center_d[0] = 0.0;
+            cam->gravity_center_d[1] = 0.0;
+            cam->gravity_center_d[2] = 0.0;
+        }
+        cam->tangent_initialized = false;
+    } else if (cam->gravity_body >= 0 && solar) {
+        // Riding a moon: apply orbital delta so the player moves with it.
+        // This means exiting the SOI launches from the moon's current orbital
+        // position, and Tenebris visibly moves in the sky from the moon surface.
         const CelestialBody* moon = &solar->moons[cam->gravity_body];
-        double dx = cam->pos_d[0] - moon->pos_d[0];
-        double dy = cam->pos_d[1] - moon->pos_d[1];
-        double dz = cam->pos_d[2] - moon->pos_d[2];
-        double dist = sqrt(dx*dx + dy*dy + dz*dz);
-        if (dist < 0.001) dist = 0.001;
-        cam->local_up = (HMM_Vec3){{(float)(dx/dist), (float)(dy/dist), (float)(dz/dist)}};
-
-        pos_len_d = sqrt(cam->pos_d[0]*cam->pos_d[0] +
-                         cam->pos_d[1]*cam->pos_d[1] +
-                         cam->pos_d[2]*cam->pos_d[2]);
-        pos_len = (float)pos_len_d;
-    } else {
-        // On Tenebris or in space: up points away from planet center
-        pos_len_d = sqrt(cam->pos_d[0]*cam->pos_d[0] +
-                         cam->pos_d[1]*cam->pos_d[1] +
-                         cam->pos_d[2]*cam->pos_d[2]);
-        if (pos_len_d < 0.001) pos_len_d = 0.001;
-        pos_len = (float)pos_len_d;
-        cam->local_up = (HMM_Vec3){{
-            (float)(cam->pos_d[0] / pos_len_d),
-            (float)(cam->pos_d[1] / pos_len_d),
-            (float)(cam->pos_d[2] / pos_len_d)
-        }};
+        double dx = moon->pos_d[0] - moon->prev_pos_d[0];
+        double dy = moon->pos_d[1] - moon->prev_pos_d[1];
+        double dz = moon->pos_d[2] - moon->prev_pos_d[2];
+        cam->pos_d[0] += dx;
+        cam->pos_d[1] += dy;
+        cam->pos_d[2] += dz;
+        cam->gravity_center_d[0] = moon->pos_d[0];
+        cam->gravity_center_d[1] = moon->pos_d[1];
+        cam->gravity_center_d[2] = moon->pos_d[2];
     }
+
+    // ---- Compute body-relative distance and local_up ----
+    // body_dist: distance from gravity body center (for altitude, collision, ground snap)
+    // pos_len:   distance from world origin (for space mode planet check)
+    double body_dx = cam->pos_d[0] - cam->gravity_center_d[0];
+    double body_dy = cam->pos_d[1] - cam->gravity_center_d[1];
+    double body_dz = cam->pos_d[2] - cam->gravity_center_d[2];
+    double body_dist_d = sqrt(body_dx*body_dx + body_dy*body_dy + body_dz*body_dz);
+    if (body_dist_d < 0.001) body_dist_d = 0.001;
+    float body_dist = (float)body_dist_d;
+
+    cam->local_up = (HMM_Vec3){{
+        (float)(body_dx / body_dist_d),
+        (float)(body_dy / body_dist_d),
+        (float)(body_dz / body_dist_d)
+    }};
+
+    double pos_len_d = sqrt(cam->pos_d[0]*cam->pos_d[0] +
+                            cam->pos_d[1]*cam->pos_d[1] +
+                            cam->pos_d[2]*cam->pos_d[2]);
+    if (pos_len_d < 0.001) pos_len_d = 0.001;
+    float pos_len = (float)pos_len_d;
 
     // ---- Space mode detection ----
     // Check if we're more than 50km from ALL surfaces
@@ -207,9 +245,20 @@ void camera_update(Camera* cam, Planet* planet, const LodTree* lod,
         if (!within_any_soi && solar) {
             for (int i = 0; i < solar->moon_count; i++) {
                 const CelestialBody* m = &solar->moons[i];
-                double dx = cam->pos_d[0] - m->pos_d[0];
-                double dy = cam->pos_d[1] - m->pos_d[1];
-                double dz = cam->pos_d[2] - m->pos_d[2];
+                // For the pinned body, use the frozen center (moon->pos_d drifts via Kepler)
+                double mx, my, mz;
+                if (i == solar->pinned_body) {
+                    mx = solar->pinned_center_d[0];
+                    my = solar->pinned_center_d[1];
+                    mz = solar->pinned_center_d[2];
+                } else {
+                    mx = m->pos_d[0];
+                    my = m->pos_d[1];
+                    mz = m->pos_d[2];
+                }
+                double dx = cam->pos_d[0] - mx;
+                double dy = cam->pos_d[1] - my;
+                double dz = cam->pos_d[2] - mz;
                 double dist = sqrt(dx*dx + dy*dy + dz*dz);
                 if (dist - (double)m->radius < (double)MOON_SOI_RADIUS) {
                     within_any_soi = true;
@@ -223,7 +272,10 @@ void camera_update(Camera* cam, Planet* planet, const LodTree* lod,
 
         // Transition: entering space
         if (cam->space_mode && !was_space) {
-            cam->space_up = cam->local_up;  // Snapshot current orientation
+            cam->space_up = cam->local_up;      // Snapshot current orientation
+            cam->space_forward = cam->forward;   // Snapshot current look direction
+            cam->space_prev_yaw = cam->yaw;      // Snapshot yaw/pitch for delta tracking
+            cam->space_prev_pitch = cam->pitch;
             cam->transition_alpha = 0.0f;
             cam->roll = 0.0f;
         }
@@ -250,111 +302,129 @@ void camera_update(Camera* cam, Planet* planet, const LodTree* lod,
         }
     }
 
-    // In space mode: use space_up as local_up (roll applied after forward is computed)
-    if (cam->space_mode) {
-        cam->local_up = cam->space_up;
-    }
+    // ---- Orientation: space mode uses incremental rotations, grounded uses tangent frame ----
+    HMM_Vec3 flat_forward, flat_right;
 
-    // Build a local reference frame on the sphere's tangent plane
-    // using parallel transport to avoid rotation snapping.
-    if (!cam->tangent_initialized) {
-        // First frame: initialize tangent from global reference
-        HMM_Vec3 world_ref = (HMM_Vec3){{0, 0, 1}};
-        if (fabsf(HMM_DotV3(cam->local_up, world_ref)) > 0.99f) {
-            world_ref = (HMM_Vec3){{1, 0, 0}};
+    if (cam->space_mode) {
+        // === SPACE MODE: incremental rotation from mouse deltas ===
+        // Compute how much yaw/pitch changed this frame
+        float delta_yaw = cam->yaw - cam->space_prev_yaw;
+        float delta_pitch = cam->pitch - cam->space_prev_pitch;
+        cam->space_prev_yaw = cam->yaw;
+        cam->space_prev_pitch = cam->pitch;
+
+        // Current right vector (before this frame's rotations)
+        HMM_Vec3 right = HMM_NormV3(HMM_Cross(cam->space_forward, cam->space_up));
+
+        // Yaw: rotate forward around up
+        if (fabsf(delta_yaw) > 1e-6f) {
+            cam->space_forward = rodrigues(cam->space_forward, cam->space_up, delta_yaw);
         }
-        cam->tangent_north = HMM_SubV3(world_ref,
-            HMM_MulV3F(cam->local_up, HMM_DotV3(world_ref, cam->local_up)));
-        cam->tangent_north = HMM_NormV3(cam->tangent_north);
-        cam->tangent_initialized = true;
+        // Pitch: rotate forward and up around right
+        if (fabsf(delta_pitch) > 1e-6f) {
+            cam->space_forward = rodrigues(cam->space_forward, right, delta_pitch);
+            cam->space_up = rodrigues(cam->space_up, right, delta_pitch);
+        }
+        // Roll (Q/E): rotate up around forward
+        float roll_amount = 0.0f;
+        if (cam->key_q) roll_amount -= 2.0f * dt;
+        if (cam->key_e) roll_amount += 2.0f * dt;
+        if (fabsf(roll_amount) > 1e-6f) {
+            cam->space_up = rodrigues(cam->space_up, cam->space_forward, roll_amount);
+        }
+
+        // Orthonormalize to prevent drift
+        cam->space_forward = HMM_NormV3(cam->space_forward);
+        cam->space_up = HMM_SubV3(cam->space_up,
+            HMM_MulV3F(cam->space_forward, HMM_DotV3(cam->space_up, cam->space_forward)));
+        cam->space_up = HMM_NormV3(cam->space_up);
+
+        // Set camera vectors (cross order matches grounded: cross(up, forward) for movement)
+        cam->forward = cam->space_forward;
+        cam->up = cam->space_up;
+        cam->local_up = cam->space_up;
+        cam->right = HMM_NormV3(HMM_Cross(cam->space_up, cam->space_forward));
+        cam->prev_local_up = cam->local_up;
+
+        // For movement code below
+        flat_forward = cam->forward;  // in space mode, movement follows look direction
+        flat_right = cam->right;
     } else {
-        // Parallel transport: rotate tangent_north from prev_up to current local_up
-        HMM_Vec3 prev_up = cam->prev_local_up;
-        float cos_a = HMM_DotV3(prev_up, cam->local_up);
-        if (cos_a < 0.999999f) {
-            // Rodrigues rotation around axis = prev_up × local_up
-            HMM_Vec3 axis = HMM_NormV3(HMM_Cross(prev_up, cam->local_up));
-            float angle = acosf(fminf(fmaxf(cos_a, -1.0f), 1.0f));
-            float c = cosf(angle), s = sinf(angle);
-            HMM_Vec3 tn = cam->tangent_north;
-            float dot_ax = HMM_DotV3(axis, tn);
-            HMM_Vec3 cross_ax = HMM_Cross(axis, tn);
-            cam->tangent_north = HMM_AddV3(
-                HMM_AddV3(HMM_MulV3F(tn, c), HMM_MulV3F(cross_ax, s)),
-                HMM_MulV3F(axis, dot_ax * (1.0f - c))
-            );
-        }
-        // Re-orthogonalize against new local_up (remove accumulated drift)
-        cam->tangent_north = HMM_SubV3(cam->tangent_north,
-            HMM_MulV3F(cam->local_up, HMM_DotV3(cam->tangent_north, cam->local_up)));
-        float tn_len = HMM_LenV3(cam->tangent_north);
-        if (tn_len < 0.001f) {
-            // Degenerate: fall back to global reference
+        // === GROUNDED MODE: tangent frame + absolute yaw/pitch ===
+
+        // Build a local reference frame on the sphere's tangent plane
+        // using parallel transport to avoid rotation snapping.
+        if (!cam->tangent_initialized) {
+            // First frame: initialize tangent from global reference
             HMM_Vec3 world_ref = (HMM_Vec3){{0, 0, 1}};
             if (fabsf(HMM_DotV3(cam->local_up, world_ref)) > 0.99f) {
                 world_ref = (HMM_Vec3){{1, 0, 0}};
             }
             cam->tangent_north = HMM_SubV3(world_ref,
                 HMM_MulV3F(cam->local_up, HMM_DotV3(world_ref, cam->local_up)));
+            cam->tangent_north = HMM_NormV3(cam->tangent_north);
+            cam->tangent_initialized = true;
+        } else {
+            // Parallel transport: rotate tangent_north from prev_up to current local_up
+            HMM_Vec3 prev_up = cam->prev_local_up;
+            float cos_a = HMM_DotV3(prev_up, cam->local_up);
+            if (cos_a < 0.999999f) {
+                HMM_Vec3 axis = HMM_NormV3(HMM_Cross(prev_up, cam->local_up));
+                float angle = acosf(fminf(fmaxf(cos_a, -1.0f), 1.0f));
+                float c = cosf(angle), s = sinf(angle);
+                HMM_Vec3 tn = cam->tangent_north;
+                float dot_ax = HMM_DotV3(axis, tn);
+                HMM_Vec3 cross_ax = HMM_Cross(axis, tn);
+                cam->tangent_north = HMM_AddV3(
+                    HMM_AddV3(HMM_MulV3F(tn, c), HMM_MulV3F(cross_ax, s)),
+                    HMM_MulV3F(axis, dot_ax * (1.0f - c))
+                );
+            }
+            // Re-orthogonalize against new local_up (remove accumulated drift)
+            cam->tangent_north = HMM_SubV3(cam->tangent_north,
+                HMM_MulV3F(cam->local_up, HMM_DotV3(cam->tangent_north, cam->local_up)));
+            float tn_len = HMM_LenV3(cam->tangent_north);
+            if (tn_len < 0.001f) {
+                HMM_Vec3 world_ref = (HMM_Vec3){{0, 0, 1}};
+                if (fabsf(HMM_DotV3(cam->local_up, world_ref)) > 0.99f) {
+                    world_ref = (HMM_Vec3){{1, 0, 0}};
+                }
+                cam->tangent_north = HMM_SubV3(world_ref,
+                    HMM_MulV3F(cam->local_up, HMM_DotV3(world_ref, cam->local_up)));
+            }
+            cam->tangent_north = HMM_NormV3(cam->tangent_north);
         }
-        cam->tangent_north = HMM_NormV3(cam->tangent_north);
-    }
-    cam->prev_local_up = cam->local_up;
+        cam->prev_local_up = cam->local_up;
 
-    HMM_Vec3 tangent_north = cam->tangent_north;
+        HMM_Vec3 tangent_north = cam->tangent_north;
+        HMM_Vec3 tangent_east = HMM_Cross(cam->local_up, tangent_north);
 
-    // tangent_east = local_up cross tangent_north
-    HMM_Vec3 tangent_east = HMM_Cross(cam->local_up, tangent_north);
+        flat_forward = HMM_AddV3(
+            HMM_MulV3F(tangent_north, cosf(cam->yaw)),
+            HMM_MulV3F(tangent_east, sinf(cam->yaw))
+        );
+        flat_forward = HMM_NormV3(flat_forward);
 
-    // Apply yaw to get forward direction on tangent plane
-    HMM_Vec3 flat_forward = HMM_AddV3(
-        HMM_MulV3F(tangent_north, cosf(cam->yaw)),
-        HMM_MulV3F(tangent_east, sinf(cam->yaw))
-    );
-    flat_forward = HMM_NormV3(flat_forward);
+        flat_right = HMM_Cross(cam->local_up, flat_forward);
+        flat_right = HMM_NormV3(flat_right);
 
-    // Right direction on tangent plane
-    HMM_Vec3 flat_right = HMM_Cross(cam->local_up, flat_forward);
-    flat_right = HMM_NormV3(flat_right);
-
-    // Full forward with pitch (for look direction only, not movement)
-    cam->forward = HMM_AddV3(
-        HMM_MulV3F(flat_forward, cosf(cam->pitch)),
-        HMM_MulV3F(cam->local_up, sinf(cam->pitch))
-    );
-    cam->forward = HMM_NormV3(cam->forward);
-    cam->right = flat_right;
-    cam->up = cam->local_up;
-
-    // ---- In space mode, apply Q/E roll around the current forward vector ----
-    if (cam->space_mode) {
-        float roll_speed = 2.0f;  // radians/sec
-        if (cam->key_q) cam->roll -= roll_speed * dt;
-        if (cam->key_e) cam->roll += roll_speed * dt;
-
-        if (fabsf(cam->roll) > 0.001f) {
-            // Rodrigues rotation of space_up around current forward
-            float c = cosf(cam->roll);
-            float s = sinf(cam->roll);
-            HMM_Vec3 fwd = cam->forward;
-            float dot_fu = HMM_DotV3(fwd, cam->space_up);
-            HMM_Vec3 cross_fu = HMM_Cross(fwd, cam->space_up);
-            cam->space_up = HMM_NormV3(HMM_AddV3(
-                HMM_AddV3(HMM_MulV3F(cam->space_up, c), HMM_MulV3F(cross_fu, s)),
-                HMM_MulV3F(fwd, dot_fu * (1.0f - c))
-            ));
-            cam->roll = 0.0f;  // Consumed
-        }
-
-        // Update local_up/up/right to reflect the roll
-        cam->local_up = cam->space_up;
-        cam->up = cam->space_up;
-        cam->right = HMM_NormV3(HMM_Cross(cam->forward, cam->up));
+        cam->forward = HMM_AddV3(
+            HMM_MulV3F(flat_forward, cosf(cam->pitch)),
+            HMM_MulV3F(cam->local_up, sinf(cam->pitch))
+        );
+        cam->forward = HMM_NormV3(cam->forward);
+        cam->right = flat_right;
+        cam->up = cam->local_up;
     }
 
     // ---- Get current ground info for collision ----
-    float current_ground_r = pos_len;
-    if (lod) {
+    // current_ground_r is a body-relative radius (distance from gravity body center)
+    float current_ground_r = body_dist;
+    if (cam->gravity_body >= 0 && solar) {
+        // On a moon: use the moon's shape model (NOT the Tenebris LOD tree)
+        current_ground_r = moon_surface_radius(
+            &solar->moons[cam->gravity_body].shape, cam->local_up);
+    } else if (lod) {
         current_ground_r = (float)lod_tree_terrain_height(lod, cam->position);
     } else if (planet) {
         current_ground_r = planet->radius + planet->sea_level * planet->layer_thickness;
@@ -364,7 +434,7 @@ void camera_update(Camera* cam, Planet* planet, const LodTree* lod,
     // <1km: max 25x, 1-5km: max 200x, 5-50km: max 500x, >50km: unlimited
     // Once you drop below 50km, speed is clamped to the tier cap.
     {
-        float altitude = pos_len - current_ground_r;
+        float altitude = body_dist - current_ground_r;
         float max_mult;
         if (altitude >= 50000.0f) {
             max_mult = 1e9f;  // unlimited above 50km
@@ -663,14 +733,16 @@ void camera_update(Camera* cam, Planet* planet, const LodTree* lod,
         }
         cam->position = (HMM_Vec3){{(float)cam->pos_d[0], (float)cam->pos_d[1], (float)cam->pos_d[2]}};
 
-        // Moon ground collision: use moon_surface_radius
+        // Moon ground collision: use gravity_center_d (frozen moon center)
         const CelestialBody* moon = &solar->moons[cam->gravity_body];
-        double dx = cam->pos_d[0] - moon->pos_d[0];
-        double dy = cam->pos_d[1] - moon->pos_d[1];
-        double dz = cam->pos_d[2] - moon->pos_d[2];
+        double dx = cam->pos_d[0] - cam->gravity_center_d[0];
+        double dy = cam->pos_d[1] - cam->gravity_center_d[1];
+        double dz = cam->pos_d[2] - cam->gravity_center_d[2];
         double dist_from_moon = sqrt(dx*dx + dy*dy + dz*dz);
+        if (dist_from_moon < 0.001) dist_from_moon = 0.001;
         HMM_Vec3 dir_from_moon = {{(float)(dx/dist_from_moon), (float)(dy/dist_from_moon), (float)(dz/dist_from_moon)}};
-        float ground_r = moon_surface_radius(&moon->shape, dir_from_moon);
+        float ground_r = current_ground_r;  // from lod_tree_terrain_height (body-relative)
+        if (ground_r < 1.0f) ground_r = moon_surface_radius(&moon->shape, dir_from_moon);
         double feet_dist = dist_from_moon - (double)cam->eye_height;
         float radial_vel = HMM_DotV3(cam->velocity, cam->local_up);
 
@@ -678,10 +750,10 @@ void camera_update(Camera* cam, Planet* planet, const LodTree* lod,
             if (radial_vel <= 0.0f) {
                 double target_dist = (double)ground_r + (double)cam->eye_height;
                 double scale = target_dist / dist_from_moon;
-                // Scale position relative to moon center
-                cam->pos_d[0] = moon->pos_d[0] + dx * scale;
-                cam->pos_d[1] = moon->pos_d[1] + dy * scale;
-                cam->pos_d[2] = moon->pos_d[2] + dz * scale;
+                // Scale position relative to frozen moon center
+                cam->pos_d[0] = cam->gravity_center_d[0] + dx * scale;
+                cam->pos_d[1] = cam->gravity_center_d[1] + dy * scale;
+                cam->pos_d[2] = cam->gravity_center_d[2] + dz * scale;
                 cam->velocity = (HMM_Vec3){{0, 0, 0}};
                 cam->on_ground = true;
                 if (cam->jetpack_active) {
@@ -747,13 +819,14 @@ void camera_update(Camera* cam, Planet* planet, const LodTree* lod,
         // Sync float position for collision queries
         cam->position = (HMM_Vec3){{(float)cam->pos_d[0], (float)cam->pos_d[1], (float)cam->pos_d[2]}};
 
-        // Ground collision using LOD terrain height
+        // Ground collision using LOD terrain height (body-relative)
         if (lod) {
             static double smoothed_ground_r = 0.0;
             double ground_r = lod_tree_terrain_height(lod, cam->position);
-            double pr = sqrt(cam->pos_d[0]*cam->pos_d[0] +
-                             cam->pos_d[1]*cam->pos_d[1] +
-                             cam->pos_d[2]*cam->pos_d[2]);
+            double bdx = cam->pos_d[0] - cam->gravity_center_d[0];
+            double bdy = cam->pos_d[1] - cam->gravity_center_d[1];
+            double bdz = cam->pos_d[2] - cam->gravity_center_d[2];
+            double pr = sqrt(bdx*bdx + bdy*bdy + bdz*bdz);
             double feet_r = pr - (double)cam->eye_height;
             float radial_vel = HMM_DotV3(cam->velocity, cam->local_up);
 
@@ -769,9 +842,10 @@ void camera_update(Camera* cam, Planet* planet, const LodTree* lod,
                 if (radial_vel <= 0.0f) {
                     double target_r = smoothed_ground_r + (double)cam->eye_height;
                     double scale = target_r / pr;
-                    cam->pos_d[0] *= scale;
-                    cam->pos_d[1] *= scale;
-                    cam->pos_d[2] *= scale;
+                    // Scale relative to gravity body center
+                    cam->pos_d[0] = cam->gravity_center_d[0] + bdx * scale;
+                    cam->pos_d[1] = cam->gravity_center_d[1] + bdy * scale;
+                    cam->pos_d[2] = cam->gravity_center_d[2] + bdz * scale;
                     cam->velocity = (HMM_Vec3){{0, 0, 0}};
                     cam->on_ground = true;
                     if (cam->jetpack_active) {
@@ -943,9 +1017,12 @@ void camera_handle_event(Camera* cam, const sapp_event* ev) {
             if (cam->mouse_locked) {
                 cam->yaw -= ev->mouse_dx * cam->sensitivity;
                 cam->pitch -= ev->mouse_dy * cam->sensitivity;
-                float limit = (float)M_PI / 2.0f - 0.01f;
-                if (cam->pitch > limit) cam->pitch = limit;
-                if (cam->pitch < -limit) cam->pitch = -limit;
+                if (!cam->space_mode) {
+                    // Clamp pitch to ±90° only when grounded (fixed up vector)
+                    float limit = (float)M_PI / 2.0f - 0.01f;
+                    if (cam->pitch > limit) cam->pitch = limit;
+                    if (cam->pitch < -limit) cam->pitch = -limit;
+                }
             }
             break;
 

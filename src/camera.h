@@ -49,8 +49,12 @@ typedef struct Camera {
     bool space_mode;              // true when >50km from any surface
     float roll;                   // accumulated roll angle (Q/E)
     HMM_Vec3 space_up;           // free-form up vector in space mode
+    HMM_Vec3 space_forward;      // free-form forward vector in space mode
+    float space_prev_yaw;        // yaw at last frame (for computing mouse deltas)
+    float space_prev_pitch;      // pitch at last frame (for computing mouse deltas)
     bool key_q, key_e;           // roll keys
     int gravity_body;             // -1 = Tenebris, 0-9 = moon index
+    double gravity_center_d[3];   // Fixed center of gravity body (latched on transition)
     float transition_alpha;       // 0.0 = space, 1.0 = grounded (lerps over 0.5s)
 } Camera;
 

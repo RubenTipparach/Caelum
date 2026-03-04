@@ -5,6 +5,7 @@
 #include "planet.glsl.h"
 #include "sokol_app.h"
 #include "util/sokol_debugtext.h"
+#include "util/sokol_gl.h"
 #include <math.h>
 #include <string.h>
 #include <stdio.h>
@@ -235,6 +236,130 @@ void moon_generate_mesh(CelestialBody* body) {
     free(radii);
 }
 
+/* ---- Tenebris fallback mesh generation ---- */
+void solar_system_generate_planet_mesh(SolarSystem* ss, float planet_radius, int seed) {
+    static IcoMesh mesh;
+    mesh.vert_count = 0;
+    mesh.tri_count = 0;
+
+    /* Build icosphere (3 subdivisions = ~642 verts, ~1280 tris) */
+    for (int i = 0; i < ICO_VERTEX_COUNT; i++) {
+        mesh.verts[mesh.vert_count++] = HMM_NormV3(ICO_VERTICES[i]);
+    }
+    for (int i = 0; i < ICO_FACE_COUNT; i++) {
+        mesh.tris[mesh.tri_count][0] = ICO_FACES[i][0];
+        mesh.tris[mesh.tri_count][1] = ICO_FACES[i][1];
+        mesh.tris[mesh.tri_count][2] = ICO_FACES[i][2];
+        mesh.tri_count++;
+    }
+    for (int s = 0; s < 3; s++) {
+        ico_subdivide(&mesh);
+    }
+
+    /* Displace by terrain noise (same noise as LOD system uses) */
+    fnl_state noise = fnlCreateState();
+    noise.seed = seed;
+    noise.noise_type = FNL_NOISE_OPENSIMPLEX2S;
+    noise.fractal_type = FNL_FRACTAL_FBM;
+    noise.octaves = 6;
+    noise.frequency = 1.5f / planet_radius;
+
+    float* radii = (float*)malloc((size_t)mesh.vert_count * sizeof(float));
+    float min_r = 1e9f, max_r = -1e9f;
+    float layer_thickness = 0.5f;  /* approximate */
+    int sea_level = 50;
+
+    for (int v = 0; v < mesh.vert_count; v++) {
+        HMM_Vec3 dir = mesh.verts[v];
+        float n3d = fnlGetNoise3D(&noise, dir.X * planet_radius,
+                                  dir.Y * planet_radius, dir.Z * planet_radius);
+        float height_layers = (n3d + 1.0f) * 0.5f * 120.0f;  /* 0-120 layers */
+        float r = planet_radius + (height_layers - (float)sea_level) * layer_thickness;
+        if (r < planet_radius) r = planet_radius;  /* ocean floor clamp */
+        radii[v] = r;
+        if (r < min_r) min_r = r;
+        if (r > max_r) max_r = r;
+        mesh.verts[v] = HMM_MulV3F(dir, r);
+    }
+
+    /* Compute vertex normals */
+    HMM_Vec3* vert_normals = (HMM_Vec3*)calloc((size_t)mesh.vert_count, sizeof(HMM_Vec3));
+    for (int i = 0; i < mesh.tri_count; i++) {
+        HMM_Vec3 v0 = mesh.verts[mesh.tris[i][0]];
+        HMM_Vec3 v1 = mesh.verts[mesh.tris[i][1]];
+        HMM_Vec3 v2 = mesh.verts[mesh.tris[i][2]];
+        HMM_Vec3 face_n = HMM_Cross(HMM_SubV3(v1, v0), HMM_SubV3(v2, v0));
+        vert_normals[mesh.tris[i][0]] = HMM_AddV3(vert_normals[mesh.tris[i][0]], face_n);
+        vert_normals[mesh.tris[i][1]] = HMM_AddV3(vert_normals[mesh.tris[i][1]], face_n);
+        vert_normals[mesh.tris[i][2]] = HMM_AddV3(vert_normals[mesh.tris[i][2]], face_n);
+    }
+    for (int i = 0; i < mesh.vert_count; i++) {
+        vert_normals[i] = HMM_NormV3(vert_normals[i]);
+    }
+
+    /* Color by biome: latitude + elevation */
+    float range = max_r - min_r;
+    if (range < 1.0f) range = 1.0f;
+    int total_verts = mesh.tri_count * 3;
+    MoonVertex* vbuf = (MoonVertex*)malloc((size_t)total_verts * sizeof(MoonVertex));
+    int vi = 0;
+    for (int i = 0; i < mesh.tri_count; i++) {
+        for (int j = 0; j < 3; j++) {
+            int idx = mesh.tris[i][j];
+            HMM_Vec3 p = mesh.verts[idx];
+            HMM_Vec3 n = vert_normals[idx];
+            float height_t = (radii[idx] - min_r) / range;
+
+            /* Determine color based on height and latitude */
+            HMM_Vec3 dir = HMM_NormV3(p);
+            float lat = fabsf(dir.Y);  /* 0 = equator, 1 = pole */
+            HMM_Vec3 col;
+            if (radii[idx] <= planet_radius + 0.1f) {
+                /* Ocean: deep blue */
+                col = (HMM_Vec3){{0.05f, 0.12f, 0.35f}};
+            } else if (lat > 0.85f) {
+                /* Polar ice */
+                col = (HMM_Vec3){{0.85f, 0.88f, 0.92f}};
+            } else if (height_t > 0.7f) {
+                /* Mountains: grey-brown */
+                col = (HMM_Vec3){{0.45f, 0.42f, 0.38f}};
+            } else if (lat > 0.6f) {
+                /* Tundra */
+                col = (HMM_Vec3){{0.35f, 0.40f, 0.30f}};
+            } else {
+                /* Lowland green/brown blend */
+                float green = 0.3f + height_t * 0.3f;
+                col = (HMM_Vec3){{0.18f + height_t * 0.2f, green, 0.12f}};
+            }
+
+            vbuf[vi].pos[0] = p.X;
+            vbuf[vi].pos[1] = p.Y;
+            vbuf[vi].pos[2] = p.Z;
+            vbuf[vi].normal[0] = n.X;
+            vbuf[vi].normal[1] = n.Y;
+            vbuf[vi].normal[2] = n.Z;
+            vbuf[vi].color[0] = col.X;
+            vbuf[vi].color[1] = col.Y;
+            vbuf[vi].color[2] = col.Z;
+            vi++;
+        }
+    }
+
+    ss->planet_buffer = sg_make_buffer(&(sg_buffer_desc){
+        .data = { .ptr = vbuf, .size = (size_t)total_verts * sizeof(MoonVertex) },
+        .label = "tenebris-fallback",
+    });
+    ss->planet_vertex_count = total_verts;
+    ss->planet_mesh_ready = true;
+    ss->planet_radius = planet_radius;
+
+    printf("[CELESTIAL] Tenebris fallback mesh: %d verts (3 subdivisions)\n", total_verts);
+
+    free(vbuf);
+    free(vert_normals);
+    free(radii);
+}
+
 /* ---- Kepler orbit solver ---- */
 static void kepler_position(const OrbitParams* orbit, double t, double out_pos[3]) {
     /* Mean anomaly */
@@ -290,6 +415,7 @@ static void kepler_position(const OrbitParams* orbit, double t, double out_pos[3
 void solar_system_init(SolarSystem* ss) {
     memset(ss, 0, sizeof(SolarSystem));
     ss->gravity_body = -1;
+    ss->pinned_body = -1;
 
     /* Define 10 moons: 5 large (5-10km), 5 small (1-5km) */
     typedef struct {
@@ -329,37 +455,39 @@ void solar_system_init(SolarSystem* ss) {
           {{0.50f, 0.50f, 0.52f}}, {{0.68f, 0.68f, 0.70f}}, {{0.25f, 0.25f, 0.27f}} },
 
         /* --- 3 large moons (5-10km radius) --- */
+        /*   Noise amplitude: ~50m peaks → amp = 50/radius                */
         { "Kelthos",  3000000.0f, 6600.0f, 12.0f,  45.0f, 0.04f,
-          7000.0f, {0.95f, 1.10f, 1.0f}, 300, 1.0f, 0.15f, 4,
+          7000.0f, {0.95f, 1.10f, 1.0f}, 300, 0.5f, 0.007f, 4,
           {{0.48f, 0.47f, 0.45f}}, {{0.65f, 0.63f, 0.60f}}, {{0.24f, 0.23f, 0.22f}} },
 
         { "Dravok",   6500000.0f, 21100.0f, 18.0f, 200.0f, 0.06f,
-          6000.0f, {1.20f, 0.80f, 0.95f}, 400, 1.2f, 0.18f, 3,
+          6000.0f, {1.20f, 0.80f, 0.95f}, 400, 0.6f, 0.007f, 3,
           {{0.42f, 0.40f, 0.38f}}, {{0.58f, 0.56f, 0.53f}}, {{0.20f, 0.19f, 0.18f}} },
 
         { "Serath",   8500000.0f, 31560.0f,  8.0f, 300.0f, 0.03f,
-          5000.0f, {1.0f, 1.0f, 1.15f}, 500, 0.7f, 0.08f, 3,
+          5000.0f, {1.0f, 1.0f, 1.15f}, 500, 0.4f, 0.006f, 3,
           {{0.52f, 0.52f, 0.53f}}, {{0.70f, 0.70f, 0.72f}}, {{0.28f, 0.28f, 0.29f}} },
 
         /* --- 5 small moons (1-5km radius) --- */
+        /*   Noise amplitude: ~10-30m peaks → amp = peak/radius            */
         { "Cryx",     2000000.0f, 3600.0f, 25.0f,  60.0f, 0.08f,
-          3000.0f, {1.3f, 0.7f, 1.0f}, 600, 1.5f, 0.20f, 2,
+          3000.0f, {1.3f, 0.7f, 1.0f}, 600, 0.5f, 0.007f, 2,
           {{0.40f, 0.38f, 0.37f}}, {{0.55f, 0.53f, 0.51f}}, {{0.18f, 0.17f, 0.16f}} },
 
         { "Nyctra",   4500000.0f, 12150.0f, 30.0f, 150.0f, 0.05f,
-          2000.0f, {0.8f, 1.2f, 1.1f}, 700, 1.8f, 0.18f, 2,
+          2000.0f, {0.8f, 1.2f, 1.1f}, 700, 0.6f, 0.008f, 2,
           {{0.46f, 0.45f, 0.47f}}, {{0.63f, 0.62f, 0.65f}}, {{0.23f, 0.22f, 0.24f}} },
 
         { "Thalwen",  7500000.0f, 26200.0f, 15.0f, 270.0f, 0.07f,
-          4000.0f, {1.1f, 0.9f, 1.2f}, 800, 1.0f, 0.15f, 3,
+          4000.0f, {1.1f, 0.9f, 1.2f}, 800, 0.5f, 0.006f, 3,
           {{0.44f, 0.43f, 0.42f}}, {{0.60f, 0.58f, 0.57f}}, {{0.21f, 0.20f, 0.19f}} },
 
         { "Vexis",   11000000.0f, 46440.0f, 40.0f,  90.0f, 0.09f,
-          1500.0f, {1.4f, 0.6f, 1.0f}, 900, 2.0f, 0.20f, 2,
+          1500.0f, {1.4f, 0.6f, 1.0f}, 900, 0.7f, 0.008f, 2,
           {{0.38f, 0.38f, 0.40f}}, {{0.53f, 0.53f, 0.56f}}, {{0.17f, 0.17f, 0.19f}} },
 
         { "Zephyros", 13000000.0f, 59720.0f, 10.0f, 330.0f, 0.02f,
-          1000.0f, {1.0f, 1.3f, 0.8f}, 1000, 1.5f, 0.15f, 2,
+          1000.0f, {1.0f, 1.3f, 0.8f}, 1000, 0.7f, 0.010f, 2,
           {{0.50f, 0.49f, 0.48f}}, {{0.67f, 0.65f, 0.64f}}, {{0.26f, 0.25f, 0.24f}} },
     };
 
@@ -398,6 +526,9 @@ void solar_system_init(SolarSystem* ss) {
 
         /* Initial position */
         kepler_position(&m->orbit, 0.0, m->pos_d);
+        m->prev_pos_d[0] = m->pos_d[0];
+        m->prev_pos_d[1] = m->pos_d[1];
+        m->prev_pos_d[2] = m->pos_d[2];
         m->position = (HMM_Vec3){{(float)m->pos_d[0], (float)m->pos_d[1], (float)m->pos_d[2]}};
 
         /* Generate mesh */
@@ -406,12 +537,30 @@ void solar_system_init(SolarSystem* ss) {
         printf("[CELESTIAL] Moon '%s': orbit=%.0fkm radius=%.0fm\n",
                m->name, d->semi_major / 1000.0f, m->radius);
     }
+
+    /* Create sgl pipeline for depth-tested orbit lines */
+    ss->orbit_pip = sgl_make_pipeline(&(sg_pipeline_desc){
+        .depth = {
+            .compare = SG_COMPAREFUNC_LESS_EQUAL,
+            .write_enabled = true,
+        },
+        .colors[0].blend = {
+            .enabled = true,
+            .src_factor_rgb = SG_BLENDFACTOR_SRC_ALPHA,
+            .dst_factor_rgb = SG_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
+        },
+    });
 }
 
 void solar_system_update(SolarSystem* ss, double dt) {
     ss->elapsed_time += dt;
     for (int i = 0; i < ss->moon_count; i++) {
         CelestialBody* m = &ss->moons[i];
+        /* Save previous position before orbital update (for camera tracking delta) */
+        m->prev_pos_d[0] = m->pos_d[0];
+        m->prev_pos_d[1] = m->pos_d[1];
+        m->prev_pos_d[2] = m->pos_d[2];
+
         kepler_position(&m->orbit, ss->elapsed_time, m->pos_d);
         m->position = (HMM_Vec3){{
             (float)m->pos_d[0],
@@ -434,9 +583,20 @@ int solar_system_find_gravity_body(const SolarSystem* ss,
 
     for (int i = 0; i < ss->moon_count; i++) {
         const CelestialBody* m = &ss->moons[i];
-        double dx = pos_d[0] - m->pos_d[0];
-        double dy = pos_d[1] - m->pos_d[1];
-        double dz = pos_d[2] - m->pos_d[2];
+        /* For pinned body, use frozen center (Kepler pos_d drifts away from camera) */
+        double mx, my, mz;
+        if (i == ss->pinned_body) {
+            mx = ss->pinned_center_d[0];
+            my = ss->pinned_center_d[1];
+            mz = ss->pinned_center_d[2];
+        } else {
+            mx = m->pos_d[0];
+            my = m->pos_d[1];
+            mz = m->pos_d[2];
+        }
+        double dx = pos_d[0] - mx;
+        double dy = pos_d[1] - my;
+        double dz = pos_d[2] - mz;
         double dist = sqrt(dx*dx + dy*dy + dz*dz);
         double alt = dist - (double)m->radius;
 
@@ -455,10 +615,15 @@ void solar_system_render(const SolarSystem* ss,
                          HMM_Mat4 vp_rot,
                          sg_pipeline pip,
                          float Fcoef, float far_plane, float z_bias,
-                         const double world_origin[3]) {
+                         const double world_origin[3],
+                         int lod_target_body,
+                         sg_view planet_tex_view,
+                         sg_sampler planet_tex_smp,
+                         const void* planet_fallback_fs) {
     sg_apply_pipeline(pip);
 
     for (int i = 0; i < ss->moon_count; i++) {
+        if (i == lod_target_body) continue;  /* LOD tree renders this one */
         const CelestialBody* m = &ss->moons[i];
         if (!m->mesh_ready) continue;
 
@@ -494,6 +659,7 @@ void solar_system_render(const SolarSystem* ss,
             .lod_debug = (HMM_Vec4){{0.0f, 0.0f, 0.0f, 0.0f}},
             .dusk_sun_color = (HMM_Vec4){{1.0f, 0.85f, 0.7f, 0.0f}},
             .day_sun_color = (HMM_Vec4){{1.0f, 0.98f, 0.95f, 0.0f}},
+            .planet_tex_params = (HMM_Vec4){{0.0f, 0.0f, 0.0f, 0.0f}},  /* disabled for moons */
         };
 
         sg_apply_uniforms(UB_planet_vs_params, &SG_RANGE(vs));
@@ -501,8 +667,49 @@ void solar_system_render(const SolarSystem* ss,
 
         sg_bindings bind = {0};
         bind.vertex_buffers[0] = m->gpu_buffer;
+        bind.views[0] = planet_tex_view;
+        bind.samplers[0] = planet_tex_smp;
         sg_apply_bindings(&bind);
         sg_draw(0, m->vertex_count, 1);
+    }
+
+    /* Draw Tenebris fallback mesh when LOD targets a moon */
+    if (lod_target_body >= 0 && ss->planet_mesh_ready) {
+        /* Tenebris mesh vertices are centered at origin (planet-local coords).
+           Camera offset = cam_pos - planet_center = cam_pos - (0,0,0) = cam_pos */
+        double cam_off_d[3] = {
+            cam->pos_d[0],
+            cam->pos_d[1],
+            cam->pos_d[2],
+        };
+        float hi_x = (float)cam_off_d[0];
+        float hi_y = (float)cam_off_d[1];
+        float hi_z = (float)cam_off_d[2];
+        float lo_x = (float)(cam_off_d[0] - (double)hi_x);
+        float lo_y = (float)(cam_off_d[1] - (double)hi_y);
+        float lo_z = (float)(cam_off_d[2] - (double)hi_z);
+
+        planet_vs_params_t vs = {
+            .mvp = vp_rot,
+            .camera_offset = (HMM_Vec4){{hi_x, hi_y, hi_z, 0.0f}},
+            .camera_offset_low = (HMM_Vec4){{lo_x, lo_y, lo_z, 0.0f}},
+            .log_depth = (HMM_Vec4){{Fcoef, far_plane, z_bias, 0.0f}},
+        };
+        /* Use the same fs_params as the LOD path (passed from render.c) so that
+           Tenebris looks identical whether viewed from space or from a moon's SOI.
+           Only override camera_pos for the planet-centered reference frame. */
+        planet_fs_params_t fs = *(const planet_fs_params_t*)planet_fallback_fs;
+        fs.camera_pos = (HMM_Vec4){{hi_x, hi_y, hi_z, 0.0f}};
+
+        sg_apply_uniforms(UB_planet_vs_params, &SG_RANGE(vs));
+        sg_apply_uniforms(UB_planet_fs_params, &SG_RANGE(fs));
+
+        sg_bindings bind = {0};
+        bind.vertex_buffers[0] = ss->planet_buffer;
+        bind.views[0] = planet_tex_view;
+        bind.samplers[0] = planet_tex_smp;
+        sg_apply_bindings(&bind);
+        sg_draw(0, ss->planet_vertex_count, 1);
     }
 }
 
@@ -631,11 +838,58 @@ void solar_system_draw_labels(const SolarSystem* ss,
     }
 }
 
+void solar_system_draw_orbits(const SolarSystem* ss,
+                              const Camera* cam,
+                              HMM_Mat4 vp_rot) {
+    if (!cam->space_mode) return;
+
+    /* Set up sgl with camera-relative perspective + depth testing */
+    sgl_defaults();
+    sgl_load_pipeline(ss->orbit_pip);
+    sgl_matrix_mode_projection();
+    sgl_load_matrix((const float*)&vp_rot);
+    sgl_matrix_mode_modelview();
+    sgl_load_identity();
+
+    #define ORBIT_SEGMENTS 128
+
+    for (int i = 0; i < ss->moon_count; i++) {
+        const CelestialBody* m = &ss->moons[i];
+
+        /* Dim orbit line color — slightly brighter for the pinned body */
+        float alpha = (i == ss->pinned_body) ? 0.5f : 0.2f;
+
+        sgl_begin_line_strip();
+        sgl_c4f(0.4f, 0.6f, 0.9f, alpha);
+
+        for (int s = 0; s <= ORBIT_SEGMENTS; s++) {
+            /* Sample the orbit at evenly-spaced mean anomaly */
+            double t_sample = (double)s / (double)ORBIT_SEGMENTS * (double)m->orbit.period;
+            double pos[3];
+            kepler_position(&m->orbit, t_sample, pos);
+
+            /* Camera-relative position */
+            float rx = (float)(pos[0] - cam->pos_d[0]);
+            float ry = (float)(pos[1] - cam->pos_d[1]);
+            float rz = (float)(pos[2] - cam->pos_d[2]);
+            sgl_v3f(rx, ry, rz);
+        }
+        sgl_end();
+    }
+
+    sgl_draw();
+    #undef ORBIT_SEGMENTS
+}
+
 void solar_system_shutdown(SolarSystem* ss) {
     for (int i = 0; i < ss->moon_count; i++) {
         if (ss->moons[i].mesh_ready) {
             sg_destroy_buffer(ss->moons[i].gpu_buffer);
             ss->moons[i].mesh_ready = false;
         }
+    }
+    if (ss->planet_mesh_ready) {
+        sg_destroy_buffer(ss->planet_buffer);
+        ss->planet_mesh_ready = false;
     }
 }

@@ -27,6 +27,7 @@ typedef struct VisualConfig {
 
     // LOD
     float lod_split_factor;     // split threshold multiplier (higher = more detail)
+
 } VisualConfig;
 
 // Returns hardcoded defaults (same values currently in the code)

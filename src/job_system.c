@@ -135,6 +135,18 @@ int job_system_pending(JobSystem* sys) {
     return count;
 }
 
+int job_system_flush(JobSystem* sys, void** out_data, int max_out) {
+    EnterCriticalSection(&sys->mutex);
+    int flushed = 0;
+    while (sys->queue_count > 0 && flushed < max_out) {
+        out_data[flushed++] = sys->queue[sys->queue_head].data;
+        sys->queue_head = (sys->queue_head + 1) % JOB_QUEUE_SIZE;
+        sys->queue_count--;
+    }
+    LeaveCriticalSection(&sys->mutex);
+    return flushed;
+}
+
 void job_system_destroy(JobSystem* sys) {
     if (!sys) return;
 
@@ -188,6 +200,11 @@ bool job_system_try_submit(JobSystem* sys, JobFunc func, void* data) {
 
 int job_system_pending(JobSystem* sys) {
     (void)sys;
+    return 0;
+}
+
+int job_system_flush(JobSystem* sys, void** out_data, int max_out) {
+    (void)sys; (void)out_data; (void)max_out;
     return 0;
 }
 
@@ -312,6 +329,18 @@ int job_system_pending(JobSystem* sys) {
     int count = sys->queue_count;
     pthread_mutex_unlock(&sys->mutex);
     return count;
+}
+
+int job_system_flush(JobSystem* sys, void** out_data, int max_out) {
+    pthread_mutex_lock(&sys->mutex);
+    int flushed = 0;
+    while (sys->queue_count > 0 && flushed < max_out) {
+        out_data[flushed++] = sys->queue[sys->queue_head].data;
+        sys->queue_head = (sys->queue_head + 1) % JOB_QUEUE_SIZE;
+        sys->queue_count--;
+    }
+    pthread_mutex_unlock(&sys->mutex);
+    return flushed;
 }
 
 void job_system_destroy(JobSystem* sys) {

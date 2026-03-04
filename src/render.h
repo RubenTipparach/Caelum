@@ -90,6 +90,11 @@ typedef struct Renderer {
     sg_view hex_atlas_view;
     sg_sampler hex_atlas_smp;
 
+    // Planet color texture (equirectangular, baked from terrain noise)
+    sg_image planet_tex_img;
+    sg_view planet_tex_view;
+    sg_sampler planet_tex_smp;
+
     // Hex selection highlight
     sg_pipeline highlight_pip;
     sg_buffer highlight_buf;
@@ -117,6 +122,7 @@ typedef struct Renderer {
 
     // Celestial bodies (moons)
     SolarSystem solar_system;
+    int lod_current_body;       // Which body LOD tree targets: -1 = Tenebris, 0-9 = moon
 
     // Debug modes
     bool show_profiler;     // F3: performance overlay

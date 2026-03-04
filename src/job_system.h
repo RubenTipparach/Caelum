@@ -25,6 +25,11 @@ bool job_system_try_submit(JobSystem* sys, JobFunc func, void* data);
 // Get the number of pending (unstarted) jobs in the queue (thread-safe).
 int job_system_pending(JobSystem* sys);
 
+// Flush all queued (not yet started) jobs. Returns data pointers via out_data array.
+// Returns the number of flushed jobs. Caller must free the returned data pointers.
+// Does NOT affect jobs currently being executed by workers.
+int job_system_flush(JobSystem* sys, void** out_data, int max_out);
+
 // Destroy the job system. Waits for all pending jobs to finish.
 void job_system_destroy(JobSystem* sys);
 

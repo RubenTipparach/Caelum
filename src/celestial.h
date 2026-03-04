@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include "HandmadeMath.h"
 #include "sokol_gfx.h"
+#include "util/sokol_gl.h"
 
 /* Forward declarations */
 typedef struct Camera Camera;
@@ -40,6 +41,7 @@ typedef struct OrbitParams {
 typedef struct CelestialBody {
     char name[32];
     double pos_d[3];               /* double-precision world position */
+    double prev_pos_d[3];          /* position at start of previous frame (for orbital delta) */
     HMM_Vec3 position;             /* float copy for rendering */
     float radius;                  /* effective radius (for SOI checks) */
     MoonShapeParams shape;
@@ -57,10 +59,27 @@ typedef struct SolarSystem {
     int moon_count;
     double elapsed_time;           /* accumulated simulation time (seconds) */
     int gravity_body;              /* -1 = main planet, 0-9 = moon index */
+
+    /* Pinned body: when LOD targets a moon, it becomes the stationary reference frame.
+       The Kepler solver still updates moon positions, but pinned_center_d is frozen. */
+    int pinned_body;               /* -1 = none, 0-9 = moon index */
+    double pinned_center_d[3];     /* frozen world position of pinned body */
+
+    /* Tenebris fallback mesh (rendered when LOD targets a moon) */
+    sg_buffer planet_buffer;
+    int planet_vertex_count;
+    bool planet_mesh_ready;
+    float planet_radius;           /* Tenebris effective surface radius */
+
+    /* sgl pipeline for orbit lines (depth-tested) */
+    sgl_pipeline orbit_pip;
 } SolarSystem;
 
 /* Initialize all 10 moons with hardcoded orbital + shape params */
 void solar_system_init(SolarSystem* ss);
+
+/* Generate a coarse fallback mesh for Tenebris (used when LOD targets a moon) */
+void solar_system_generate_planet_mesh(SolarSystem* ss, float planet_radius, int seed);
 
 /* Update moon positions via Kepler solver */
 void solar_system_update(SolarSystem* ss, double dt);
@@ -78,20 +97,34 @@ float moon_surface_radius(const MoonShapeParams* shape, HMM_Vec3 unit_dir);
 /* Generate icosphere mesh for a moon and upload to GPU */
 void moon_generate_mesh(CelestialBody* body);
 
-/* Render all moons using the planet pipeline (camera-relative) */
+/* Render all moons using the planet pipeline (camera-relative).
+   lod_target_body: moon index being rendered by LOD tree (-1 = none). That moon is skipped.
+   planet_tex_view/smp: required for valid pipeline bindings (planet shader expects texture).
+   planet_fallback_fs: opaque pointer to planet_fs_params_t for Tenebris fallback shading
+                       (cast internally; ensures consistent lighting with the LOD path). */
 void solar_system_render(const SolarSystem* ss,
                          const Camera* cam,
                          HMM_Vec3 sun_dir,
                          HMM_Mat4 vp_rot,
                          sg_pipeline pip,
                          float Fcoef, float far_plane, float z_bias,
-                         const double world_origin[3]);
+                         const double world_origin[3],
+                         int lod_target_body,
+                         sg_view planet_tex_view,
+                         sg_sampler planet_tex_smp,
+                         const void* planet_fallback_fs);
 
 /* Draw moon name labels in screen space (call between sdtx_canvas and sdtx_draw).
    Only draws when camera is in space_mode. */
 void solar_system_draw_labels(const SolarSystem* ss,
                               const Camera* cam,
                               HMM_Mat4 vp);
+
+/* Draw orbit lines for all moons (sgl immediate-mode, camera-relative).
+   Only draws when camera is in space_mode. */
+void solar_system_draw_orbits(const SolarSystem* ss,
+                              const Camera* cam,
+                              HMM_Mat4 vp_rot);
 
 /* Cleanup GPU resources */
 void solar_system_shutdown(SolarSystem* ss);

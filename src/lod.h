@@ -7,6 +7,13 @@
 #include "sokol_gfx.h"
 #include "job_system.h"
 #include "hex_vertex.h"
+#include "celestial.h"
+
+// Body type for LOD tree targeting
+typedef enum {
+    LOD_BODY_PLANET,    // Tenebris (complex terrain noise)
+    LOD_BODY_MOON,      // Moon (MoonShapeParams noise)
+} LodBodyType;
 
 // ---- Configuration ----
 #define LOD_MAX_DEPTH       13      // Max subdivision depth
@@ -73,11 +80,18 @@ typedef struct LodTree {
 
     int root_nodes[LOD_ROOT_COUNT];
 
-    // Planet parameters
-    float planet_radius;        // Base sphere radius (e.g., 796000 for 1/8 Earth)
+    // Body parameters (retargetable to planet or any moon)
+    LodBodyType body_type;
+    double body_center_d[3];    // World-space center (0,0,0 for Tenebris, moon.pos_d for moons)
+    float planet_radius;        // Body sphere radius
     float layer_thickness;
     int sea_level;
     int seed;
+    int max_depth_effective;    // Capped by body radius (smaller body = fewer levels)
+
+    // Moon-specific params (only used when body_type == LOD_BODY_MOON)
+    MoonShapeParams moon_shape;
+    MoonColorPalette moon_palette;
 
     // Floating origin (double precision) — all mesh vertex positions are stored
     // relative to this origin to keep float32 vertex coords near zero.
@@ -98,6 +112,7 @@ typedef struct LodTree {
         float max_distance;     // Farthest patch distance from camera
     } level_stats[LOD_MAX_DEPTH + 1];
     int stats_frame_counter;    // For periodic console printing
+    int retarget_diag_frames;   // Diagnostic: log first N frames after retarget
 
     // Depth-based split thresholds (precomputed for consistent LOD ordering)
     float depth_arc[LOD_MAX_DEPTH + 1];  // Canonical arc length at each depth
@@ -154,13 +169,16 @@ typedef struct LodUniformBlock {
     size_t size;
 } LodUniformBlock;
 
-// Hex pipeline rendering info for depth-13 nodes
+// Hex pipeline rendering info for depth-13 nodes + planet color texture
 typedef struct LodHexRenderInfo {
     sg_pipeline pip;
     sg_view atlas_view;
     sg_sampler atlas_smp;
     LodUniformBlock vs_ub;
     LodUniformBlock fs_ub;
+    // Planet color texture (equirectangular, for LOD patch detail)
+    sg_view planet_atlas_view;
+    sg_sampler planet_atlas_smp;
 } LodHexRenderInfo;
 
 // Render all active leaf nodes.
@@ -190,6 +208,14 @@ double lod_tree_terrain_height(const LodTree* tree, HMM_Vec3 world_pos);
 // Call once per frame with the camera's double-precision position.
 // Returns true if origin was recentered (all meshes will regenerate).
 bool lod_tree_update_origin(LodTree* tree, const double cam_pos_d[3]);
+
+// Switch the LOD tree to render a different celestial body.
+// Destroys all existing nodes and regenerates from scratch.
+void lod_tree_retarget(LodTree* tree, LodBodyType type,
+                       const double center_d[3], float radius,
+                       float layer_thickness, int sea_level, int seed,
+                       const MoonShapeParams* moon_shape,
+                       const MoonColorPalette* moon_palette);
 
 // Get stats
 int lod_tree_active_leaves(const LodTree* tree);

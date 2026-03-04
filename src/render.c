@@ -17,9 +17,105 @@
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
+#include "terrain_noise.h"
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+
+// ---- Planet texture generation ----
+// Generates an equirectangular texture showing continents and oceans.
+// Uses the same noise + biome coloring as LOD mesh generation.
+static void generate_planet_texture(Renderer* r, float planet_radius, int seed, int width, int height) {
+    printf("[RENDER] Generating %dx%d planet texture...\n", width, height); fflush(stdout);
+
+    unsigned char* pixels = (unsigned char*)malloc(width * height * 4);
+
+    fnl_state continental = ht_create_continental_noise(seed);
+    fnl_state mountain = ht_create_mountain_noise(seed);
+    fnl_state warp = ht_create_warp_noise(seed);
+    fnl_state detail = ht_create_detail_noise(seed);
+
+    // Biome reference colors (same as lod.c terrain_color_m)
+    const float water_deep[3]    = {0.06f, 0.10f, 0.25f};
+    const float water_shallow[3] = {0.12f, 0.21f, 0.39f};
+    const float sand_col[3]      = {0.94f, 0.84f, 0.77f};
+    const float grass_col[3]     = {0.07f, 0.58f, 0.35f};
+    const float rock_col[3]      = {0.46f, 0.45f, 0.45f};
+    const float high_stone[3]    = {0.50f, 0.50f, 0.50f};
+    const float ice_col[3]       = {0.44f, 0.77f, 0.97f};
+
+    for (int y = 0; y < height; y++) {
+        float lat = ((float)y / (float)(height - 1) - 0.5f) * (float)M_PI;  // [-pi/2, pi/2]
+        float cos_lat = cosf(lat);
+        float sin_lat = sinf(lat);
+
+        for (int x = 0; x < width; x++) {
+            float lon = ((float)x / (float)(width - 1) - 0.5f) * 2.0f * (float)M_PI;  // [-pi, pi]
+
+            // Unit sphere direction
+            HMM_Vec3 dir = {{
+                cos_lat * cosf(lon),
+                sin_lat,
+                cos_lat * sinf(lon),
+            }};
+
+            // Sample terrain height
+            float h_m = ht_sample_height_m(&continental, &mountain, &warp, &detail, dir);
+            float rel = h_m - TERRAIN_SEA_LEVEL_M;
+
+            // Biome coloring (same logic as lod.c terrain_color_m)
+            float r_c, g_c, b_c;
+            if (h_m < TERRAIN_SEA_LEVEL_M) {
+                float depth_t = -rel / 2000.0f;
+                if (depth_t > 1.0f) depth_t = 1.0f;
+                r_c = water_shallow[0] + (water_deep[0] - water_shallow[0]) * depth_t;
+                g_c = water_shallow[1] + (water_deep[1] - water_shallow[1]) * depth_t;
+                b_c = water_shallow[2] + (water_deep[2] - water_shallow[2]) * depth_t;
+            } else {
+                float blend = 100.0f;
+                float t1 = ht_smoothstepf(200.0f - blend, 200.0f + blend, rel);
+                float t2 = ht_smoothstepf(1500.0f - blend, 1500.0f + blend, rel);
+                float t3 = ht_smoothstepf(3000.0f - blend, 3000.0f + blend, rel);
+                float t4 = ht_smoothstepf(4500.0f - blend, 4500.0f + blend, rel);
+
+                r_c = sand_col[0]; g_c = sand_col[1]; b_c = sand_col[2];
+                r_c += (grass_col[0] - r_c) * t1; g_c += (grass_col[1] - g_c) * t1; b_c += (grass_col[2] - b_c) * t1;
+                r_c += (rock_col[0] - r_c) * t2;  g_c += (rock_col[1] - g_c) * t2;  b_c += (rock_col[2] - b_c) * t2;
+                r_c += (high_stone[0] - r_c) * t3; g_c += (high_stone[1] - g_c) * t3; b_c += (high_stone[2] - b_c) * t3;
+                r_c += (ice_col[0] - r_c) * t4;   g_c += (ice_col[1] - g_c) * t4;   b_c += (ice_col[2] - b_c) * t4;
+            }
+
+            int idx = (y * width + x) * 4;
+            pixels[idx + 0] = (unsigned char)(fminf(1.0f, fmaxf(0.0f, r_c)) * 255.0f);
+            pixels[idx + 1] = (unsigned char)(fminf(1.0f, fmaxf(0.0f, g_c)) * 255.0f);
+            pixels[idx + 2] = (unsigned char)(fminf(1.0f, fmaxf(0.0f, b_c)) * 255.0f);
+            pixels[idx + 3] = 255;
+        }
+    }
+
+    r->planet_tex_img = sg_make_image(&(sg_image_desc){
+        .width = width,
+        .height = height,
+        .pixel_format = SG_PIXELFORMAT_RGBA8,
+        .data.mip_levels[0] = (sg_range){ pixels, (size_t)(width * height * 4) },
+        .label = "planet-color-texture",
+    });
+    r->planet_tex_view = sg_make_view(&(sg_view_desc){
+        .texture.image = r->planet_tex_img,
+        .label = "planet-color-view",
+    });
+    r->planet_tex_smp = sg_make_sampler(&(sg_sampler_desc){
+        .min_filter = SG_FILTER_LINEAR,
+        .mag_filter = SG_FILTER_LINEAR,
+        .wrap_u = SG_WRAP_REPEAT,
+        .wrap_v = SG_WRAP_CLAMP_TO_EDGE,
+        .label = "planet-color-sampler",
+    });
+
+    free(pixels);
+    printf("[RENDER] Planet texture generated.\n"); fflush(stdout);
+}
 
 // LOD debug pre-draw callback: sets per-patch lod_debug uniform
 typedef struct {
@@ -37,6 +133,7 @@ void render_init(Renderer* r, Planet* planet, const Camera* cam, const char* edi
     // ---- Planet pipeline ----
     printf("[RENDER] render_init: creating planet shader...\n"); fflush(stdout);
     r->show_lod_debug = false;
+    r->lod_current_body = -1;   // Start targeting Tenebris
 
     sg_shader planet_shd = sg_make_shader(planet_shader_desc(sg_query_backend()));
     printf("[RENDER] render_init: creating planet pipeline...\n"); fflush(stdout);
@@ -115,6 +212,9 @@ void render_init(Renderer* r, Planet* planet, const Camera* cam, const char* edi
     hex_terrain_init(&r->hex_terrain, planet->radius, planet->layer_thickness,
                      planet->sea_level, 42, r->lod_tree.jobs, edits_dir);
     printf("[RENDER] render_init: hex terrain done\n"); fflush(stdout);
+
+    // ---- Planet color texture (equirectangular, baked from terrain noise) ----
+    generate_planet_texture(r, planet->radius, 42, 2048, 1024);
 
     r->lod_tree.suppress_range = 0.0f;  // Updated dynamically each frame
 
@@ -304,7 +404,6 @@ void render_init(Renderer* r, Planet* planet, const Camera* cam, const char* edi
             .wrap_v = SG_WRAP_CLAMP_TO_EDGE,
             .label = "hex-atlas-sampler",
         });
-
         sg_shader hex_shd = sg_make_shader(hex_terrain_shader_desc(sg_query_backend()));
         r->hex_pip = sg_make_pipeline(&(sg_pipeline_desc){
             .shader = hex_shd,
@@ -466,11 +565,15 @@ void render_update_mesh(Renderer* r, Planet* planet, const Camera* cam) {
     lod_tree_upload_meshes(&r->lod_tree);
     uint64_t t2 = stm_now();
 
-    // Hex terrain: 3D voxel system (close-range)
+    // Hex terrain: 3D voxel system (close-range, Tenebris only)
     uint64_t t3 = stm_now();
-    hex_terrain_update(&r->hex_terrain, cam->position, r->lod_tree.world_origin);
+    if (r->lod_current_body == -1) {
+        hex_terrain_update(&r->hex_terrain, cam->position, r->lod_tree.world_origin);
+    }
     uint64_t t4 = stm_now();
-    hex_terrain_upload_meshes(&r->hex_terrain);
+    if (r->lod_current_body == -1) {
+        hex_terrain_upload_meshes(&r->hex_terrain);
+    }
     uint64_t t5 = stm_now();
     double hex_update_ms = stm_ms(stm_diff(t4, t3));
     double hex_upload_ms = stm_ms(stm_diff(t5, t4));
@@ -549,6 +652,7 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
     sg_draw(0, 3, 1);
 
     // ---- 2. Draw atmosphere (fullscreen, additive blend on top of sky) ----
+    // Always render — Tenebris fallback mesh provides solid geometry when on a moon.
     atmosphere_render(&r->atmosphere, &r->sky_bind,
                       cam->position, r->sun_direction,
                       cam_S, cam_U, cam_F, tan_half_fov, aspect,
@@ -625,7 +729,30 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
             r->visual_config.day_sun_color.Z,
             0.0f,
         }},
+        .planet_tex_params = (HMM_Vec4){{
+            (r->planet_tex_img.id != SG_INVALID_ID) ? 1.0f : 0.0f,  // enabled
+            50000.0f,   // blend_start: vertex colors dominate below 50km (LOD 6+)
+            200000.0f,  // blend_end: fully texture above 200km (LOD 1-5, orbital)
+            0.0f,
+        }},
     };
+
+    // Snapshot Tenebris-mode fs_params BEFORE applying moon overrides.
+    // This is passed to solar_system_render for the Tenebris fallback mesh.
+    planet_fs_params_t planet_fs_for_tenebris = fs_params;
+
+    // When LOD tree targets a moon, adjust uniforms for correct lighting/fog
+    if (r->lod_current_body >= 0) {
+        // camera_pos relative to frozen moon center (body_center_d, not live pos_d)
+        float cx = (float)(cam->pos_d[0] - r->lod_tree.body_center_d[0]);
+        float cy = (float)(cam->pos_d[1] - r->lod_tree.body_center_d[1]);
+        float cz = (float)(cam->pos_d[2] - r->lod_tree.body_center_d[2]);
+        fs_params.camera_pos = (HMM_Vec4){{cx, cy, cz, 0.0f}};
+        // Disable aerial perspective fog on moons (no atmosphere)
+        fs_params.atmos_params = (HMM_Vec4){{1.0f, 2.0f, 0.0f, 0.0f}};
+        // Disable planet texture on moons (they use vertex colors only)
+        fs_params.planet_tex_params = (HMM_Vec4){{0.0f, 0.0f, 0.0f, 0.0f}};
+    }
 
     sg_apply_pipeline(r->pip);
     sg_apply_uniforms(UB_planet_vs_params, &SG_RANGE(vs_params));
@@ -657,6 +784,8 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
         .atlas_smp = r->hex_atlas_smp,
         .vs_ub = { .slot = UB_hex_terrain_vs_params, .data = &hex_vs, .size = sizeof(hex_vs) },
         .fs_ub = { .slot = UB_hex_terrain_fs_params, .data = &hex_fs, .size = sizeof(hex_fs) },
+        .planet_atlas_view = r->planet_tex_view,
+        .planet_atlas_smp = r->planet_tex_smp,
     };
     LodUniformBlock planet_ub[2] = {
         { .slot = UB_planet_vs_params, .data = &vs_params, .size = sizeof(vs_params) },
@@ -693,10 +822,18 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
     }
 
     // ---- 3a+. Draw moons ----
+    // Pass the original (pre-moon-override) fs_params for the Tenebris fallback mesh
+    // so it looks identical to the LOD-rendered Tenebris from space.
     solar_system_render(&r->solar_system, cam, r->sun_direction,
                         vp_terrain, r->pip,
                         Fcoef, far_plane, z_bias,
-                        r->lod_tree.world_origin);
+                        r->lod_tree.world_origin,
+                        r->lod_current_body,
+                        r->planet_tex_view, r->planet_tex_smp,
+                        &planet_fs_for_tenebris);
+
+    // ---- 3a++. Draw moon orbit lines (space mode) ----
+    solar_system_draw_orbits(&r->solar_system, cam, vp_terrain);
 
     // ---- 3b. Draw hex terrain (close-range 3D voxel chunks) ----
     if (r->hex_terrain.active_count > 0) {
@@ -857,14 +994,16 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
     sdtx_color3f(1.0f, 1.0f, 0.0f);
     sdtx_printf("FPS: %.0f\n", r->display_fps);
 
-    // Player position + altitude
+    // Player altitude (relative to gravity body surface)
     {
-        float cam_r = sqrtf(cam->position.X * cam->position.X +
-                            cam->position.Y * cam->position.Y +
-                            cam->position.Z * cam->position.Z);
+        double bdx = cam->pos_d[0] - r->lod_tree.body_center_d[0];
+        double bdy = cam->pos_d[1] - r->lod_tree.body_center_d[1];
+        double bdz = cam->pos_d[2] - r->lod_tree.body_center_d[2];
+        float cam_r = (float)sqrt(bdx*bdx + bdy*bdy + bdz*bdz);
         float altitude = cam_r - r->lod_tree.planet_radius;
+        float body_r_km = r->lod_tree.planet_radius / 1000.0f;
         sdtx_color3f(0.6f, 0.8f, 1.0f);
-        sdtx_printf("alt: %.0fm  r: %.0fkm\n", altitude, cam_r / 1000.0f);
+        sdtx_printf("alt: %.0fm  R: %.0fkm\n", altitude, body_r_km);
     }
 
     // Jetpack status
@@ -887,6 +1026,26 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
         const char* name = (vtype < 9) ? block_names[vtype] : "???";
         sdtx_color3f(1.0f, 0.8f, 0.4f);
         sdtx_printf("[%d] %s\n", r->hotbar_selected_slot + 1, name);
+    }
+
+    // Reference frame indicator (top-right corner)
+    {
+        float canvas_w = sapp_widthf() * 0.5f;
+        const char* body_name;
+        if (cam->gravity_body < 0) {
+            body_name = "Tenebris";
+        } else if (cam->gravity_body < r->solar_system.moon_count) {
+            body_name = r->solar_system.moons[cam->gravity_body].name;
+        } else {
+            body_name = "???";
+        }
+        int name_len = 0;
+        for (const char* p = body_name; *p; p++) name_len++;
+        // Position: right edge minus name length, top row
+        float col = canvas_w / 8.0f - (float)name_len - 1.0f;
+        sdtx_color3f(0.6f, 0.8f, 1.0f);
+        sdtx_pos(col, 0.0f);
+        sdtx_puts(body_name);
     }
 
     // ---- F3 Profiler overlay ----
@@ -1092,6 +1251,15 @@ void render_shutdown(Renderer* r) {
     }
     if (r->hex_atlas_smp.id != SG_INVALID_ID) {
         sg_destroy_sampler(r->hex_atlas_smp);
+    }
+    if (r->planet_tex_view.id != SG_INVALID_ID) {
+        sg_destroy_view(r->planet_tex_view);
+    }
+    if (r->planet_tex_img.id != SG_INVALID_ID) {
+        sg_destroy_image(r->planet_tex_img);
+    }
+    if (r->planet_tex_smp.id != SG_INVALID_ID) {
+        sg_destroy_sampler(r->planet_tex_smp);
     }
     if (r->hotbar_pip.id != SG_INVALID_ID) {
         sg_destroy_pipeline(r->hotbar_pip);

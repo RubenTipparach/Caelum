@@ -33,6 +33,13 @@ typedef struct MeshGenJob {
     int seed;
     float origin[3];  // Floating origin — subtract from world positions
 
+    // Body targeting
+    LodBodyType body_type;
+    double body_center_d[3];        // World-space center of the body
+    MoonShapeParams moon_shape;     // Only used for LOD_BODY_MOON
+    MoonColorPalette moon_palette;
+    int max_depth_effective;
+
     // Shared hex tangent frame (copied from LodTree for thread safety)
     HMM_Vec3 hex_frame_origin;
     HMM_Vec3 hex_frame_east;
@@ -403,10 +410,15 @@ static int allocate_node(LodTree* tree) {
 
 void lod_tree_init(LodTree* tree, float planet_radius, float layer_thickness,
                    int sea_level, int seed) {
+    tree->body_type = LOD_BODY_PLANET;
+    tree->body_center_d[0] = 0.0;
+    tree->body_center_d[1] = 0.0;
+    tree->body_center_d[2] = 0.0;
     tree->planet_radius = planet_radius;
     tree->layer_thickness = layer_thickness;
     tree->sea_level = sea_level;
     tree->seed = seed;
+    tree->max_depth_effective = LOD_MAX_DEPTH;
     tree->camera_pos = (HMM_Vec3){{0, 0, 0}};
     tree->world_origin[0] = 0.0;
     tree->world_origin[1] = 0.0;
@@ -416,6 +428,8 @@ void lod_tree_init(LodTree* tree, float planet_radius, float layer_thickness,
     tree->stats_frame_counter = 0;
     tree->suppress_range = 0.0f;
     tree->split_factor = LOD_SPLIT_FACTOR;
+    memset(&tree->moon_shape, 0, sizeof(tree->moon_shape));
+    memset(&tree->moon_palette, 0, sizeof(tree->moon_palette));
 
     // Initial capacity
     tree->node_capacity = 256;
@@ -495,6 +509,159 @@ void lod_tree_destroy(LodTree* tree) {
     tree->nodes = NULL;
     tree->node_count = 0;
     tree->node_capacity = 0;
+}
+
+// Compute max LOD depth based on body radius (smaller bodies need fewer levels)
+static int compute_max_depth_for_radius(float radius) {
+    // Target ~1m patches at max depth.
+    // At depth 0, patch_size ~ (2*pi*R / 5). Each depth halves the linear size.
+    // Solve: (2*pi*R / 5) / 2^d ≈ 1m → d ≈ log2(2*pi*R / 5)
+    float patch0 = 2.0f * (float)M_PI * radius / 5.0f;
+    int d = (int)(log2f(patch0));
+    if (d < 4) d = 4;          // Never go below depth 4
+    if (d > LOD_MAX_DEPTH) d = LOD_MAX_DEPTH;
+    return d;
+}
+
+void lod_tree_retarget(LodTree* tree, LodBodyType type,
+                       const double center_d[3], float radius,
+                       float layer_thickness, int sea_level, int seed,
+                       const MoonShapeParams* moon_shape,
+                       const MoonColorPalette* moon_palette) {
+    printf("[LOD] Retarget: type=%d radius=%.0f center=(%.0f,%.0f,%.0f)\n",
+           type, radius, center_d[0], center_d[1], center_d[2]);
+
+    fflush(stdout);
+
+    // ---- 1. Flush the job queue: remove all queued-but-not-started jobs ----
+    // This prevents old body's mesh jobs from clogging the queue and triggering
+    // backpressure that would block the new body's LOD updates.
+    {
+        void* flushed[256];
+        int n_flushed = job_system_flush(tree->jobs, flushed, 256);
+        // Clear node pending_job pointers for flushed jobs (via node_index), then free
+        for (int i = 0; i < n_flushed; i++) {
+            MeshGenJob* job = (MeshGenJob*)flushed[i];
+            int ni = job->node_index;
+            if (ni >= 0 && ni < tree->node_count) {
+                tree->nodes[ni].pending_job = NULL;
+                tree->nodes[ni].state = LOD_UNLOADED;
+            }
+            if (job->vertices) free(job->vertices);
+            free(job);
+        }
+        if (n_flushed > 0) {
+            printf("[LOD] Flushed %d queued jobs\n", n_flushed);
+        }
+    }
+
+    // ---- 2. Wait for in-flight jobs (already dequeued by workers) ----
+    // After flush, only jobs currently executing on worker threads remain.
+    // At most num_workers (~4) jobs, each completing within milliseconds.
+    for (int i = 0; i < tree->node_count; i++) {
+        LodNode* node = &tree->nodes[i];
+        if (node->pending_job) {
+            MeshGenJob* job = (MeshGenJob*)node->pending_job;
+            volatile int* done = &job->completed;
+            while (!*done) { /* spin — worker will finish shortly */ }
+            if (job->vertices) free(job->vertices);
+            free(job);
+            node->pending_job = NULL;
+        }
+    }
+
+    // ---- 3. Free all node resources ----
+    for (int i = 0; i < tree->node_count; i++) {
+        LodNode* node = &tree->nodes[i];
+
+        if (node->cpu_vertices) {
+            free(node->cpu_vertices);
+            node->cpu_vertices = NULL;
+            node->cpu_vertex_count = 0;
+        }
+
+        if (node->gpu_buffer.id != SG_INVALID_ID) {
+            sg_destroy_buffer(node->gpu_buffer);
+            node->gpu_buffer.id = SG_INVALID_ID;
+            node->gpu_vertex_count = 0;
+        }
+
+        node->state = LOD_UNLOADED;
+    }
+
+    // Reset tree to just 20 root nodes (collapse all subdivision)
+    for (int i = 0; i < tree->node_count; i++) {
+        bool is_root = false;
+        for (int r = 0; r < LOD_ROOT_COUNT; r++) {
+            if (tree->root_nodes[r] == i) { is_root = true; break; }
+        }
+        if (!is_root) {
+            LodNode* node = &tree->nodes[i];
+            node->is_leaf = false;
+            node->wants_split = false;
+            node->wants_merge = false;
+        }
+    }
+
+    // Reset root nodes to leaf state
+    for (int r = 0; r < LOD_ROOT_COUNT; r++) {
+        LodNode* root = &tree->nodes[tree->root_nodes[r]];
+        root->state = LOD_UNLOADED;
+        root->is_leaf = true;
+        root->wants_split = false;
+        root->wants_merge = false;
+        for (int c = 0; c < LOD_CHILDREN; c++) root->children[c] = -1;
+    }
+    // Reset node count to root nodes only (free pool space for fresh subdivision)
+    tree->node_count = LOD_ROOT_COUNT;
+
+    // Update body parameters
+    tree->body_type = type;
+    tree->body_center_d[0] = center_d[0];
+    tree->body_center_d[1] = center_d[1];
+    tree->body_center_d[2] = center_d[2];
+    tree->planet_radius = radius;
+    tree->layer_thickness = layer_thickness;
+    tree->sea_level = sea_level;
+    tree->seed = seed;
+    tree->max_depth_effective = compute_max_depth_for_radius(radius);
+
+    if (moon_shape) tree->moon_shape = *moon_shape;
+    else memset(&tree->moon_shape, 0, sizeof(tree->moon_shape));
+    if (moon_palette) tree->moon_palette = *moon_palette;
+    else memset(&tree->moon_palette, 0, sizeof(tree->moon_palette));
+
+    // Reset floating origin near the body center
+    tree->world_origin[0] = center_d[0];
+    tree->world_origin[1] = center_d[1];
+    tree->world_origin[2] = center_d[2];
+
+    // Invalidate hex frame
+    tree->hex_frame_valid = false;
+    tree->suppress_range = 0.0f;
+
+    // Recompute depth arcs for new radius
+    {
+        float avg_root_ar = 0.0f;
+        for (int i = 0; i < LOD_ROOT_COUNT; i++) {
+            avg_root_ar += tree->nodes[tree->root_nodes[i]].tri.angular_radius;
+        }
+        avg_root_ar /= (float)LOD_ROOT_COUNT;
+
+        for (int d = 0; d <= LOD_MAX_DEPTH; d++) {
+            float ar = avg_root_ar;
+            for (int i = 0; i < d; i++) ar *= 0.5f;
+            tree->depth_arc[d] = ar * radius;
+        }
+    }
+
+    tree->active_leaf_count = 0;
+    tree->total_vertex_count = 0;
+    tree->splits_this_frame = 0;
+    tree->retarget_diag_frames = 30;  // Log next 30 frames
+
+    printf("[LOD] Retarget complete: max_depth=%d\n", tree->max_depth_effective);
+    fflush(stdout);
 }
 
 // ---- Hex grid constants (for LOD depth-13 hex mesh generation) ----
@@ -977,8 +1144,10 @@ static void generate_hex_mesh_for_triangle(
 // Generate mesh for a coarse node (tessellated spherical triangle).
 // Thread-safe: takes all inputs by value, writes to output pointers.
 static void generate_coarse_mesh_params(
-    const SphericalTriangle* tri, int depth,
+    const SphericalTriangle* tri, int depth, int max_depth,
     float planet_radius, float layer_thickness, int sea_level, int seed,
+    LodBodyType body_type, const MoonShapeParams* moon_shape,
+    const MoonColorPalette* moon_palette, const double body_center_d[3],
     LodVertex** out_vertices, int* out_count)
 {
     // Tessellation resolution depends on depth.
@@ -1021,15 +1190,42 @@ static void generate_coarse_mesh_params(
             );
             p = vec3_normalize(p);
 
-            // Single source of truth: hex terrain provides noise + structures (arch etc.)
-            float h_m, effective_h_m;
-            hex_terrain_sample_height(seed, planet_radius, p, &h_m, &effective_h_m);
+            float radius;
+            float h_m;
+            HMM_Vec3 vert_color;
 
-            float radius = planet_radius + effective_h_m;
+            if (body_type == LOD_BODY_MOON && moon_shape) {
+                // Moon terrain: ellipsoid + noise displacement
+                radius = moon_surface_radius(moon_shape, p);
+                h_m = radius - moon_shape->base_radius;
 
-            points[idx] = vec3_scale(p, radius);
+                // Color from palette based on relative height
+                float base_r = moon_shape->base_radius;
+                float height_t = (radius - base_r * 0.9f) / (base_r * 0.2f);
+                height_t = fminf(1.0f, fmaxf(0.0f, height_t));
+                vert_color = vec3_lerp(moon_palette->shadow_color,
+                                       moon_palette->base_color, height_t);
+                vert_color = vec3_lerp(vert_color,
+                                       moon_palette->highlight_color,
+                                       height_t * height_t * 0.5f);
+                // Slight noise perturbation for color variation
+                vert_color = perturb_color(vert_color, &cnoise, p);
+            } else {
+                // Planet terrain: full noise + structures
+                float effective_h_m;
+                hex_terrain_sample_height(seed, planet_radius, p, &h_m, &effective_h_m);
+                radius = planet_radius + effective_h_m;
+                vert_color = perturb_color(terrain_color_m(h_m), &cnoise, p);
+            }
+
+            // Body center offset: shift from body-local to world space
+            points[idx] = (HMM_Vec3){{
+                p.X * radius + (float)body_center_d[0],
+                p.Y * radius + (float)body_center_d[1],
+                p.Z * radius + (float)body_center_d[2],
+            }};
             heights[idx] = h_m;
-            colors[idx] = perturb_color(terrain_color_m(h_m), &cnoise, p);
+            colors[idx] = vert_color;
             idx++;
         }
     }
@@ -1102,8 +1298,8 @@ static void generate_coarse_mesh_params(
 
     // ---- Boundary skirts: hide gaps between patches at different LOD levels ----
     // Only needed at depths where neighbors may have different LOD levels.
-    // At depth >= LOD_MAX_DEPTH-1, all neighbors are the same depth — no seams.
-    if (depth < LOD_MAX_DEPTH - 1) {
+    // At depth >= max_depth-1, all neighbors are the same depth — no seams.
+    if (depth < max_depth - 1) {
         float patch_world_size = tri->angular_radius * planet_radius;
         float skirt_drop = fmaxf(3.0f * layer_thickness, patch_world_size * 0.015f);
 
@@ -1162,25 +1358,41 @@ static void apply_origin_offset(void* verts, int count, int stride, const float 
 static void mesh_gen_worker(void* data) {
     MeshGenJob* job = (MeshGenJob*)data;
 
-    if (job->depth >= LOD_MAX_DEPTH) {
-        // Hex mesh: output is HexVertex[]
-        HexVertex* hex_verts = NULL;
-        int hex_count = 0;
-        generate_hex_mesh_for_triangle(
-            &job->tri, job->planet_radius, job->seed,
-            job->hex_frame_origin, job->hex_frame_east, job->hex_frame_north,
-            &hex_verts, &hex_count);
-        job->vertices = hex_verts;
-        job->vertex_count = hex_count;
-        job->vertex_stride = sizeof(HexVertex);
-        job->is_hex_mesh = true;
+    if (job->depth >= job->max_depth_effective) {
+        // Hex mesh: output is HexVertex[] (only for planet; moons use coarse at max depth)
+        if (job->body_type == LOD_BODY_PLANET) {
+            HexVertex* hex_verts = NULL;
+            int hex_count = 0;
+            generate_hex_mesh_for_triangle(
+                &job->tri, job->planet_radius, job->seed,
+                job->hex_frame_origin, job->hex_frame_east, job->hex_frame_north,
+                &hex_verts, &hex_count);
+            job->vertices = hex_verts;
+            job->vertex_count = hex_count;
+            job->vertex_stride = sizeof(HexVertex);
+            job->is_hex_mesh = true;
+        } else {
+            // Moon at max depth: just use fine coarse mesh (no hex voxels)
+            LodVertex* lod_verts = NULL;
+            int lod_count = 0;
+            generate_coarse_mesh_params(
+                &job->tri, job->depth, job->max_depth_effective,
+                job->planet_radius, job->layer_thickness, job->sea_level, job->seed,
+                job->body_type, &job->moon_shape, &job->moon_palette, job->body_center_d,
+                &lod_verts, &lod_count);
+            job->vertices = lod_verts;
+            job->vertex_count = lod_count;
+            job->vertex_stride = sizeof(LodVertex);
+            job->is_hex_mesh = false;
+        }
     } else {
         // Tessellated mesh: smooth terrain (all non-hex depths)
         LodVertex* lod_verts = NULL;
         int lod_count = 0;
         generate_coarse_mesh_params(
-            &job->tri, job->depth,
+            &job->tri, job->depth, job->max_depth_effective,
             job->planet_radius, job->layer_thickness, job->sea_level, job->seed,
+            job->body_type, &job->moon_shape, &job->moon_palette, job->body_center_d,
             &lod_verts, &lod_count);
         job->vertices = lod_verts;
         job->vertex_count = lod_count;
@@ -1197,7 +1409,7 @@ static void mesh_gen_worker(void* data) {
 
 // Synchronous mesh generation (fallback when no job system)
 static void generate_node_mesh(LodTree* tree, LodNode* node) {
-    if (node->depth >= LOD_MAX_DEPTH) {
+    if (node->depth >= tree->max_depth_effective && tree->body_type == LOD_BODY_PLANET) {
         HexVertex* hex_verts = NULL;
         int hex_count = 0;
         generate_hex_mesh_for_triangle(
@@ -1212,8 +1424,9 @@ static void generate_node_mesh(LodTree* tree, LodNode* node) {
         LodVertex* lod_verts = NULL;
         int lod_count = 0;
         generate_coarse_mesh_params(
-            &node->tri, node->depth,
+            &node->tri, node->depth, tree->max_depth_effective,
             tree->planet_radius, tree->layer_thickness, tree->sea_level, tree->seed,
+            tree->body_type, &tree->moon_shape, &tree->moon_palette, tree->body_center_d,
             &lod_verts, &lod_count);
         node->cpu_vertices = lod_verts;
         node->cpu_vertex_count = lod_count;
@@ -1243,6 +1456,13 @@ static bool submit_mesh_job(LodTree* tree, int node_idx) {
     job->origin[0] = (float)tree->world_origin[0];
     job->origin[1] = (float)tree->world_origin[1];
     job->origin[2] = (float)tree->world_origin[2];
+    job->body_type = tree->body_type;
+    job->body_center_d[0] = tree->body_center_d[0];
+    job->body_center_d[1] = tree->body_center_d[1];
+    job->body_center_d[2] = tree->body_center_d[2];
+    job->moon_shape = tree->moon_shape;
+    job->moon_palette = tree->moon_palette;
+    job->max_depth_effective = tree->max_depth_effective;
     job->hex_frame_origin = tree->hex_frame_origin;
     job->hex_frame_east = tree->hex_frame_east;
     job->hex_frame_north = tree->hex_frame_north;
@@ -1282,13 +1502,17 @@ static void process_completed_jobs(LodTree* tree) {
         MeshGenJob* job = (MeshGenJob*)node->pending_job;
         if (!job->completed) continue;
 
-        // Check if job's origin matches current tree origin (may be stale after recenter)
+        // Check if job's origin matches current tree origin (may be stale after recenter).
+        // Use distance threshold instead of exact equality: orbital delta shifts the
+        // origin by small amounts each frame, which is NOT a real recenter. Only discard
+        // when the origin has shifted by >1km (a real floating-origin recenter).
         float cur_origin[3] = {(float)tree->world_origin[0],
                                (float)tree->world_origin[1],
                                (float)tree->world_origin[2]};
-        bool stale = (job->origin[0] != cur_origin[0] ||
-                      job->origin[1] != cur_origin[1] ||
-                      job->origin[2] != cur_origin[2]);
+        float odx = job->origin[0] - cur_origin[0];
+        float ody = job->origin[1] - cur_origin[1];
+        float odz = job->origin[2] - cur_origin[2];
+        bool stale = (odx*odx + ody*ody + odz*odz) > 1000.0f * 1000.0f;
 
         if (stale) {
             // Discard stale mesh and reset node for regeneration
@@ -1318,7 +1542,7 @@ static void process_completed_jobs(LodTree* tree) {
 static bool split_node(LodTree* tree, int node_idx) {
     LodNode* node = &tree->nodes[node_idx];
     if (!node->is_leaf) return false;
-    if (node->depth >= LOD_MAX_DEPTH) return false;
+    if (node->depth >= tree->max_depth_effective) return false;
     if (tree->node_count + LOD_CHILDREN > tree->node_capacity &&
         tree->node_capacity >= LOD_MAX_NODES) {
         return false;  // At max capacity
@@ -1418,7 +1642,10 @@ static float patch_distance(const LodTree* tree, const LodNode* node) {
     float arc_dist = edge_angle * tree->planet_radius;
 
     // Altitude above the highest possible terrain (prevents over-splitting from orbit)
-    float max_surface_r = tree->planet_radius + TERRAIN_AMPLITUDE_M;
+    float terrain_amp = (tree->body_type == LOD_BODY_MOON)
+        ? tree->moon_shape.noise_amplitude * tree->moon_shape.base_radius
+        : TERRAIN_AMPLITUDE_M;
+    float max_surface_r = tree->planet_radius + terrain_amp;
     float altitude = cam_r - max_surface_r;
     if (altitude < 0.0f) altitude = 0.0f;
 
@@ -1441,7 +1668,10 @@ static float patch_center_distance(const LodTree* tree, const LodNode* node) {
 
     float arc_dist = angle_to_center * tree->planet_radius;
 
-    float max_surface_r = tree->planet_radius + TERRAIN_AMPLITUDE_M;
+    float terrain_amp = (tree->body_type == LOD_BODY_MOON)
+        ? tree->moon_shape.noise_amplitude * tree->moon_shape.base_radius
+        : TERRAIN_AMPLITUDE_M;
+    float max_surface_r = tree->planet_radius + terrain_amp;
     float altitude = cam_r - max_surface_r;
     if (altitude < 0.0f) altitude = 0.0f;
 
@@ -1452,11 +1682,11 @@ static float patch_center_distance(const LodTree* tree, const LodNode* node) {
 // Using depth_arc[] (precomputed) ensures all patches at the same depth
 // have identical thresholds — no asymmetry from aperture-4 corner vs center children.
 static bool should_split(const LodTree* tree, const LodNode* node) {
-    if (node->depth >= LOD_MAX_DEPTH) return false;
+    if (node->depth >= tree->max_depth_effective) return false;
 
-    // Don't split to hex-voxel depth — hex_terrain system handles close-range detail.
-    // LOD stops at depth 12 (smooth heightmap); hex_terrain overlays on top with depth bias.
-    if (node->depth + 1 >= LOD_MAX_DEPTH) return false;
+    // For the planet, don't split to hex-voxel depth — hex_terrain system handles close-range detail.
+    // For moons, max_depth_effective is already capped appropriately.
+    if (tree->body_type == LOD_BODY_PLANET && node->depth + 1 >= tree->max_depth_effective) return false;
 
     float dist = patch_center_distance(tree, node);
     float patch_arc = tree->depth_arc[node->depth];
@@ -1601,7 +1831,18 @@ static void update_node(LodTree* tree, int node_idx) {
 
 void lod_tree_update(LodTree* tree, HMM_Vec3 camera_pos, HMM_Mat4 view_proj) {
     (void)view_proj;
-    tree->camera_pos = camera_pos;
+
+    // For moons, transform camera to body-local coords so distance metrics
+    // (patch_distance, patch_center_distance) work correctly on the unit sphere.
+    if (tree->body_type == LOD_BODY_MOON) {
+        tree->camera_pos = (HMM_Vec3){{
+            camera_pos.X - (float)tree->body_center_d[0],
+            camera_pos.Y - (float)tree->body_center_d[1],
+            camera_pos.Z - (float)tree->body_center_d[2],
+        }};
+    } else {
+        tree->camera_pos = camera_pos;
+    }
     tree->splits_this_frame = 0;
 
     // Update shared hex tangent frame.
@@ -1637,6 +1878,7 @@ void lod_tree_update(LodTree* tree, HMM_Vec3 camera_pos, HMM_Mat4 view_proj) {
     // This prevents the main thread from queuing faster than workers can process,
     // which would eventually fill the queue and stall the frame loop.
     int pending = job_system_pending(tree->jobs);
+
     if (pending > 128) {  // Let workers catch up but don't starve the tree build
         // Queue heavily loaded — skip splits this frame, let workers catch up
         goto collect_stats;
@@ -1883,6 +2125,9 @@ void lod_tree_render(LodTree* tree, sg_pipeline pip, HMM_Mat4 vp,
     if (hex) {
         rs.hex_bind.views[0] = hex->atlas_view;
         rs.hex_bind.samplers[0] = hex->atlas_smp;
+        // Planet triplanar: bind same atlas with LINEAR sampler
+        rs.bind.views[0] = hex->planet_atlas_view;
+        rs.bind.samplers[0] = hex->planet_atlas_smp;
     }
     rs.hex = hex;
     rs.hex_active = false;
@@ -2040,6 +2285,26 @@ bool lod_tree_update_origin(LodTree* tree, const double cam_pos_d[3]) {
 }
 
 double lod_tree_terrain_height(const LodTree* tree, HMM_Vec3 world_pos) {
+    if (tree->body_type == LOD_BODY_MOON) {
+        // Moon: get direction from body center, use moon noise
+        HMM_Vec3 rel = {{
+            world_pos.X - (float)tree->body_center_d[0],
+            world_pos.Y - (float)tree->body_center_d[1],
+            world_pos.Z - (float)tree->body_center_d[2],
+        }};
+        HMM_Vec3 unit = vec3_normalize(rel);
+        float r = moon_surface_radius(&tree->moon_shape, unit);
+        // Return distance from world origin to surface point along this direction
+        double cx = tree->body_center_d[0];
+        double cy = tree->body_center_d[1];
+        double cz = tree->body_center_d[2];
+        return sqrt(
+            (cx + (double)unit.X * r) * (cx + (double)unit.X * r) +
+            (cy + (double)unit.Y * r) * (cy + (double)unit.Y * r) +
+            (cz + (double)unit.Z * r) * (cz + (double)unit.Z * r)
+        );
+    }
+
     HMM_Vec3 unit = vec3_normalize(world_pos);
     float effective_h_m;
     hex_terrain_sample_height(tree->seed, tree->planet_radius, unit, NULL, &effective_h_m);
