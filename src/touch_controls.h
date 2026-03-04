@@ -18,7 +18,8 @@ typedef struct TouchJoystick {
 } TouchJoystick;
 
 typedef struct TouchButton {
-    float x, y, w, h;      /* Screen rect (computed from layout) */
+    float x, y;            /* Screen center of button */
+    float radius;           /* Hit/visual radius */
     bool pressed;
     bool just_released;     /* Set true on finger-up, cleared by caller */
     uintptr_t touch_id;
@@ -28,12 +29,16 @@ typedef struct TouchControls {
     bool is_touch_device;       /* Auto-detected on first TOUCHES_BEGAN */
 
     TouchJoystick move_stick;   /* Left side — floating joystick */
-    TouchJoystick look_stick;   /* Right side — trackpad (delta-based) */
+    TouchJoystick look_stick;   /* Right side — floating joystick */
 
-    TouchButton btn_jump;       /* Green */
-    TouchButton btn_crouch;     /* Blue */
-    TouchButton btn_break;      /* Red */
-    TouchButton btn_place;      /* Yellow */
+    /* Face buttons (diamond layout, right side) */
+    TouchButton btn_jump;       /* Top — green (A) */
+    TouchButton btn_crouch;     /* Bottom — blue (B) */
+    TouchButton btn_break;      /* Left — red (X) */
+    TouchButton btn_place;      /* Right — yellow (Y) */
+
+    /* Menu / start button */
+    TouchButton btn_menu;       /* Top center */
 
     int hotbar_touch_slot;      /* -1 if no hotbar tap this event */
 } TouchControls;

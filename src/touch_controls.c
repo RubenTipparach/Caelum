@@ -10,22 +10,33 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* ---------- layout constants (hotbar must match render.c) ---------- */
+/* ---------- layout constants ---------- */
+
+/* Joysticks */
+#define STICK_OUTER_RADIUS      70.0f   /* outer ring radius */
+#define STICK_KNOB_RADIUS       24.0f   /* inner thumb knob */
+#define STICK_DEADZONE          0.15f
+#define STICK_MARGIN_X          120.0f  /* center of joystick from screen edge */
+#define STICK_MARGIN_Y          160.0f  /* center of joystick from bottom */
+#define TOUCH_LOOK_SENSITIVITY  0.005f
+
+/* Face buttons (diamond / ABXY layout) */
+#define FACE_BTN_RADIUS         28.0f
+#define FACE_CENTER_MARGIN_X    100.0f  /* diamond center from right edge */
+#define FACE_CENTER_MARGIN_Y    200.0f  /* diamond center from bottom edge */
+#define FACE_SPREAD             52.0f   /* distance from diamond center to each button center */
+
+/* Menu / start button */
+#define MENU_BTN_W              70.0f
+#define MENU_BTN_H              30.0f
+#define MENU_BTN_RADIUS         35.0f   /* hit area radius */
+#define MENU_TOP_MARGIN         30.0f   /* from top edge */
+
+/* Hotbar */
 #define HOTBAR_VISUAL_SLOTS     8
 #define HOTBAR_SLOT_SIZE        40.0f
 #define HOTBAR_PADDING          4.0f
 #define HOTBAR_BOTTOM_MARGIN    12.0f
-
-/* buttons */
-#define BTN_RADIUS              30.0f
-#define BTN_SPACING             70.0f   /* diameter + 10 px gap */
-#define BTN_RIGHT_MARGIN        50.0f
-#define BTN_BASE_Y_OFFSET       200.0f  /* from bottom edge to center of Place btn */
-
-/* joystick */
-#define STICK_RADIUS            60.0f
-#define STICK_DEADZONE          0.3f
-#define TOUCH_LOOK_SENSITIVITY  0.005f
 
 /* ---------- helpers ---------- */
 
@@ -35,26 +46,35 @@ static bool point_in_circle(float px, float py,
     return dx * dx + dy * dy <= r * r;
 }
 
-static void update_button_layout(TouchControls* tc) {
+static bool point_in_rect(float px, float py,
+                           float rx, float ry, float rw, float rh) {
+    return px >= rx && px <= rx + rw && py >= ry && py <= ry + rh;
+}
+
+/* Compute button positions from current screen size */
+static void update_layout(TouchControls* tc) {
     float sw = sapp_widthf();
     float sh = sapp_heightf();
-    float r  = BTN_RADIUS;
-    float d  = r * 2.0f;
-    float cx = sw - BTN_RIGHT_MARGIN;
-    float base_y = sh - BTN_BASE_Y_OFFSET;
 
-    /* From bottom up: Place, Break, Crouch, Jump */
-    tc->btn_place.x  = cx - r;  tc->btn_place.y  = base_y - r;
-    tc->btn_place.w  = d;       tc->btn_place.h  = d;
+    /* Face buttons — diamond centered at (sw - margin, sh - margin) */
+    float dcx = sw - FACE_CENTER_MARGIN_X;
+    float dcy = sh - FACE_CENTER_MARGIN_Y;
 
-    tc->btn_break.x  = cx - r;  tc->btn_break.y  = base_y - BTN_SPACING - r;
-    tc->btn_break.w  = d;       tc->btn_break.h  = d;
+    /* Top = Jump (A), Bottom = Crouch (B), Left = Break (X), Right = Place (Y) */
+    tc->btn_jump.x   = dcx;                tc->btn_jump.y   = dcy - FACE_SPREAD;
+    tc->btn_crouch.x = dcx;                tc->btn_crouch.y = dcy + FACE_SPREAD;
+    tc->btn_break.x  = dcx - FACE_SPREAD;  tc->btn_break.y  = dcy;
+    tc->btn_place.x  = dcx + FACE_SPREAD;  tc->btn_place.y  = dcy;
 
-    tc->btn_crouch.x = cx - r;  tc->btn_crouch.y = base_y - 2 * BTN_SPACING - r;
-    tc->btn_crouch.w = d;       tc->btn_crouch.h = d;
+    tc->btn_jump.radius   = FACE_BTN_RADIUS;
+    tc->btn_crouch.radius = FACE_BTN_RADIUS;
+    tc->btn_break.radius  = FACE_BTN_RADIUS;
+    tc->btn_place.radius  = FACE_BTN_RADIUS;
 
-    tc->btn_jump.x   = cx - r;  tc->btn_jump.y   = base_y - 3 * BTN_SPACING - r;
-    tc->btn_jump.w   = d;       tc->btn_jump.h   = d;
+    /* Menu button — top center */
+    tc->btn_menu.x = sw * 0.5f;
+    tc->btn_menu.y = MENU_TOP_MARGIN + MENU_BTN_H * 0.5f;
+    tc->btn_menu.radius = MENU_BTN_RADIUS;
 }
 
 static int hotbar_hit_test(float px, float py, int hotbar_count) {
@@ -75,20 +95,20 @@ static int hotbar_hit_test(float px, float py, int hotbar_count) {
 }
 
 static TouchButton* find_button_hit(TouchControls* tc, float px, float py) {
-    float r = BTN_RADIUS;
-    float hit_r = r * 1.2f;  /* slightly forgiving hit area */
-    if (point_in_circle(px, py, tc->btn_place.x  + r, tc->btn_place.y  + r, hit_r)) return &tc->btn_place;
-    if (point_in_circle(px, py, tc->btn_break.x  + r, tc->btn_break.y  + r, hit_r)) return &tc->btn_break;
-    if (point_in_circle(px, py, tc->btn_crouch.x + r, tc->btn_crouch.y + r, hit_r)) return &tc->btn_crouch;
-    if (point_in_circle(px, py, tc->btn_jump.x   + r, tc->btn_jump.y   + r, hit_r)) return &tc->btn_jump;
+    float forgive = 1.2f;
+    if (point_in_circle(px, py, tc->btn_jump.x,   tc->btn_jump.y,   tc->btn_jump.radius   * forgive)) return &tc->btn_jump;
+    if (point_in_circle(px, py, tc->btn_crouch.x,  tc->btn_crouch.y, tc->btn_crouch.radius * forgive)) return &tc->btn_crouch;
+    if (point_in_circle(px, py, tc->btn_break.x,   tc->btn_break.y,  tc->btn_break.radius  * forgive)) return &tc->btn_break;
+    if (point_in_circle(px, py, tc->btn_place.x,   tc->btn_place.y,  tc->btn_place.radius  * forgive)) return &tc->btn_place;
+    if (point_in_circle(px, py, tc->btn_menu.x,    tc->btn_menu.y,   tc->btn_menu.radius   * forgive)) return &tc->btn_menu;
     return NULL;
 }
 
 static void release_button_by_id(TouchControls* tc, uintptr_t tid) {
     TouchButton* btns[] = {
-        &tc->btn_place, &tc->btn_break, &tc->btn_crouch, &tc->btn_jump
+        &tc->btn_jump, &tc->btn_crouch, &tc->btn_break, &tc->btn_place, &tc->btn_menu
     };
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 5; i++) {
         if (btns[i]->pressed && btns[i]->touch_id == tid) {
             btns[i]->pressed = false;
             btns[i]->just_released = true;
@@ -102,8 +122,8 @@ static void release_button_by_id(TouchControls* tc, uintptr_t tid) {
 void touch_init(TouchControls* tc) {
     memset(tc, 0, sizeof(*tc));
     tc->hotbar_touch_slot = -1;
-    tc->move_stick.radius = STICK_RADIUS;
-    tc->look_stick.radius = STICK_RADIUS;
+    tc->move_stick.radius = STICK_OUTER_RADIUS;
+    tc->look_stick.radius = STICK_OUTER_RADIUS;
 }
 
 bool touch_handle_event(TouchControls* tc, const sapp_event* ev, int hotbar_count) {
@@ -116,7 +136,7 @@ bool touch_handle_event(TouchControls* tc, const sapp_event* ev, int hotbar_coun
 
     tc->is_touch_device = true;
     tc->hotbar_touch_slot = -1;
-    update_button_layout(tc);
+    update_layout(tc);
 
     float sw = sapp_widthf();
 
@@ -135,7 +155,7 @@ bool touch_handle_event(TouchControls* tc, const sapp_event* ev, int hotbar_coun
                 continue;
             }
 
-            /* 2. Action buttons */
+            /* 2. Action buttons (face buttons + menu) */
             TouchButton* btn = find_button_hit(tc, px, py);
             if (btn) {
                 btn->pressed  = true;
@@ -143,8 +163,8 @@ bool touch_handle_event(TouchControls* tc, const sapp_event* ev, int hotbar_coun
                 continue;
             }
 
-            /* 3. Left half → move joystick */
-            if (px < sw * 0.5f) {
+            /* 3. Left half → move joystick (floating) */
+            if (px < sw * 0.4f) {
                 tc->move_stick.active    = true;
                 tc->move_stick.touch_id  = tid;
                 tc->move_stick.origin_x  = px;
@@ -156,7 +176,7 @@ bool touch_handle_event(TouchControls* tc, const sapp_event* ev, int hotbar_coun
                 continue;
             }
 
-            /* 4. Right half → look zone */
+            /* 4. Right half (middle area) → look joystick (floating) */
             if (!tc->look_stick.active) {
                 tc->look_stick.active    = true;
                 tc->look_stick.touch_id  = tid;
@@ -176,15 +196,14 @@ bool touch_handle_event(TouchControls* tc, const sapp_event* ev, int hotbar_coun
                 tc->move_stick.current_y = py;
                 float raw_dx =  (px - tc->move_stick.origin_x) / tc->move_stick.radius;
                 float raw_dy = -(py - tc->move_stick.origin_y) / tc->move_stick.radius;
-                /* clamp to unit circle */
                 float len = sqrtf(raw_dx * raw_dx + raw_dy * raw_dy);
                 if (len > 1.0f) { raw_dx /= len; raw_dy /= len; }
                 tc->move_stick.dx = raw_dx;
-                tc->move_stick.dy = raw_dy;  /* positive = up/forward */
+                tc->move_stick.dy = raw_dy;
                 continue;
             }
 
-            /* Look zone — accumulate delta */
+            /* Look joystick — accumulate delta */
             if (tc->look_stick.active && tc->look_stick.touch_id == tid) {
                 tc->look_stick.dx += px - tc->look_stick.current_x;
                 tc->look_stick.dy += py - tc->look_stick.current_y;
@@ -222,19 +241,18 @@ void touch_apply_to_camera(TouchControls* tc, Camera* cam, float dt) {
     cam->key_w = cam->key_s = cam->key_a = cam->key_d = false;
     cam->key_space = cam->key_ctrl = false;
 
-    /* Move stick → movement keys (dy > 0 = forward = up on screen) */
+    /* Move stick → movement keys */
     if (tc->move_stick.dy >  STICK_DEADZONE) cam->key_w = true;
     if (tc->move_stick.dy < -STICK_DEADZONE) cam->key_s = true;
     if (tc->move_stick.dx >  STICK_DEADZONE) cam->key_d = true;
     if (tc->move_stick.dx < -STICK_DEADZONE) cam->key_a = true;
 
-    /* Look zone delta → yaw / pitch */
+    /* Look joystick delta → yaw / pitch */
     cam->yaw   -= tc->look_stick.dx * TOUCH_LOOK_SENSITIVITY;
-    cam->pitch  -= tc->look_stick.dy * TOUCH_LOOK_SENSITIVITY;
+    cam->pitch -= tc->look_stick.dy * TOUCH_LOOK_SENSITIVITY;
     float limit = (float)M_PI / 2.0f - 0.01f;
     if (cam->pitch >  limit) cam->pitch =  limit;
     if (cam->pitch < -limit) cam->pitch = -limit;
-    /* clear accumulated delta */
     tc->look_stick.dx = 0;
     tc->look_stick.dy = 0;
 
@@ -242,7 +260,6 @@ void touch_apply_to_camera(TouchControls* tc, Camera* cam, float dt) {
     if (tc->btn_jump.pressed)   cam->key_space = true;
     if (tc->btn_crouch.pressed) cam->key_ctrl  = true;
 
-    /* Auto-lock mouse so the game logic treats us as "playing" */
     cam->mouse_locked = true;
 }
 
@@ -279,6 +296,21 @@ static void draw_ring(float cx, float cy, float r,
     sgl_end();
 }
 
+static void draw_rounded_rect(float cx, float cy, float w, float h,
+                               float cr, float cg, float cb, float ca) {
+    float hw = w * 0.5f, hh = h * 0.5f;
+    sgl_begin_triangles();
+    sgl_c4f(cr, cg, cb, ca);
+    /* Two triangles for the rect */
+    sgl_v2f(cx - hw, cy - hh);
+    sgl_v2f(cx + hw, cy - hh);
+    sgl_v2f(cx + hw, cy + hh);
+    sgl_v2f(cx - hw, cy - hh);
+    sgl_v2f(cx + hw, cy + hh);
+    sgl_v2f(cx - hw, cy + hh);
+    sgl_end();
+}
+
 static void setup_sgl_ortho(void) {
     sgl_defaults();
     sgl_matrix_mode_projection();
@@ -304,78 +336,122 @@ void touch_render(const TouchControls* tc, int hotbar_selected, int hotbar_count
     (void)hotbar_selected;
     (void)hotbar_count;
 
+    float sw = sapp_widthf();
+    float sh = sapp_heightf();
+
     setup_sgl_ortho();
 
-    /* ---- Move joystick (only when active) ---- */
+    /* ---- Left joystick base (always visible as ghost) ---- */
+    {
+        float base_x = STICK_MARGIN_X;
+        float base_y = sh - STICK_MARGIN_Y;
+        /* Ghost ring — always shown so player knows where to touch */
+        draw_ring(base_x, base_y, STICK_OUTER_RADIUS,
+                  1.0f, 1.0f, 1.0f, 0.15f, 24, 2.0f);
+    }
+
+    /* ---- Left joystick active ---- */
     if (tc->move_stick.active) {
         float ox = tc->move_stick.origin_x;
         float oy = tc->move_stick.origin_y;
         float r  = tc->move_stick.radius;
 
-        /* outer ring */
         draw_ring(ox, oy, r, 1.0f, 1.0f, 1.0f, 0.3f, 24, 2.0f);
-
-        /* inner knob — note dy is flipped (positive = screen-up) */
         float knob_x = ox + tc->move_stick.dx * r;
         float knob_y = oy - tc->move_stick.dy * r;
-        draw_filled_circle(knob_x, knob_y, 20.0f, 1.0f, 1.0f, 1.0f, 0.6f, 16);
+        draw_filled_circle(knob_x, knob_y, STICK_KNOB_RADIUS,
+                           1.0f, 1.0f, 1.0f, 0.6f, 16);
     }
 
-    /* ---- Action buttons (always visible) ---- */
-    float r = BTN_RADIUS;
+    /* ---- Right joystick base (always visible as ghost) ---- */
+    {
+        float base_x = sw - STICK_MARGIN_X;
+        float base_y = sh - STICK_MARGIN_Y;
+        draw_ring(base_x, base_y, STICK_OUTER_RADIUS,
+                  1.0f, 1.0f, 1.0f, 0.15f, 24, 2.0f);
+    }
 
-    /* Jump — green */
-    {
-        float cx = tc->btn_jump.x + r, cy = tc->btn_jump.y + r;
-        float a  = tc->btn_jump.pressed ? 0.8f : 0.5f;
-        draw_filled_circle(cx, cy, r, 0.2f, 0.8f, 0.2f, a, 16);
+    /* ---- Right joystick active ---- */
+    if (tc->look_stick.active) {
+        float ox = tc->look_stick.origin_x;
+        float oy = tc->look_stick.origin_y;
+        float r  = tc->look_stick.radius;
+
+        draw_ring(ox, oy, r, 1.0f, 1.0f, 1.0f, 0.3f, 24, 2.0f);
+        float knob_x = tc->look_stick.current_x;
+        float knob_y = tc->look_stick.current_y;
+        /* Clamp knob to circle */
+        float dx = knob_x - ox, dy = knob_y - oy;
+        float dist = sqrtf(dx * dx + dy * dy);
+        if (dist > r) {
+            knob_x = ox + dx / dist * r;
+            knob_y = oy + dy / dist * r;
+        }
+        draw_filled_circle(knob_x, knob_y, STICK_KNOB_RADIUS,
+                           1.0f, 1.0f, 1.0f, 0.6f, 16);
     }
-    /* Crouch — blue */
-    {
-        float cx = tc->btn_crouch.x + r, cy = tc->btn_crouch.y + r;
-        float a  = tc->btn_crouch.pressed ? 0.8f : 0.5f;
-        draw_filled_circle(cx, cy, r, 0.2f, 0.4f, 0.9f, a, 16);
+
+    /* ---- Face buttons (diamond layout) ---- */
+    struct {
+        const TouchButton* btn;
+        float cr, cg, cb;
+        char label;
+    } faces[] = {
+        { &tc->btn_jump,   0.2f, 0.8f, 0.2f, 'A' },  /* Top — green */
+        { &tc->btn_crouch, 0.3f, 0.5f, 0.9f, 'B' },  /* Bottom — blue */
+        { &tc->btn_break,  0.9f, 0.2f, 0.2f, 'X' },  /* Left — red */
+        { &tc->btn_place,  0.9f, 0.8f, 0.2f, 'Y' },  /* Right — yellow */
+    };
+    for (int i = 0; i < 4; i++) {
+        float bcx = faces[i].btn->x;
+        float bcy = faces[i].btn->y;
+        float br  = faces[i].btn->radius;
+        float a   = faces[i].btn->pressed ? 0.85f : 0.45f;
+        /* Dark background circle */
+        draw_filled_circle(bcx, bcy, br, 0.0f, 0.0f, 0.0f, 0.3f, 16);
+        /* Colored ring */
+        draw_ring(bcx, bcy, br, faces[i].cr, faces[i].cg, faces[i].cb, a, 16, 3.0f);
+        /* Colored fill when pressed */
+        if (faces[i].btn->pressed) {
+            draw_filled_circle(bcx, bcy, br - 3.0f,
+                               faces[i].cr, faces[i].cg, faces[i].cb, 0.3f, 16);
+        }
     }
-    /* Break — red */
+
+    /* ---- Menu / Start button (top center, pill shape) ---- */
     {
-        float cx = tc->btn_break.x + r, cy = tc->btn_break.y + r;
-        float a  = tc->btn_break.pressed ? 0.8f : 0.5f;
-        draw_filled_circle(cx, cy, r, 0.9f, 0.2f, 0.2f, a, 16);
-    }
-    /* Place — yellow */
-    {
-        float cx = tc->btn_place.x + r, cy = tc->btn_place.y + r;
-        float a  = tc->btn_place.pressed ? 0.8f : 0.5f;
-        draw_filled_circle(cx, cy, r, 0.9f, 0.8f, 0.2f, a, 16);
+        float mx = tc->btn_menu.x;
+        float my = tc->btn_menu.y;
+        float a  = tc->btn_menu.pressed ? 0.7f : 0.35f;
+        draw_rounded_rect(mx, my, MENU_BTN_W, MENU_BTN_H,
+                          0.4f, 0.4f, 0.4f, a);
+        /* Three horizontal lines (hamburger icon) */
+        float lw = 16.0f, lh = 2.0f, gap = 5.0f;
+        for (int i = -1; i <= 1; i++) {
+            draw_rounded_rect(mx, my + (float)i * gap, lw, lh,
+                              1.0f, 1.0f, 1.0f, a + 0.2f);
+        }
     }
 
     sgl_draw();
 
-    /* ---- Button labels (single char each, via sdtx) ---- */
+    /* ---- Button labels via sdtx ---- */
     {
         float canvas_w = sapp_widthf()  * 0.5f;
         float canvas_h = sapp_heightf() * 0.5f;
         sdtx_canvas(canvas_w, canvas_h);
         sdtx_font(0);
 
-        /* scale: screen-px → sdtx char-cell position */
-        float sx = canvas_w / sapp_widthf()  / 8.0f;   /* 0.5 / 8 */
+        float sx = canvas_w / sapp_widthf()  / 8.0f;
         float sy = canvas_h / sapp_heightf() / 8.0f;
 
-        struct { const TouchButton* btn; char ch; } labels[] = {
-            { &tc->btn_jump,   'J' },
-            { &tc->btn_crouch, 'C' },
-            { &tc->btn_break,  'X' },
-            { &tc->btn_place,  'P' },
-        };
-
         for (int i = 0; i < 4; i++) {
-            float bcx = labels[i].btn->x + r;  /* screen center */
-            float bcy = labels[i].btn->y + r;
+            float bcx = faces[i].btn->x;
+            float bcy = faces[i].btn->y;
             sdtx_origin(bcx * sx - 0.5f, bcy * sy - 0.5f);
             sdtx_home();
             sdtx_color3f(1.0f, 1.0f, 1.0f);
-            sdtx_putc(labels[i].ch);
+            sdtx_putc(faces[i].label);
         }
         sdtx_draw();
     }

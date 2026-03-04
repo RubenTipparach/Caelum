@@ -1251,6 +1251,12 @@ static void event(const sapp_event* ev) {
             interact_place();
             app.touch.btn_place.just_released = false;
         }
+        if (app.touch.btn_menu.just_released) {
+            app.touch.btn_menu.just_released = false;
+            app.state = app.is_multiplayer ? STATE_MULTI_MENU : STATE_MENU;
+            sapp_show_mouse(true);
+            return;
+        }
         return;
     }
 
