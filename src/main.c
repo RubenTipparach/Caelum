@@ -933,29 +933,25 @@ static void frame(void) {
             app.renderer.lod_current_body = app.camera.gravity_body;
         }
 
-        // Track orbital delta: shift ALL reference-frame anchors so the moon
-        // stays fixed relative to the camera (which also tracks via camera_update).
+        // Moon reference frame: sync body_center and pinned_center to the moon's
+        // current Kepler position. The camera tracks orbital motion via camera_update
+        // (pos_d += delta), so camera and body center stay close together.
+        // world_origin is NOT shifted here — the floating-origin recenter system
+        // handles that when camera drifts far enough, ensuring mesh jobs are never
+        // falsely discarded as stale by the origin check.
         if (app.renderer.lod_current_body >= 0) {
             SolarSystem* ss = &app.renderer.solar_system;
             const CelestialBody* moon = &ss->moons[app.renderer.lod_current_body];
-            double dx = moon->pos_d[0] - moon->prev_pos_d[0];
-            double dy = moon->pos_d[1] - moon->prev_pos_d[1];
-            double dz = moon->pos_d[2] - moon->prev_pos_d[2];
 
-            // Keep pinned center in sync (SOI checks use this)
-            ss->pinned_center_d[0] += dx;
-            ss->pinned_center_d[1] += dy;
-            ss->pinned_center_d[2] += dz;
+            // Sync body center to actual Kepler position (mesh generation uses this)
+            app.renderer.lod_tree.body_center_d[0] = moon->pos_d[0];
+            app.renderer.lod_tree.body_center_d[1] = moon->pos_d[1];
+            app.renderer.lod_tree.body_center_d[2] = moon->pos_d[2];
 
-            // Keep LOD body center in sync (mesh generation uses this)
-            app.renderer.lod_tree.body_center_d[0] += dx;
-            app.renderer.lod_tree.body_center_d[1] += dy;
-            app.renderer.lod_tree.body_center_d[2] += dz;
-
-            // Shift world_origin by same delta to prevent spurious recenters
-            app.renderer.lod_tree.world_origin[0] += dx;
-            app.renderer.lod_tree.world_origin[1] += dy;
-            app.renderer.lod_tree.world_origin[2] += dz;
+            // Sync pinned center for SOI checks
+            ss->pinned_center_d[0] = moon->pos_d[0];
+            ss->pinned_center_d[1] = moon->pos_d[1];
+            ss->pinned_center_d[2] = moon->pos_d[2];
         }
 
         lod_tree_update_origin(&app.renderer.lod_tree, app.camera.pos_d);
