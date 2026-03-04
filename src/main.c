@@ -1025,11 +1025,29 @@ static void world_select_activate(int idx) {
 }
 
 static void event(const sapp_event* ev) {
-    // Track mouse position for all menu states
+    // Track mouse/touch position for all menu states
     if (ev->type == SAPP_EVENTTYPE_MOUSE_MOVE) {
         menu_mouse_x = ev->mouse_x;
         menu_mouse_y = ev->mouse_y;
     }
+    // Track touch position so hover detection works on mobile
+    if (ev->type == SAPP_EVENTTYPE_TOUCHES_BEGAN ||
+        ev->type == SAPP_EVENTTYPE_TOUCHES_MOVED) {
+        for (int t = 0; t < ev->num_touches; t++) {
+            if (ev->touches[t].changed) {
+                menu_mouse_x = ev->touches[t].pos_x;
+                menu_mouse_y = ev->touches[t].pos_y;
+                break;
+            }
+        }
+    }
+
+    // Helper: detect touch began/ended as mouse-like press/release
+    bool touch_began = false;
+    bool touch_ended = false;
+    if (ev->type == SAPP_EVENTTYPE_TOUCHES_BEGAN) touch_began = true;
+    if (ev->type == SAPP_EVENTTYPE_TOUCHES_ENDED ||
+        ev->type == SAPP_EVENTTYPE_TOUCHES_CANCELLED) touch_ended = true;
 
     // ---- STATE_MENU ----
     if (app.state == STATE_MENU) {
@@ -1043,13 +1061,13 @@ static void event(const sapp_event* ev) {
             } \
         } while(0)
 
-        if (ev->type == SAPP_EVENTTYPE_MOUSE_DOWN &&
-            ev->mouse_button == SAPP_MOUSEBUTTON_LEFT) {
+        if ((ev->type == SAPP_EVENTTYPE_MOUSE_DOWN &&
+             ev->mouse_button == SAPP_MOUSEBUTTON_LEFT) || touch_began) {
             menu_pressed = menu_hover;
             return;
         }
-        if (ev->type == SAPP_EVENTTYPE_MOUSE_UP &&
-            ev->mouse_button == SAPP_MOUSEBUTTON_LEFT) {
+        if ((ev->type == SAPP_EVENTTYPE_MOUSE_UP &&
+             ev->mouse_button == SAPP_MOUSEBUTTON_LEFT) || touch_ended) {
             if (menu_pressed >= 0 && menu_pressed == menu_hover) {
                 MAIN_MENU_ACTIVATE(menu_pressed);
             }
@@ -1079,13 +1097,13 @@ static void event(const sapp_event* ev) {
             app.state = app.is_multiplayer ? STATE_MULTI_MENU : STATE_MENU;
             return;
         }
-        if (ev->type == SAPP_EVENTTYPE_MOUSE_DOWN &&
-            ev->mouse_button == SAPP_MOUSEBUTTON_LEFT) {
+        if ((ev->type == SAPP_EVENTTYPE_MOUSE_DOWN &&
+             ev->mouse_button == SAPP_MOUSEBUTTON_LEFT) || touch_began) {
             ws_pressed = ws_hover;
             return;
         }
-        if (ev->type == SAPP_EVENTTYPE_MOUSE_UP &&
-            ev->mouse_button == SAPP_MOUSEBUTTON_LEFT) {
+        if ((ev->type == SAPP_EVENTTYPE_MOUSE_UP &&
+             ev->mouse_button == SAPP_MOUSEBUTTON_LEFT) || touch_ended) {
             if (ws_pressed >= 0 && ws_pressed == ws_hover) {
                 world_select_activate(ws_pressed);
             }
@@ -1127,13 +1145,13 @@ static void event(const sapp_event* ev) {
             } \
         } while(0)
 
-        if (ev->type == SAPP_EVENTTYPE_MOUSE_DOWN &&
-            ev->mouse_button == SAPP_MOUSEBUTTON_LEFT) {
+        if ((ev->type == SAPP_EVENTTYPE_MOUSE_DOWN &&
+             ev->mouse_button == SAPP_MOUSEBUTTON_LEFT) || touch_began) {
             multi_pressed = multi_hover;
             return;
         }
-        if (ev->type == SAPP_EVENTTYPE_MOUSE_UP &&
-            ev->mouse_button == SAPP_MOUSEBUTTON_LEFT) {
+        if ((ev->type == SAPP_EVENTTYPE_MOUSE_UP &&
+             ev->mouse_button == SAPP_MOUSEBUTTON_LEFT) || touch_ended) {
             if (multi_pressed >= 0 && multi_pressed == multi_hover) {
                 MULTI_ACTIVATE(multi_pressed);
             }
