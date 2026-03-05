@@ -36,6 +36,7 @@
 typedef enum {
     STATE_MENU,
     STATE_WORLD_SELECT,
+    STATE_SPAWN_SELECT,
     STATE_MULTI_MENU,
     STATE_MULTI_HOST,
     STATE_MULTI_JOIN,
@@ -87,6 +88,7 @@ static struct {
     char active_edits_dir[256]; // edits dir for active world
     bool is_multiplayer;
     bool is_host;
+    int spawn_type;             // 0 = Summit (origin), 1 = Twilight
 
     // Touch controls
     TouchControls touch;
@@ -115,6 +117,11 @@ static float menu_mouse_y = 0;
 // World select state
 static int ws_hover = -1;
 static int ws_pressed = -1;
+
+// Spawn select state
+static int sp_hover = -1;
+static int sp_pressed = -1;
+static int sp_selected = 0;
 
 // Multiplayer menu state
 static int multi_hover = -1;
@@ -186,6 +193,12 @@ static void init(void) {
     #endif
 
     crash_handler_install();
+
+    // macOS: disable mouse event coalescing to prevent input lag
+    #ifdef __APPLE__
+    extern void platform_macos_init(void);
+    platform_macos_init();
+    #endif
 
     printf("[GAME] Hex Planets starting...\n");
     fflush(stdout);
@@ -558,6 +571,93 @@ static void frame(void) {
         return;
     }
 
+    // ---- STATE_SPAWN_SELECT: Summit / Twilight ----
+    if (app.state == STATE_SPAWN_SELECT) {
+        sg_begin_pass(&(sg_pass){
+            .action = { .colors[0] = { .load_action = SG_LOADACTION_CLEAR,
+                .clear_value = {0.05f, 0.05f, 0.1f, 1.0f} } },
+            .swapchain = sglue_swapchain()
+        });
+
+        const int sp_count = 2;
+        float btn_h = 3.0f * char_px;
+        float btn_gap = 8.0f;
+        float btn_w = 28.0f * char_px;
+        float btn_y0 = title_y + 2.0f * char_px;
+
+        sp_hover = hit_test_buttons(sp_count, btn_w, btn_h, btn_gap,
+                                     margin_x, btn_y0, menu_mouse_x, menu_mouse_y);
+
+        sgl_defaults();
+        sgl_matrix_mode_projection();
+        sgl_load_identity();
+        sgl_ortho(0.0f, win_w, win_h, 0.0f, -1.0f, 1.0f);
+        sgl_matrix_mode_modelview();
+        sgl_load_identity();
+
+        const char* sp_labels[] = { "[1] Summit", "[2] Twilight" };
+        float sp_colors[][3] = {
+            { 1.0f, 0.85f, 0.3f },  // Summit: warm gold
+            { 0.4f, 0.5f, 1.0f },   // Twilight: cool blue
+        };
+
+        for (int i = 0; i < sp_count; i++) {
+            bool is_pressed = (sp_pressed == i && sp_hover == i);
+            bool is_hovered = (sp_hover == i);
+            float x0 = margin_x, y0 = btn_y0 + i * (btn_h + btn_gap);
+            float x1 = x0 + btn_w, y1 = y0 + btn_h;
+
+            float fr, fg, fb, fa;
+            if (is_pressed)      { fr = 0.25f; fg = 0.25f; fb = 0.3f; fa = 0.9f; }
+            else if (is_hovered) { fr = 0.12f; fg = 0.12f; fb = 0.18f; fa = 0.8f; }
+            else                 { fr = 0.08f; fg = 0.08f; fb = 0.12f; fa = 0.6f; }
+            sgl_begin_quads();
+            sgl_c4f(fr, fg, fb, fa);
+            sgl_v2f(x0, y0); sgl_v2f(x1, y0); sgl_v2f(x1, y1); sgl_v2f(x0, y1);
+            sgl_end();
+
+            float br = sp_colors[i][0], bg_ = sp_colors[i][1], bb = sp_colors[i][2];
+            if (is_pressed)      { br *= 0.5f; bg_ *= 0.5f; bb *= 0.5f; }
+            else if (!is_hovered) { br *= 0.4f; bg_ *= 0.4f; bb *= 0.4f; }
+            float bw = 2.0f;
+            sgl_begin_quads();
+            sgl_c3f(br, bg_, bb);
+            sgl_v2f(x0, y0); sgl_v2f(x1, y0); sgl_v2f(x1, y0 + bw); sgl_v2f(x0, y0 + bw);
+            sgl_v2f(x0, y1 - bw); sgl_v2f(x1, y1 - bw); sgl_v2f(x1, y1); sgl_v2f(x0, y1);
+            sgl_v2f(x0, y0); sgl_v2f(x0 + bw, y0); sgl_v2f(x0 + bw, y1); sgl_v2f(x0, y1);
+            sgl_v2f(x1 - bw, y0); sgl_v2f(x1, y0); sgl_v2f(x1, y1); sgl_v2f(x1 - bw, y1);
+            sgl_end();
+        }
+        sgl_draw();
+
+        sdtx_canvas(canvas_w, canvas_h);
+        sdtx_origin(0.0f, 0.0f);
+        sdtx_font(0);
+        sdtx_pos(margin_x / char_px, title_y / char_px);
+        sdtx_color3f(0.8f, 0.9f, 1.0f);
+        sdtx_puts("Choose Starting Location    [ESC] Back");
+
+        for (int i = 0; i < sp_count; i++) {
+            bool pressed = (sp_pressed == i && sp_hover == i);
+            bool hovered = (sp_hover == i);
+            float by = btn_y0 + i * (btn_h + btn_gap);
+            float tx = margin_x + 2.0f * char_px;
+            float ty = by + (btn_h - char_px) * 0.5f;
+            sdtx_pos(tx / char_px, ty / char_px);
+
+            float cr = sp_colors[i][0], cg = sp_colors[i][1], cb = sp_colors[i][2];
+            if (pressed)      sdtx_color3f(1.0f, 1.0f, 1.0f);
+            else if (hovered) sdtx_color3f(cr, cg, cb);
+            else              sdtx_color3f(cr * 0.6f, cg * 0.6f, cb * 0.6f);
+            sdtx_puts(sp_labels[i]);
+        }
+
+        sdtx_draw();
+        sg_end_pass();
+        sg_commit();
+        return;
+    }
+
     // ---- STATE_MULTI_MENU: Host / Join ----
     if (app.state == STATE_MULTI_MENU) {
         sg_begin_pass(&(sg_pass){
@@ -810,10 +910,16 @@ static void frame(void) {
                    app.renderer.solar_system.moon_count);
             fflush(stdout);
 
-            // Try loading saved player position; fall back to default spawn
+            // Try loading saved player position; fall back to spawn type selection
             if (!player_load()) {
-                // Default spawn: Twilight zone, grass biome (lat 68.55, lon -106.52)
-                HMM_Vec3 spawn_dir = HMM_NormV3((HMM_Vec3){{-0.103983f, 0.930767f, -0.350514f}});
+                HMM_Vec3 spawn_dir;
+                if (app.spawn_type == 0) {
+                    // Summit: planet origin (top)
+                    spawn_dir = (HMM_Vec3){{0.0f, 1.0f, 0.0f}};
+                } else {
+                    // Twilight zone, grass biome (lat 68.55, lon -106.52)
+                    spawn_dir = HMM_NormV3((HMM_Vec3){{-0.103983f, 0.930767f, -0.350514f}});
+                }
                 double surface_r = lod_tree_terrain_height(&app.renderer.lod_tree, spawn_dir) + 10.0;
                 app.camera.pos_d[0] = (double)spawn_dir.X * surface_r;
                 app.camera.pos_d[1] = (double)spawn_dir.Y * surface_r;
@@ -1001,22 +1107,46 @@ static void frame(void) {
 }
 
 // ---- Helper: activate world select choice ----
+static void spawn_select_activate(int slot);
+
 static void world_select_activate(int idx) {
     if (idx == app.world_list.count) {
-        // [New World] button
-        int new_idx = world_create_new(&app.world_list);
-        if (new_idx < 0) return;
-        idx = new_idx;
+        // [New World] button — go to spawn location selection
+        app.state = STATE_SPAWN_SELECT;
+        sp_hover = -1;
+        sp_pressed = -1;
+        sp_selected = 0;
+        return;
     }
     app.active_world_idx = idx;
     if (app.is_multiplayer && app.is_host) {
-        // Host: create lobby, then show room code
         lobby_create("Host", &app.lobby_req);
         app.state = STATE_MULTI_HOST;
     } else {
-        // Single player: go straight to loading
         printf("[GAME] Starting single player, world=%s\n",
             app.world_list.worlds[idx].name);
+        fflush(stdout);
+        app.load_start_time = stm_now();
+        app.load_frame_count = 0;
+        start_loading();
+    }
+}
+
+static void spawn_select_activate(int slot) {
+    app.spawn_type = slot;
+    int new_idx = world_create_new(&app.world_list);
+    if (new_idx < 0) {
+        app.state = STATE_WORLD_SELECT;
+        return;
+    }
+    app.active_world_idx = new_idx;
+    if (app.is_multiplayer && app.is_host) {
+        lobby_create("Host", &app.lobby_req);
+        app.state = STATE_MULTI_HOST;
+    } else {
+        printf("[GAME] Starting single player (spawn=%s), world=%s\n",
+            slot == 0 ? "Summit" : "Twilight",
+            app.world_list.worlds[new_idx].name);
         fflush(stdout);
         app.load_start_time = stm_now();
         app.load_frame_count = 0;
@@ -1120,6 +1250,47 @@ static void event(const sapp_event* ev) {
             }
             return;
         }
+        return;
+    }
+
+    // ---- STATE_SPAWN_SELECT ----
+    if (app.state == STATE_SPAWN_SELECT) {
+        if (ev->type == SAPP_EVENTTYPE_KEY_DOWN && ev->key_code == SAPP_KEYCODE_ESCAPE) {
+            app.state = STATE_WORLD_SELECT;
+            return;
+        }
+
+        #define SPAWN_ACTIVATE(slot) do { \
+            if ((slot) >= 0 && (slot) < 2) spawn_select_activate(slot); \
+        } while(0)
+
+        if ((ev->type == SAPP_EVENTTYPE_MOUSE_DOWN &&
+             ev->mouse_button == SAPP_MOUSEBUTTON_LEFT) || touch_began) {
+            sp_pressed = sp_hover;
+            return;
+        }
+        if ((ev->type == SAPP_EVENTTYPE_MOUSE_UP &&
+             ev->mouse_button == SAPP_MOUSEBUTTON_LEFT) || touch_ended) {
+            if (sp_pressed >= 0 && sp_pressed == sp_hover) {
+                SPAWN_ACTIVATE(sp_pressed);
+            }
+            sp_pressed = -1;
+            return;
+        }
+        if (ev->type == SAPP_EVENTTYPE_KEY_DOWN) {
+            if (ev->key_code == SAPP_KEYCODE_1) { SPAWN_ACTIVATE(0); return; }
+            if (ev->key_code == SAPP_KEYCODE_2) { SPAWN_ACTIVATE(1); return; }
+            if (ev->key_code == SAPP_KEYCODE_UP || ev->key_code == SAPP_KEYCODE_W) {
+                sp_selected = (sp_selected - 1 + 2) % 2; return;
+            }
+            if (ev->key_code == SAPP_KEYCODE_DOWN || ev->key_code == SAPP_KEYCODE_S) {
+                sp_selected = (sp_selected + 1) % 2; return;
+            }
+            if (ev->key_code == SAPP_KEYCODE_ENTER || ev->key_code == SAPP_KEYCODE_SPACE) {
+                SPAWN_ACTIVATE(sp_selected); return;
+            }
+        }
+        #undef SPAWN_ACTIVATE
         return;
     }
 
@@ -1261,6 +1432,23 @@ static void event(const sapp_event* ev) {
     if (ev->type == SAPP_EVENTTYPE_KEY_DOWN &&
         ev->key_code == SAPP_KEYCODE_P && (ev->modifiers & SAPP_MODIFIER_ALT)) {
         app.screenshot_requested = true;
+        return;
+    }
+
+    // Toggle mouse diagnostics with Alt+M
+    if (ev->type == SAPP_EVENTTYPE_KEY_DOWN &&
+        ev->key_code == SAPP_KEYCODE_M && (ev->modifiers & SAPP_MODIFIER_ALT)) {
+        app.camera.mouse_diag_enabled = !app.camera.mouse_diag_enabled;
+        printf("[MOUSE DIAG] %s\n", app.camera.mouse_diag_enabled ? "ENABLED" : "DISABLED");
+        fflush(stdout);
+        // Reset counters
+        app.camera.diag_frame_count = 0;
+        app.camera.diag_total_events = 0;
+        app.camera.diag_zero_event_frames = 0;
+        app.camera.diag_max_gap_ms = 0.0f;
+        app.camera.diag_max_delta = 0.0f;
+        app.camera.diag_max_accum = 0.0f;
+        app.camera.diag_max_frame_ms = 0.0f;
         return;
     }
 
