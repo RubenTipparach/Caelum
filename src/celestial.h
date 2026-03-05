@@ -9,6 +9,12 @@
 /* Forward declarations */
 typedef struct Camera Camera;
 
+// Body type for LOD/hex terrain targeting
+typedef enum {
+    LOD_BODY_PLANET,    // Tenebris (complex terrain noise)
+    LOD_BODY_MOON,      // Moon (MoonShapeParams noise)
+} LodBodyType;
+
 #define MAX_MOONS 10
 #define MOON_MESH_SUBDIVISIONS 4   /* icosphere subdivision depth (4 = ~2562 verts, ~5120 tris) */
 #define MOON_SOI_RADIUS 50000.0f   /* 50 km sphere of influence */

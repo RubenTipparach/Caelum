@@ -414,6 +414,9 @@ typedef struct HexMeshJob {
     int cx, cz;
     float planet_radius;
     int seed;
+    LodBodyType body_type;
+    MoonShapeParams moon_shape;
+    MoonColorPalette moon_palette;
 
     HMM_Vec3 tangent_origin;
     HMM_Vec3 tangent_up;
@@ -1468,14 +1471,17 @@ static double timer_ms(void) {
 static void generate_chunk_mesh(HexMeshJob* job) {
     double t_start = timer_ms();
 
-    fnl_state continental = ht_create_continental_noise(job->seed);
-    fnl_state mountain = ht_create_mountain_noise(job->seed);
-    fnl_state warp = ht_create_warp_noise(job->seed);
-    fnl_state detail = ht_create_detail_noise(job->seed);
+    fnl_state continental, mountain, warp, detail;
+    if (job->body_type != LOD_BODY_MOON) {
+        continental = ht_create_continental_noise(job->seed);
+        mountain = ht_create_mountain_noise(job->seed);
+        warp = ht_create_warp_noise(job->seed);
+        detail = ht_create_detail_noise(job->seed);
 
-    // Precompute arch data once per job (used in voxel fill + cross-chunk queries)
-    job->arch_frame = ht_arch_make_frame();
-    job->arch_base = ht_arch_compute_base(&job->arch_frame, job->seed);
+        // Precompute arch data once per job (used in voxel fill + cross-chunk queries)
+        job->arch_frame = ht_arch_make_frame();
+        job->arch_base = ht_arch_compute_base(&job->arch_frame, job->seed);
+    }
 
     // Skip voxel generation if job already has populated voxels (remesh after break/place)
     if (!job->has_voxels) {
@@ -1492,8 +1498,15 @@ static void generate_chunk_mesh(HexMeshJob* job) {
                     vec3_add(job->tangent_origin,
                         vec3_add(vec3_scale(job->tangent_east, lx),
                                  vec3_scale(job->tangent_north, lz))));
-                float h_m = ht_sample_height_m(&continental, &mountain, &warp, &detail, dir);
-                int h_layers = (int)floorf(fmaxf(h_m, TERRAIN_SEA_LEVEL_M) / HEX_HEIGHT);
+                float h_m;
+                if (job->body_type == LOD_BODY_MOON) {
+                    float surface_r = moon_surface_radius(&job->moon_shape, dir);
+                    h_m = surface_r - job->moon_shape.base_radius;
+                } else {
+                    h_m = ht_sample_height_m(&continental, &mountain, &warp, &detail, dir);
+                }
+                float sea = (job->body_type == LOD_BODY_MOON) ? 0.0f : TERRAIN_SEA_LEVEL_M;
+                int h_layers = (int)floorf(fmaxf(h_m, sea) / HEX_HEIGHT);
                 if (h_layers < min_h) min_h = h_layers;
             }
             job->base_layer = min_h - HEX_BASE_PADDING;
@@ -1516,10 +1529,22 @@ static void generate_chunk_mesh(HexMeshJob* job) {
                              vec3_scale(job->tangent_north, lz)));
                 HMM_Vec3 unit = vec3_normalize(world_dir);
 
-                float h_m = ht_sample_height_m(&continental, &mountain, &warp, &detail, unit);
-                float effective_h = fmaxf(h_m, TERRAIN_SEA_LEVEL_M);
-                int surface_layer = (int)ceilf(effective_h / HEX_HEIGHT);
-                VoxelType surface_type = ht_voxel_type(h_m, gcol, grow, job->seed); // biome from raw h_m
+                float h_m;
+                float effective_h;
+                int surface_layer;
+                VoxelType surface_type;
+                if (job->body_type == LOD_BODY_MOON) {
+                    float surface_r = moon_surface_radius(&job->moon_shape, unit);
+                    h_m = surface_r - job->moon_shape.base_radius;
+                    effective_h = fmaxf(h_m, 0.0f);
+                    surface_layer = (int)ceilf(effective_h / HEX_HEIGHT);
+                    surface_type = VOXEL_STONE;
+                } else {
+                    h_m = ht_sample_height_m(&continental, &mountain, &warp, &detail, unit);
+                    effective_h = fmaxf(h_m, TERRAIN_SEA_LEVEL_M);
+                    surface_layer = (int)ceilf(effective_h / HEX_HEIGHT);
+                    surface_type = ht_voxel_type(h_m, gcol, grow, job->seed);
+                }
 
                 int min_solid = HEX_CHUNK_LAYERS;
                 int max_solid = -1;
@@ -1540,8 +1565,8 @@ static void generate_chunk_mesh(HexMeshJob* job) {
             }
         }
 
-        // Phase 2b: Fill arch voxels (stone arch at spawn)
-        {
+        // Phase 2b: Fill arch voxels (stone arch at spawn, planet only)
+        if (job->body_type != LOD_BODY_MOON) {
             for (int col = 0; col < HEX_CHUNK_SIZE; col++) {
                 for (int row = 0; row < HEX_CHUNK_SIZE; row++) {
                     int gcol = job->cx * HEX_CHUNK_SIZE + col;
@@ -1755,8 +1780,24 @@ static void generate_chunk_mesh(HexMeshJob* job) {
             HMM_Vec3 local_down = vec3_scale(center_dir, -1.0f);
 
             // Compute per-column terrain color (no brightness bake — shader handles lighting)
-            float col_h_m = ht_sample_height_m(&continental, &mountain, &warp, &detail, center_dir);
-            HMM_Vec3 col_color = ht_terrain_color(col_h_m);
+            float col_h_m;
+            HMM_Vec3 col_color;
+            if (job->body_type == LOD_BODY_MOON) {
+                float surface_r = moon_surface_radius(&job->moon_shape, center_dir);
+                col_h_m = surface_r - job->moon_shape.base_radius;
+                float base_r = job->moon_shape.base_radius;
+                float height_t = (surface_r - base_r * 0.9f) / (base_r * 0.2f);
+                if (height_t < 0.0f) height_t = 0.0f;
+                if (height_t > 1.0f) height_t = 1.0f;
+                col_color = vec3_lerp(job->moon_palette.shadow_color,
+                                      job->moon_palette.base_color, height_t);
+                col_color = vec3_lerp(col_color,
+                                      job->moon_palette.highlight_color,
+                                      height_t * height_t * 0.5f);
+            } else {
+                col_h_m = ht_sample_height_m(&continental, &mountain, &warp, &detail, center_dir);
+                col_color = ht_terrain_color(col_h_m);
+            }
 
             // Compute terrain slope normal from noise at LOD-triangle-scale offsets (~10m).
             // Used as shading normal so the fragment shader's NdotL + AO match the LOD mesh.
@@ -1769,8 +1810,14 @@ static void generate_chunk_mesh(HexMeshJob* job) {
                 HMM_Vec3 dir_n = vec3_normalize(vec3_add(job->tangent_origin,
                     vec3_add(vec3_scale(job->tangent_east, lx),
                              vec3_scale(job->tangent_north, lz + d))));
-                float h_e = ht_sample_height_m(&continental, &mountain, &warp, &detail, dir_e);
-                float h_n = ht_sample_height_m(&continental, &mountain, &warp, &detail, dir_n);
+                float h_e, h_n;
+                if (job->body_type == LOD_BODY_MOON) {
+                    h_e = moon_surface_radius(&job->moon_shape, dir_e) - job->moon_shape.base_radius;
+                    h_n = moon_surface_radius(&job->moon_shape, dir_n) - job->moon_shape.base_radius;
+                } else {
+                    h_e = ht_sample_height_m(&continental, &mountain, &warp, &detail, dir_e);
+                    h_n = ht_sample_height_m(&continental, &mountain, &warp, &detail, dir_n);
+                }
 
                 float grad_e = (h_e - col_h_m) / d;
                 float grad_n = (h_n - col_h_m) / d;
@@ -2281,11 +2328,16 @@ void hex_terrain_init(HexTerrain* ht, float planet_radius, float layer_thickness
                       int sea_level, int seed, JobSystem* jobs,
                       const char* edits_dir) {
     memset(ht, 0, sizeof(HexTerrain));
+    ht->body_type = LOD_BODY_PLANET;
     ht->planet_radius = planet_radius;
     ht->layer_thickness = layer_thickness;
     ht->sea_level = sea_level;
     ht->seed = seed;
     ht->jobs = jobs;
+
+    // Cache edits_dir for retarget
+    const char* dir = edits_dir ? edits_dir : "cache/edits";
+    snprintf(ht->edits_dir, sizeof(ht->edits_dir), "%s", dir);
 
     for (int i = 0; i < HEX_MAX_CHUNKS; i++) {
         ht->chunks[i].active = false;
@@ -2295,7 +2347,6 @@ void hex_terrain_init(HexTerrain* ht, float planet_radius, float layer_thickness
     }
 
     // Initialize voxel edit persistence
-    const char* dir = edits_dir ? edits_dir : "cache/edits";
     edit_cache_init(&ht->edits, seed, planet_radius, dir);
 
     printf("[HEX] 3D voxel terrain initialized: radius=%.0f, range=%.0fm, chunk=%dx%dx%d\n",
@@ -2328,6 +2379,59 @@ void hex_terrain_destroy(HexTerrain* ht) {
     s_orphan_count = 0;
     edit_cache_flush_all(&ht->edits);
     edit_cache_destroy(&ht->edits);
+}
+
+void hex_terrain_retarget(HexTerrain* ht, LodBodyType type,
+                          float radius, int seed,
+                          const MoonShapeParams* moon_shape,
+                          const MoonColorPalette* moon_palette) {
+    // Wait for all pending jobs and free all active chunks
+    for (int i = 0; i < HEX_MAX_CHUNKS; i++) {
+        if (ht->chunks[i].pending_job) {
+            HexMeshJob* job = (HexMeshJob*)ht->chunks[i].pending_job;
+            while (!job->completed) { /* spin-wait */ }
+        }
+        if (ht->chunks[i].active) {
+            free_chunk(&ht->chunks[i]);
+        }
+    }
+    // Drain orphaned jobs
+    for (int i = 0; i < s_orphan_count; i++) {
+        HexMeshJob* job = (HexMeshJob*)s_orphaned_jobs[i];
+        while (!job->completed) { /* spin-wait */ }
+        if (job->vertices) free(job->vertices);
+        if (job->voxels) free(job->voxels);
+        if (job->sky_map) free(job->sky_map);
+        if (job->torch_map) free(job->torch_map);
+        if (job->wire_verts) free(job->wire_verts);
+        for (int b = 0; b < 4; b++) { if (job->out_border_torch[b]) free(job->out_border_torch[b]); }
+        free_job_neighbors(job);
+        free(job);
+    }
+    s_orphan_count = 0;
+
+    // Set new body parameters
+    ht->body_type = type;
+    ht->planet_radius = radius;
+    ht->seed = seed;
+    ht->sea_level = (type == LOD_BODY_MOON) ? 0 : ht->sea_level;
+    if (moon_shape) ht->moon_shape = *moon_shape;
+    if (moon_palette) ht->moon_palette = *moon_palette;
+
+    // Reset tangent frame
+    ht->frame_valid = false;
+    ht->active_count = 0;
+    ht->initial_gen_pending = 0;
+    ht->initial_load_complete = false;
+
+    // Reinitialize edit cache for new body
+    edit_cache_flush_all(&ht->edits);
+    edit_cache_destroy(&ht->edits);
+    edit_cache_init(&ht->edits, seed, radius, ht->edits_dir);
+
+    printf("[HEX] Retargeted to %s: radius=%.0f, seed=%d\n",
+        type == LOD_BODY_MOON ? "moon" : "planet", radius, seed);
+    fflush(stdout);
 }
 
 #define FRAME_REANCHOR_THRESHOLD 10000.0f
@@ -2549,6 +2653,9 @@ void hex_terrain_update(HexTerrain* ht, HMM_Vec3 camera_pos,
                     job->cz = chunk->cz;
                     job->planet_radius = ht->planet_radius;
                     job->seed = ht->seed;
+                    job->body_type = ht->body_type;
+                    job->moon_shape = ht->moon_shape;
+                    job->moon_palette = ht->moon_palette;
                     job->tangent_origin = ht->tangent_origin;
                     job->tangent_up = ht->tangent_up;
                     job->tangent_east = ht->tangent_east;
@@ -2621,6 +2728,9 @@ void hex_terrain_update(HexTerrain* ht, HMM_Vec3 camera_pos,
             job->cz = chunk->cz;
             job->planet_radius = ht->planet_radius;
             job->seed = ht->seed;
+            job->body_type = ht->body_type;
+            job->moon_shape = ht->moon_shape;
+            job->moon_palette = ht->moon_palette;
             job->tangent_origin = ht->tangent_origin;
             job->tangent_up = ht->tangent_up;
             job->tangent_east = ht->tangent_east;

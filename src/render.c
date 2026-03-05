@@ -565,15 +565,11 @@ void render_update_mesh(Renderer* r, Planet* planet, const Camera* cam) {
     lod_tree_upload_meshes(&r->lod_tree);
     uint64_t t2 = stm_now();
 
-    // Hex terrain: 3D voxel system (close-range, Tenebris only)
+    // Hex terrain: 3D voxel system (close-range, planet + moons)
     uint64_t t3 = stm_now();
-    if (r->lod_current_body == -1) {
-        hex_terrain_update(&r->hex_terrain, cam->position, r->lod_tree.world_origin);
-    }
+    hex_terrain_update(&r->hex_terrain, cam->position, r->lod_tree.world_origin);
     uint64_t t4 = stm_now();
-    if (r->lod_current_body == -1) {
-        hex_terrain_upload_meshes(&r->hex_terrain);
-    }
+    hex_terrain_upload_meshes(&r->hex_terrain);
     uint64_t t5 = stm_now();
     double hex_update_ms = stm_ms(stm_diff(t4, t3));
     double hex_upload_ms = stm_ms(stm_diff(t5, t4));
