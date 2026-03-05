@@ -96,6 +96,9 @@ static struct {
     // Lobby
     LobbyRequest lobby_req;
 
+    // Save restore state
+    bool restore_moon_local;    // Skip world→moon transform on next SOI transition (loading from save)
+
     // Background loading
     PlanetInitTask init_task;
 #ifdef _WIN32
@@ -931,10 +934,42 @@ static void frame(void) {
                 }};
             }
 
-            // Set floating origin to spawn/loaded position BEFORE any LOD meshes are generated.
-            app.renderer.lod_tree.world_origin[0] = app.camera.pos_d[0];
-            app.renderer.lod_tree.world_origin[1] = app.camera.pos_d[1];
-            app.renderer.lod_tree.world_origin[2] = app.camera.pos_d[2];
+            // If restoring onto a moon, set up the moon reference frame NOW
+            // (before any LOD mesh generation or camera updates).
+            if (app.restore_moon_local && app.camera.gravity_body >= 0 &&
+                app.camera.gravity_body < app.renderer.solar_system.moon_count) {
+                SolarSystem* ss = &app.renderer.solar_system;
+                int mi = app.camera.gravity_body;
+                const CelestialBody* moon = &ss->moons[mi];
+
+                // Retarget LOD to moon with center at origin
+                double zero_center[3] = {0, 0, 0};
+                lod_tree_retarget(&app.renderer.lod_tree, LOD_BODY_MOON,
+                    zero_center, moon->radius, 1.0f, 0,
+                    moon->shape.noise_seed, &moon->shape, &moon->palette);
+                hex_terrain_retarget(&app.renderer.hex_terrain, LOD_BODY_MOON,
+                    moon->radius, moon->shape.noise_seed,
+                    &moon->shape, &moon->palette);
+
+                // Set up pinned body for world-space reconstruction
+                ss->pinned_body = mi;
+                ss->pinned_center_d[0] = moon->pos_d[0];
+                ss->pinned_center_d[1] = moon->pos_d[1];
+                ss->pinned_center_d[2] = moon->pos_d[2];
+
+                app.renderer.lod_current_body = mi;
+                app.restore_moon_local = false;
+
+                // Moon-local: world_origin stays at {0,0,0}
+                app.renderer.lod_tree.world_origin[0] = 0.0;
+                app.renderer.lod_tree.world_origin[1] = 0.0;
+                app.renderer.lod_tree.world_origin[2] = 0.0;
+            } else {
+                // Planet/space: set floating origin to camera position
+                app.renderer.lod_tree.world_origin[0] = app.camera.pos_d[0];
+                app.renderer.lod_tree.world_origin[1] = app.camera.pos_d[1];
+                app.renderer.lod_tree.world_origin[2] = app.camera.pos_d[2];
+            }
 
             double cam_r = sqrt(app.camera.pos_d[0]*app.camera.pos_d[0] +
                                app.camera.pos_d[1]*app.camera.pos_d[1] +
@@ -1018,19 +1053,50 @@ static void frame(void) {
         if (app.camera.gravity_body != app.renderer.lod_current_body) {
             SolarSystem* ss = &app.renderer.solar_system;
             if (app.camera.gravity_body == -1) {
-                // Retarget to Tenebris — moon is no longer pinned
+                // Leaving moon SOI — convert camera back to world-space
+                if (app.renderer.lod_current_body >= 0) {
+                    app.camera.pos_d[0] += ss->pinned_center_d[0];
+                    app.camera.pos_d[1] += ss->pinned_center_d[1];
+                    app.camera.pos_d[2] += ss->pinned_center_d[2];
+                }
+                // Retarget to Tenebris
                 double center[3] = {0, 0, 0};
                 lod_tree_retarget(&app.renderer.lod_tree, LOD_BODY_PLANET,
                     center, app.planet.radius, app.planet.layer_thickness,
                     app.planet.sea_level, 42, NULL, NULL);
+                hex_terrain_retarget(&app.renderer.hex_terrain, LOD_BODY_PLANET,
+                    app.planet.radius, 42, NULL, NULL);
                 ss->pinned_body = -1;
             } else {
-                // Retarget to moon — pin it as stationary reference frame
+                // Entering moon SOI — transform camera to moon-local coords
                 const CelestialBody* moon = &ss->moons[app.camera.gravity_body];
+
+                if (!app.restore_moon_local) {
+                    // If leaving another moon, first convert back to world-space
+                    if (app.renderer.lod_current_body >= 0) {
+                        app.camera.pos_d[0] += ss->pinned_center_d[0];
+                        app.camera.pos_d[1] += ss->pinned_center_d[1];
+                        app.camera.pos_d[2] += ss->pinned_center_d[2];
+                    }
+
+                    // Convert camera to moon-local coordinates
+                    app.camera.pos_d[0] -= moon->pos_d[0];
+                    app.camera.pos_d[1] -= moon->pos_d[1];
+                    app.camera.pos_d[2] -= moon->pos_d[2];
+                }
+                app.restore_moon_local = false;
+
+                // Retarget LOD with moon center at origin
+                double zero_center[3] = {0, 0, 0};
                 lod_tree_retarget(&app.renderer.lod_tree, LOD_BODY_MOON,
-                    moon->pos_d, moon->radius, 1.0f, 0,
+                    zero_center, moon->radius, 1.0f, 0,
                     moon->shape.noise_seed,
                     &moon->shape, &moon->palette);
+                hex_terrain_retarget(&app.renderer.hex_terrain, LOD_BODY_MOON,
+                    moon->radius, moon->shape.noise_seed,
+                    &moon->shape, &moon->palette);
+
+                // Pin the moon — track its Kepler position for world-space reconstruction
                 ss->pinned_body = app.camera.gravity_body;
                 ss->pinned_center_d[0] = moon->pos_d[0];
                 ss->pinned_center_d[1] = moon->pos_d[1];
@@ -1039,22 +1105,15 @@ static void frame(void) {
             app.renderer.lod_current_body = app.camera.gravity_body;
         }
 
-        // Moon reference frame: sync body_center and pinned_center to the moon's
-        // current Kepler position. The camera tracks orbital motion via camera_update
-        // (pos_d += delta), so camera and body center stay close together.
-        // world_origin is NOT shifted here — the floating-origin recenter system
-        // handles that when camera drifts far enough, ensuring mesh jobs are never
-        // falsely discarded as stale by the origin check.
+        // Moon reference frame: track Kepler position for world-space reconstruction.
+        // body_center_d and world_origin stay at {0,0,0} — the moon IS the origin.
+        // Camera is in moon-local coords, no drift, no recentering needed.
         if (app.renderer.lod_current_body >= 0) {
             SolarSystem* ss = &app.renderer.solar_system;
             const CelestialBody* moon = &ss->moons[app.renderer.lod_current_body];
 
-            // Sync body center to actual Kepler position (mesh generation uses this)
-            app.renderer.lod_tree.body_center_d[0] = moon->pos_d[0];
-            app.renderer.lod_tree.body_center_d[1] = moon->pos_d[1];
-            app.renderer.lod_tree.body_center_d[2] = moon->pos_d[2];
-
-            // Sync pinned center for SOI checks
+            // Track moon's current Kepler position for world-space reconstruction
+            // (used by SOI checks in camera.c and external rendering in celestial.c)
             ss->pinned_center_d[0] = moon->pos_d[0];
             ss->pinned_center_d[1] = moon->pos_d[1];
             ss->pinned_center_d[2] = moon->pos_d[2];
@@ -1537,7 +1596,29 @@ static void event(const sapp_event* ev) {
 }
 
 // ---- Player state persistence ----
-#define PLAYER_SAVE_MAGIC 0x504C5952  // "PLYR"
+#define PLAYER_SAVE_MAGIC_V1 0x504C5952  // "PLYR" (legacy, 32 bytes)
+#define PLAYER_SAVE_MAGIC    0x504C5953  // "PLYS" (v2, location-aware)
+#define PLAYER_SAVE_VERSION  2
+
+typedef enum {
+    PLAYER_LOC_PLANET = 0,  // On Tenebris surface (world-space coords)
+    PLAYER_LOC_MOON   = 1,  // On/near a moon (moon-local coords)
+    PLAYER_LOC_SPACE  = 2,  // Free space (world-space coords)
+} PlayerLocationType;
+
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    uint8_t  location_type;   // PlayerLocationType
+    uint8_t  body_index;      // Moon index (0-9) when PLAYER_LOC_MOON
+    uint8_t  hotbar_slot;
+    uint8_t  pad;
+    double   pos_d[3];        // Coordinates (meaning depends on location_type)
+    float    yaw;
+    float    pitch;
+} PlayerSave;
+
+// Legacy v1 format for migration
 typedef struct {
     uint32_t magic;
     double pos_d[3];
@@ -1545,7 +1626,7 @@ typedef struct {
     float pitch;
     uint8_t hotbar_slot;
     uint8_t pad[3];
-} PlayerSave;
+} PlayerSaveV1;
 
 static void player_save(void) {
     char path[256];
@@ -1573,18 +1654,34 @@ static void player_save(void) {
         printf("[SAVE] ERROR: could not open %s for writing\n", path); fflush(stdout);
         return;
     }
+    // Determine location type
+    PlayerLocationType loc;
+    int body_idx = 0;
+    if (app.renderer.lod_current_body >= 0) {
+        loc = PLAYER_LOC_MOON;
+        body_idx = app.renderer.lod_current_body;
+    } else if (app.camera.space_mode) {
+        loc = PLAYER_LOC_SPACE;
+    } else {
+        loc = PLAYER_LOC_PLANET;
+    }
+
     PlayerSave save = {
         .magic = PLAYER_SAVE_MAGIC,
+        .version = PLAYER_SAVE_VERSION,
+        .location_type = (uint8_t)loc,
+        .body_index = (uint8_t)body_idx,
+        .hotbar_slot = (uint8_t)app.hotbar_slot,
         .pos_d = { app.camera.pos_d[0], app.camera.pos_d[1], app.camera.pos_d[2] },
         .yaw = app.camera.yaw,
         .pitch = app.camera.pitch,
-        .hotbar_slot = (uint8_t)app.hotbar_slot,
     };
     fwrite(&save, sizeof(save), 1, f);
     fclose(f);
     double r = sqrt(save.pos_d[0]*save.pos_d[0] + save.pos_d[1]*save.pos_d[1] + save.pos_d[2]*save.pos_d[2]);
-    printf("[SAVE] Player saved to %s: r=%.0f yaw=%.2f pitch=%.2f slot=%d\n",
-           path, r, save.yaw, save.pitch, save.hotbar_slot);
+    const char* loc_names[] = {"planet", "moon", "space"};
+    printf("[SAVE] Player saved to %s: loc=%s body=%d r=%.0f yaw=%.2f pitch=%.2f slot=%d\n",
+           path, loc_names[loc], body_idx, r, save.yaw, save.pitch, save.hotbar_slot);
     fflush(stdout);
 }
 
@@ -1594,17 +1691,63 @@ static bool player_load(void) {
 
     FILE* f = fopen(path, "rb");
     if (!f) return false;
-    PlayerSave save;
-    if (fread(&save, sizeof(save), 1, f) != 1 || save.magic != PLAYER_SAVE_MAGIC) {
+
+    // Read magic to determine format
+    uint32_t magic;
+    if (fread(&magic, sizeof(magic), 1, f) != 1) { fclose(f); return false; }
+
+    PlayerSave save = {0};
+
+    if (magic == PLAYER_SAVE_MAGIC_V1) {
+        // Legacy v1 format — read remaining fields after magic
+        rewind(f);
+        PlayerSaveV1 v1;
+        if (fread(&v1, sizeof(v1), 1, f) != 1) { fclose(f); return false; }
+        fclose(f);
+
+        save.magic = PLAYER_SAVE_MAGIC;
+        save.version = PLAYER_SAVE_VERSION;
+        save.location_type = PLAYER_LOC_PLANET;
+        save.body_index = 0;
+        save.hotbar_slot = v1.hotbar_slot;
+        save.pos_d[0] = v1.pos_d[0];
+        save.pos_d[1] = v1.pos_d[1];
+        save.pos_d[2] = v1.pos_d[2];
+        save.yaw = v1.yaw;
+        save.pitch = v1.pitch;
+        printf("[SAVE] Migrated v1 save from %s\n", path); fflush(stdout);
+    } else if (magic == PLAYER_SAVE_MAGIC) {
+        // Current v2 format
+        rewind(f);
+        if (fread(&save, sizeof(save), 1, f) != 1) { fclose(f); return false; }
+        fclose(f);
+    } else {
         fclose(f);
         return false;
     }
-    fclose(f);
 
-    // Validate: position must be a reasonable distance from planet center
+    // Validate by location type
     double r = sqrt(save.pos_d[0]*save.pos_d[0] + save.pos_d[1]*save.pos_d[1] + save.pos_d[2]*save.pos_d[2]);
-    if (r < 700000.0 || r > 900000.0) return false;  // Sanity check (~800km planet)
 
+    switch ((PlayerLocationType)save.location_type) {
+    case PLAYER_LOC_PLANET:
+        if (r < 700000.0 || r > 900000.0) return false;  // ~800km planet
+        break;
+    case PLAYER_LOC_MOON:
+        if (save.body_index >= MAX_MOONS) return false;
+        {
+            const CelestialBody* moon = &app.renderer.solar_system.moons[save.body_index];
+            if (r < 1.0 || r > moon->radius * 2.0) return false;
+        }
+        break;
+    case PLAYER_LOC_SPACE:
+        if (r > 10000000.0) return false;  // 10,000km bounds
+        break;
+    default:
+        return false;
+    }
+
+    // Restore camera position
     app.camera.pos_d[0] = save.pos_d[0];
     app.camera.pos_d[1] = save.pos_d[1];
     app.camera.pos_d[2] = save.pos_d[2];
@@ -1616,7 +1759,18 @@ static bool player_load(void) {
     app.hotbar_slot = save.hotbar_slot % HOTBAR_COUNT;
     app.selected_block_type = hotbar_types[app.hotbar_slot];
 
-    printf("[SAVE] Player position loaded from %s (r=%.0f)\n", path, r); fflush(stdout);
+    // Restore location-specific state
+    if (save.location_type == PLAYER_LOC_MOON) {
+        app.camera.gravity_body = (int)save.body_index;
+        app.restore_moon_local = true;  // Skip world→moon transform in SOI transition
+    } else if (save.location_type == PLAYER_LOC_SPACE) {
+        app.camera.space_mode = true;
+    }
+
+    const char* loc_names[] = {"planet", "moon", "space"};
+    printf("[SAVE] Player loaded from %s: loc=%s body=%d r=%.0f\n",
+           path, loc_names[save.location_type], save.body_index, r);
+    fflush(stdout);
     return true;
 }
 

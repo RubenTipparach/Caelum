@@ -271,41 +271,36 @@ void camera_update(Camera* cam, Planet* planet, const LodTree* lod,
         planet_surface_r = planet->radius + planet->sea_level * planet->layer_thickness;
     }
     int prev_gravity = cam->gravity_body;
+
+    // When on a moon, cam->pos_d is moon-local. Convert to world-space for SOI checks.
+    double world_pos_d[3];
+    if (cam->gravity_body >= 0 && solar && solar->pinned_body >= 0) {
+        world_pos_d[0] = cam->pos_d[0] + solar->pinned_center_d[0];
+        world_pos_d[1] = cam->pos_d[1] + solar->pinned_center_d[1];
+        world_pos_d[2] = cam->pos_d[2] + solar->pinned_center_d[2];
+    } else {
+        world_pos_d[0] = cam->pos_d[0];
+        world_pos_d[1] = cam->pos_d[1];
+        world_pos_d[2] = cam->pos_d[2];
+    }
+
     if (solar) {
-        cam->gravity_body = solar_system_find_gravity_body(solar, cam->pos_d, planet_surface_r);
+        cam->gravity_body = solar_system_find_gravity_body(solar, world_pos_d, planet_surface_r);
     } else {
         cam->gravity_body = -1;
     }
 
     // ---- Gravity body center tracking ----
     if (prev_gravity != cam->gravity_body) {
-        // Transition: latch gravity center to current body position
-        if (cam->gravity_body >= 0 && solar) {
-            const CelestialBody* moon = &solar->moons[cam->gravity_body];
-            cam->gravity_center_d[0] = moon->pos_d[0];
-            cam->gravity_center_d[1] = moon->pos_d[1];
-            cam->gravity_center_d[2] = moon->pos_d[2];
-        } else {
-            cam->gravity_center_d[0] = 0.0;
-            cam->gravity_center_d[1] = 0.0;
-            cam->gravity_center_d[2] = 0.0;
-        }
+        // Transition: gravity_center is always {0,0,0} — either planet origin
+        // (world-space) or moon origin (moon-local frame, set up by main.c).
+        cam->gravity_center_d[0] = 0.0;
+        cam->gravity_center_d[1] = 0.0;
+        cam->gravity_center_d[2] = 0.0;
         cam->tangent_initialized = false;
-    } else if (cam->gravity_body >= 0 && solar) {
-        // Riding a moon: apply orbital delta so the player moves with it.
-        // This means exiting the SOI launches from the moon's current orbital
-        // position, and Tenebris visibly moves in the sky from the moon surface.
-        const CelestialBody* moon = &solar->moons[cam->gravity_body];
-        double dx = moon->pos_d[0] - moon->prev_pos_d[0];
-        double dy = moon->pos_d[1] - moon->prev_pos_d[1];
-        double dz = moon->pos_d[2] - moon->prev_pos_d[2];
-        cam->pos_d[0] += dx;
-        cam->pos_d[1] += dy;
-        cam->pos_d[2] += dz;
-        cam->gravity_center_d[0] = moon->pos_d[0];
-        cam->gravity_center_d[1] = moon->pos_d[1];
-        cam->gravity_center_d[2] = moon->pos_d[2];
     }
+    // No orbital delta needed — when on a moon, cam->pos_d is already moon-local
+    // and the moon doesn't move in its own reference frame.
 
     // ---- Compute body-relative distance and local_up ----
     // body_dist: distance from gravity body center (for altitude, collision, ground snap)
@@ -323,14 +318,15 @@ void camera_update(Camera* cam, Planet* planet, const LodTree* lod,
         (float)(body_dz / body_dist_d)
     }};
 
-    double pos_len_d = sqrt(cam->pos_d[0]*cam->pos_d[0] +
-                            cam->pos_d[1]*cam->pos_d[1] +
-                            cam->pos_d[2]*cam->pos_d[2]);
+    // pos_len: distance from Tenebris center (world-space, for planet altitude check)
+    double pos_len_d = sqrt(world_pos_d[0]*world_pos_d[0] +
+                            world_pos_d[1]*world_pos_d[1] +
+                            world_pos_d[2]*world_pos_d[2]);
     if (pos_len_d < 0.001) pos_len_d = 0.001;
     float pos_len = (float)pos_len_d;
 
     // ---- Space mode detection ----
-    // Check if we're more than 50km from ALL surfaces
+    // Check if we're more than 50km from ALL surfaces (using world-space positions)
     {
         double planet_alt = pos_len_d - (double)planet_surface_r;
         bool within_any_soi = (planet_alt < (double)MOON_SOI_RADIUS);
@@ -338,20 +334,12 @@ void camera_update(Camera* cam, Planet* planet, const LodTree* lod,
         if (!within_any_soi && solar) {
             for (int i = 0; i < solar->moon_count; i++) {
                 const CelestialBody* m = &solar->moons[i];
-                // For the pinned body, use the frozen center (moon->pos_d drifts via Kepler)
-                double mx, my, mz;
-                if (i == solar->pinned_body) {
-                    mx = solar->pinned_center_d[0];
-                    my = solar->pinned_center_d[1];
-                    mz = solar->pinned_center_d[2];
-                } else {
-                    mx = m->pos_d[0];
-                    my = m->pos_d[1];
-                    mz = m->pos_d[2];
-                }
-                double dx = cam->pos_d[0] - mx;
-                double dy = cam->pos_d[1] - my;
-                double dz = cam->pos_d[2] - mz;
+                double mx = m->pos_d[0];
+                double my = m->pos_d[1];
+                double mz = m->pos_d[2];
+                double dx = world_pos_d[0] - mx;
+                double dy = world_pos_d[1] - my;
+                double dz = world_pos_d[2] - mz;
                 double dist = sqrt(dx*dx + dy*dy + dz*dz);
                 if (dist - (double)m->radius < (double)MOON_SOI_RADIUS) {
                     within_any_soi = true;
