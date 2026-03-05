@@ -5,6 +5,13 @@
 #include "log_config.h"
 #include <math.h>
 
+#ifdef __APPLE__
+extern void platform_macos_set_mouse_tap(bool active);
+extern void platform_macos_poll_mouse(float* out_dx, float* out_dy);
+extern bool platform_macos_has_tap(void);
+extern void platform_macos_poll_events(void);
+#endif
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -163,6 +170,92 @@ void camera_update(Camera* cam, Planet* planet, const LodTree* lod,
                    const HexTerrain* hex, float dt,
                    const SolarSystem* solar) {
     double dd = (double)dt;
+
+    // ---- Apply mouse deltas (once per frame) ----
+    // On macOS: drain pending mouse events from the run loop to avoid
+    // display-link starvation, then prefer CGEventTap if available.
+    #ifdef __APPLE__
+    platform_macos_poll_events();
+    #endif
+
+    float mouse_dx = cam->mouse_dx_accum;
+    float mouse_dy = cam->mouse_dy_accum;
+    cam->mouse_dx_accum = 0.0f;
+    cam->mouse_dy_accum = 0.0f;
+
+    #ifdef __APPLE__
+    if (cam->mouse_locked && platform_macos_has_tap()) {
+        float tap_dx, tap_dy;
+        platform_macos_poll_mouse(&tap_dx, &tap_dy);
+        // Use tap deltas if available (more reliable than sokol NSEvents)
+        if (tap_dx != 0.0f || tap_dy != 0.0f) {
+            mouse_dx = tap_dx;
+            mouse_dy = tap_dy;
+        }
+        // If tap returned zero but sokol had deltas, use sokol deltas
+    }
+    #endif
+
+    float applied_accum = 0.0f;
+    if (mouse_dx != 0.0f || mouse_dy != 0.0f) {
+        applied_accum = sqrtf(mouse_dx * mouse_dx + mouse_dy * mouse_dy);
+        cam->yaw -= mouse_dx * cam->sensitivity;
+        cam->pitch -= mouse_dy * cam->sensitivity;
+        if (!cam->space_mode) {
+            float limit = (float)M_PI / 2.0f - 0.01f;
+            if (cam->pitch > limit) cam->pitch = limit;
+            if (cam->pitch < -limit) cam->pitch = -limit;
+        }
+    }
+
+    // ---- Mouse diagnostics (Alt+M to toggle) ----
+    if (cam->mouse_diag_enabled) {
+        float frame_ms = dt * 1000.0f;
+
+        // Accumulate rolling stats
+        cam->diag_frame_count++;
+        cam->diag_total_events += cam->mouse_events_this_frame;
+        if (cam->mouse_locked && cam->mouse_events_this_frame == 0)
+            cam->diag_zero_event_frames++;
+        if (cam->mouse_max_gap_ms > cam->diag_max_gap_ms)
+            cam->diag_max_gap_ms = cam->mouse_max_gap_ms;
+        if (cam->mouse_max_delta > cam->diag_max_delta)
+            cam->diag_max_delta = cam->mouse_max_delta;
+        if (applied_accum > cam->diag_max_accum)
+            cam->diag_max_accum = applied_accum;
+        if (frame_ms > cam->diag_max_frame_ms)
+            cam->diag_max_frame_ms = frame_ms;
+
+        // Log every 120 frames (~2 seconds at 60fps)
+        if (cam->diag_frame_count >= 120) {
+            float avg_events = (float)cam->diag_total_events / (float)cam->diag_frame_count;
+            printf("[MOUSE DIAG] %d frames: avg_events/frame=%.1f, "
+                   "zero_event_frames=%d, max_gap=%.1fms, "
+                   "max_single_delta=%.0f, max_accum=%.0f, "
+                   "max_frame=%.1fms\n",
+                   cam->diag_frame_count, avg_events,
+                   cam->diag_zero_event_frames,
+                   cam->diag_max_gap_ms,
+                   cam->diag_max_delta,
+                   cam->diag_max_accum,
+                   cam->diag_max_frame_ms);
+            fflush(stdout);
+
+            // Reset
+            cam->diag_frame_count = 0;
+            cam->diag_total_events = 0;
+            cam->diag_zero_event_frames = 0;
+            cam->diag_max_gap_ms = 0.0f;
+            cam->diag_max_delta = 0.0f;
+            cam->diag_max_accum = 0.0f;
+            cam->diag_max_frame_ms = 0.0f;
+        }
+
+        // Reset per-frame counters
+        cam->mouse_events_this_frame = 0;
+        cam->mouse_max_gap_ms = 0.0f;
+        cam->mouse_max_delta = 0.0f;
+    }
 
     // ---- Teleport detection: capture radius before movement ----
     double radius_before = sqrt(cam->pos_d[0]*cam->pos_d[0] +
@@ -1010,18 +1103,30 @@ void camera_handle_event(Camera* cam, const sapp_event* ev) {
                  ev->mouse_button == SAPP_MOUSEBUTTON_MIDDLE)) {
                 cam->mouse_locked = true;
                 sapp_lock_mouse(true);
+                #ifdef __APPLE__
+                platform_macos_set_mouse_tap(true);
+                #endif
             }
             break;
 
         case SAPP_EVENTTYPE_MOUSE_MOVE:
             if (cam->mouse_locked) {
-                cam->yaw -= ev->mouse_dx * cam->sensitivity;
-                cam->pitch -= ev->mouse_dy * cam->sensitivity;
-                if (!cam->space_mode) {
-                    // Clamp pitch to ±90° only when grounded (fixed up vector)
-                    float limit = (float)M_PI / 2.0f - 0.01f;
-                    if (cam->pitch > limit) cam->pitch = limit;
-                    if (cam->pitch < -limit) cam->pitch = -limit;
+                // Always accumulate sokol events. On macOS with CGEventTap,
+                // tap deltas override these in camera_update if available.
+                cam->mouse_dx_accum += ev->mouse_dx;
+                cam->mouse_dy_accum += ev->mouse_dy;
+
+                // Diagnostics (works on all platforms via sokol events)
+                if (cam->mouse_diag_enabled) {
+                    cam->mouse_events_this_frame++;
+                    uint64_t now = stm_now();
+                    if (cam->mouse_last_event_time != 0) {
+                        float gap = (float)stm_ms(stm_diff(now, cam->mouse_last_event_time));
+                        if (gap > cam->mouse_max_gap_ms) cam->mouse_max_gap_ms = gap;
+                    }
+                    cam->mouse_last_event_time = now;
+                    float delta = sqrtf(ev->mouse_dx * ev->mouse_dx + ev->mouse_dy * ev->mouse_dy);
+                    if (delta > cam->mouse_max_delta) cam->mouse_max_delta = delta;
                 }
             }
             break;
@@ -1067,6 +1172,9 @@ void camera_handle_event(Camera* cam, const sapp_event* ev) {
             if (ev->key_code == SAPP_KEYCODE_ESCAPE) {
                 cam->mouse_locked = false;
                 sapp_lock_mouse(false);
+                #ifdef __APPLE__
+                platform_macos_set_mouse_tap(false);
+                #endif
             }
             break;
 

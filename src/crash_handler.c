@@ -132,6 +132,7 @@ void crash_handler_install(void) {
 // POSIX: use signal handlers
 #include <signal.h>
 #include <string.h>
+#include <unistd.h>
 #include <execinfo.h>
 
 static void crash_signal_handler(int sig) {
