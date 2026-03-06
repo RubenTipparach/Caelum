@@ -948,7 +948,7 @@ static void frame(void) {
                     zero_center, moon->radius, 1.0f, 0,
                     moon->shape.noise_seed, &moon->shape, &moon->palette);
                 hex_terrain_retarget(&app.renderer.hex_terrain, LOD_BODY_MOON,
-                    moon->radius, moon->shape.noise_seed,
+                    moon->shape.base_radius, moon->shape.noise_seed,
                     &moon->shape, &moon->palette);
 
                 // Set up pinned body for world-space reconstruction
@@ -1093,7 +1093,7 @@ static void frame(void) {
                     moon->shape.noise_seed,
                     &moon->shape, &moon->palette);
                 hex_terrain_retarget(&app.renderer.hex_terrain, LOD_BODY_MOON,
-                    moon->radius, moon->shape.noise_seed,
+                    moon->shape.base_radius, moon->shape.noise_seed,
                     &moon->shape, &moon->palette);
 
                 // Pin the moon — track its Kepler position for world-space reconstruction

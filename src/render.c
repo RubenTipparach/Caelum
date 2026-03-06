@@ -304,9 +304,9 @@ void render_init(Renderer* r, Planet* planet, const Camera* cam, const char* edi
     // ---- Hex terrain textured pipeline ----
     printf("[RENDER] render_init: loading hex terrain textures...\n"); fflush(stdout);
     {
-        // Load 10 terrain textures and build atlas
-        // Layout: water, sand, dirt, grass, stone, ice, snow, dirt_grass, dirt_snow, torch
-        const char* tex_files[10] = {
+        // Load 11 terrain textures and build atlas
+        // Layout: water, sand, dirt, grass, stone, ice, snow, dirt_grass, dirt_snow, torch, moon
+        const char* tex_files[11] = {
             "assets/textures/water.png",
             "assets/textures/sand.png",
             "assets/textures/dirt.png",
@@ -317,9 +317,10 @@ void render_init(Renderer* r, Planet* planet, const Camera* cam, const char* edi
             "assets/textures/dirt_grass.png",
             NULL,  // dirt_snow: generated from dirt+snow blend
             "assets/textures/torch.png",
+            "assets/textures/moon.png",
         };
         const int TILE_SIZE = 16;
-        const int NUM_TILES = 10;
+        const int NUM_TILES = 11;
         const int atlas_w = TILE_SIZE * NUM_TILES;
         const int atlas_h = TILE_SIZE;
         unsigned char* atlas_data = (unsigned char*)calloc(atlas_w * atlas_h * 4, 1);
@@ -1016,9 +1017,9 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
         static const char* block_names[] = {
             "AIR", "WATER", "SAND", "DIRT", "GRASS", "STONE", "ICE", "BEDROCK", "TORCH"
         };
-        // Hotbar types: STONE, DIRT, GRASS, SAND, WATER, ICE, BEDROCK, TORCH
-        static const int hotbar_voxel[] = { 5, 3, 4, 2, 1, 6, 7, 8 };
-        int vtype = hotbar_voxel[r->hotbar_selected_slot % 8];
+        // Hotbar types: STONE, DIRT, GRASS, SAND, WATER, ICE, TORCH
+        static const int hotbar_voxel[] = { 5, 3, 4, 2, 1, 6, 8 };
+        int vtype = hotbar_voxel[r->hotbar_selected_slot % 7];
         const char* name = (vtype < 9) ? block_names[vtype] : "???";
         sdtx_color3f(1.0f, 0.8f, 0.4f);
         sdtx_printf("[%d] %s\n", r->hotbar_selected_slot + 1, name);
@@ -1140,10 +1141,10 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
     // ---- 5. Hotbar UI overlay ----
     {
         // Atlas tile indices for each hotbar slot (matches hotbar_types[] in main.c)
-        // STONE=4, DIRT=2, GRASS=3, SAND=1, WATER=0, ICE=5, BEDROCK=4, TORCH=9
-        static const int hotbar_atlas[] = { 4, 2, 3, 1, 0, 5, 4, 9 };
-        static const int HOTBAR_SLOTS = 8;
-        static const float ATLAS_TILES = 10.0f;
+        // STONE=4, DIRT=2, GRASS=3, SAND=1, WATER=0, ICE=5, TORCH=9
+        static const int hotbar_atlas[] = { 4, 2, 3, 1, 0, 5, 9 };
+        static const int HOTBAR_SLOTS = 7;
+        static const float ATLAS_TILES = 11.0f;
 
         float sw = sapp_widthf();
         float sh = sapp_heightf();
