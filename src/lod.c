@@ -1210,16 +1210,16 @@ static void generate_hex_mesh_for_moon(
                 vec3_add(center_scaled,
                     vec3_add(vec3_scale(east, hx), vec3_scale(north, hz))));
 
-            // Moon terrain: ellipsoid + noise
+            // Moon terrain: per-cell ellipsoid radius (conforms to ellipsoid surface)
             float surface_r = moon_surface_radius(moon_shape, cdir);
             float ellip_r = moon_ellipsoid_radius(moon_shape, cdir);
             float h_m = surface_r - ellip_r;
-            float eff = fmaxf(h_m, 0.0f);  // No sea level on moons
+            float eff = fmaxf(h_m, 0.0f);
             int h = (int)ceilf(eff);
 
             int gi = (col - col_min) * grid_rows + (row - row_min);
             hm_heights[gi] = (int16_t)h;
-            hm_atlas[gi] = LOD_ATLAS_MOON;  // Moon surface = moon rock
+            hm_atlas[gi] = LOD_ATLAS_MOON;
 
             // Moon palette color based on height
             float height_t = (surface_r - ellip_r * 0.9f) / (ellip_r * 0.2f);
@@ -2132,11 +2132,16 @@ void lod_tree_update(LodTree* tree, HMM_Vec3 camera_pos, HMM_Mat4 view_proj) {
         }
         if (need_reanchor) {
             tree->hex_frame_origin = cam_dir;
+            /* Use ellipsoid surface normal for moons so LOD hex frame matches
+               hex terrain's tangent frame orientation */
+            HMM_Vec3 up = cam_dir;
+            if (tree->body_type == LOD_BODY_MOON)
+                up = moon_ellipsoid_normal(&tree->moon_shape, cam_dir);
             HMM_Vec3 wy = {{0.0f, 1.0f, 0.0f}};
-            if (fabsf(vec3_dot(cam_dir, wy)) > 0.99f)
+            if (fabsf(vec3_dot(up, wy)) > 0.99f)
                 wy = (HMM_Vec3){{1.0f, 0.0f, 0.0f}};
-            tree->hex_frame_east = vec3_normalize(vec3_cross(wy, cam_dir));
-            tree->hex_frame_north = vec3_normalize(vec3_cross(cam_dir, tree->hex_frame_east));
+            tree->hex_frame_east = vec3_normalize(vec3_cross(wy, up));
+            tree->hex_frame_north = vec3_normalize(vec3_cross(up, tree->hex_frame_east));
             tree->hex_frame_valid = true;
         }
     }
