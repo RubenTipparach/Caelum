@@ -74,6 +74,7 @@ typedef struct Camera {
     int gravity_body;             // -1 = Tenebris, 0-9 = moon index
     double gravity_center_d[3];   // Fixed center of gravity body (latched on transition)
     float transition_alpha;       // 0.0 = space, 1.0 = grounded (lerps over 0.5s)
+    float tenebris_gravity;       // Tenebris surface gravity (from config, default 10.0)
 } Camera;
 
 void camera_init(Camera* cam);

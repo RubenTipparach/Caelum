@@ -317,10 +317,10 @@ static int voxel_bottom_atlas(VoxelType type) {
 // ---- Tangent frame computation ----
 
 // Ground radius for tangent frame placement.
-// Planet: planet_radius + sea_level_m.  Moon: planet_radius (no sea level).
-static float ht_ground_r(const HexTerrain* ht) {
+// Planet: planet_radius + sea_level_m.  Moon: ellipsoid radius at cam direction.
+static float ht_ground_r(const HexTerrain* ht, HMM_Vec3 cam_dir) {
     if (ht->body_type == LOD_BODY_MOON)
-        return ht->planet_radius;
+        return moon_ellipsoid_radius(&ht->moon_shape, cam_dir);
     return ht->planet_radius + TERRAIN_SEA_LEVEL_M;
 }
 
@@ -330,7 +330,7 @@ static void compute_tangent_frame(HexTerrain* ht, HMM_Vec3 camera_pos) {
     HMM_Vec3 cam_dir = vec3_scale(camera_pos, 1.0f / cam_r);
 
     ht->tangent_up = cam_dir;
-    float ground_r = ht_ground_r(ht);
+    float ground_r = ht_ground_r(ht, cam_dir);
     ht->tangent_origin = vec3_scale(cam_dir, ground_r);
 
     HMM_Vec3 world_y = (HMM_Vec3){{0.0f, 1.0f, 0.0f}};
@@ -371,7 +371,7 @@ static void world_to_tangent(const HexTerrain* ht, HMM_Vec3 world_pos,
         return;
     }
     // ground_r = |tangent_origin|
-    float ground_r = ht_ground_r(ht);
+    float ground_r = ht_ground_r(ht, ht->tangent_up);
     float k = ground_r / cos_theta;
     *out_lx = k * vec3_dot(dir, ht->tangent_east);
     *out_lz = k * vec3_dot(dir, ht->tangent_north);
@@ -444,6 +444,7 @@ typedef struct HexMeshJob {
     bool has_voxels;  // true = voxels already populated (remesh only, skip terrain gen)
     int16_t col_min_solid[HEX_CHUNK_SIZE][HEX_CHUNK_SIZE];
     int16_t col_max_solid[HEX_CHUNK_SIZE][HEX_CHUNK_SIZE];
+    float   col_ellip_r[HEX_CHUNK_SIZE][HEX_CHUNK_SIZE];  // per-column ellipsoid radius (moons)
 
     // Cached arch data (computed once per job)
     HtArchFrame arch_frame;
@@ -724,7 +725,8 @@ static uint8_t job_get_neighbor_voxel(const HexMeshJob* job,
     uint8_t solid_type;
     if (job->body_type == LOD_BODY_MOON) {
         float surface_r = moon_surface_radius(&job->moon_shape, ndir);
-        nh_eff = fmaxf(surface_r - job->moon_shape.base_radius, 0.0f);
+        float ellip_r = moon_ellipsoid_radius(&job->moon_shape, ndir);
+        nh_eff = fmaxf(surface_r - ellip_r, 0.0f);
         solid_type = VOXEL_MOON_ROCK;
     } else {
         float nh_m = ht_sample_height_m(continental, mountain, warp, detail, ndir);
@@ -799,7 +801,8 @@ static int sky_neighbor_max_solid(const HexMeshJob* job,
     float nh_eff;
     if (job->body_type == LOD_BODY_MOON) {
         float surface_r = moon_surface_radius(&job->moon_shape, ndir);
-        nh_eff = fmaxf(surface_r - job->moon_shape.base_radius, 0.0f);
+        float ellip_r = moon_ellipsoid_radius(&job->moon_shape, ndir);
+        nh_eff = fmaxf(surface_r - ellip_r, 0.0f);
     } else {
         float nh_m = ht_sample_height_m(continental, mountain, warp, detail, ndir);
         nh_eff = fmaxf(nh_m, TERRAIN_SEA_LEVEL_M);
@@ -1532,7 +1535,8 @@ static void generate_chunk_mesh(HexMeshJob* job) {
                 float h_m;
                 if (job->body_type == LOD_BODY_MOON) {
                     float surface_r = moon_surface_radius(&job->moon_shape, dir);
-                    h_m = surface_r - job->moon_shape.base_radius;
+                    float ellip_r = moon_ellipsoid_radius(&job->moon_shape, dir);
+                    h_m = surface_r - ellip_r;
                 } else {
                     h_m = ht_sample_height_m(&continental, &mountain, &warp, &detail, dir);
                 }
@@ -1564,9 +1568,11 @@ static void generate_chunk_mesh(HexMeshJob* job) {
                 float effective_h;
                 int surface_layer;
                 VoxelType surface_type;
+                float col_ellip_r = 0.0f;  // per-column ellipsoid radius
                 if (job->body_type == LOD_BODY_MOON) {
                     float surface_r = moon_surface_radius(&job->moon_shape, unit);
-                    h_m = surface_r - job->moon_shape.base_radius;
+                    col_ellip_r = moon_ellipsoid_radius(&job->moon_shape, unit);
+                    h_m = surface_r - col_ellip_r;
                     effective_h = fmaxf(h_m, 0.0f);
                     surface_layer = (int)ceilf(effective_h / HEX_HEIGHT);
                     surface_type = VOXEL_MOON_ROCK;
@@ -1593,6 +1599,7 @@ static void generate_chunk_mesh(HexMeshJob* job) {
 
                 job->col_min_solid[col][row] = (int16_t)min_solid;
                 job->col_max_solid[col][row] = (int16_t)max_solid;
+                job->col_ellip_r[col][row] = col_ellip_r;
             }
         }
 
@@ -1815,9 +1822,9 @@ static void generate_chunk_mesh(HexMeshJob* job) {
             HMM_Vec3 col_color;
             if (job->body_type == LOD_BODY_MOON) {
                 float surface_r = moon_surface_radius(&job->moon_shape, center_dir);
-                col_h_m = surface_r - job->moon_shape.base_radius;
-                float base_r = job->moon_shape.base_radius;
-                float height_t = (surface_r - base_r * 0.9f) / (base_r * 0.2f);
+                float ellip_r = moon_ellipsoid_radius(&job->moon_shape, center_dir);
+                col_h_m = surface_r - ellip_r;
+                float height_t = (surface_r - ellip_r * 0.9f) / (ellip_r * 0.2f);
                 if (height_t < 0.0f) height_t = 0.0f;
                 if (height_t > 1.0f) height_t = 1.0f;
                 col_color = vec3_lerp(job->moon_palette.shadow_color,
@@ -1843,8 +1850,8 @@ static void generate_chunk_mesh(HexMeshJob* job) {
                              vec3_scale(job->tangent_north, lz + d))));
                 float h_e, h_n;
                 if (job->body_type == LOD_BODY_MOON) {
-                    h_e = moon_surface_radius(&job->moon_shape, dir_e) - job->moon_shape.base_radius;
-                    h_n = moon_surface_radius(&job->moon_shape, dir_n) - job->moon_shape.base_radius;
+                    h_e = moon_surface_radius(&job->moon_shape, dir_e) - moon_ellipsoid_radius(&job->moon_shape, dir_e);
+                    h_n = moon_surface_radius(&job->moon_shape, dir_n) - moon_ellipsoid_radius(&job->moon_shape, dir_n);
                 } else {
                     h_e = ht_sample_height_m(&continental, &mountain, &warp, &detail, dir_e);
                     h_n = ht_sample_height_m(&continental, &mountain, &warp, &detail, dir_n);
@@ -1934,12 +1941,16 @@ static void generate_chunk_mesh(HexMeshJob* job) {
                     ));
             }
 
+            // Per-column base radius for voxel layer placement
+            float col_base_r = (job->body_type == LOD_BODY_MOON)
+                ? job->col_ellip_r[col][row] : job->planet_radius;
+
             for (int l = min_s; l <= max_s; l++) {
                 uint8_t vtype = HEX_VOXEL(job->voxels, col, row, l);
                 if (is_transparent(vtype)) continue;
 
                 int world_layer = l + job->base_layer;
-                float bot_r = job->planet_radius + world_layer * HEX_HEIGHT + HEX_SURFACE_BIAS;
+                float bot_r = col_base_r + world_layer * HEX_HEIGHT + HEX_SURFACE_BIAS;
                 float top_r = bot_r + HEX_HEIGHT;
 
                 // --- TOP FACE: emit if layer above is transparent ---
@@ -2070,12 +2081,15 @@ static void generate_chunk_mesh(HexMeshJob* job) {
                                  vec3_scale(job->tangent_north, vz))));
             }
 
+            float wire_base_r = (job->body_type == LOD_BODY_MOON)
+                ? job->col_ellip_r[col][row] : job->planet_radius;
+
             for (int l = min_s; l <= max_s; l++) {
                 uint8_t vtype = HEX_VOXEL(job->voxels, col, row, l);
                 if (is_transparent(vtype)) continue;
 
                 int world_layer = l + job->base_layer;
-                float bot_r = job->planet_radius + world_layer * HEX_HEIGHT + HEX_SURFACE_BIAS;
+                float bot_r = wire_base_r + world_layer * HEX_HEIGHT + HEX_SURFACE_BIAS;
                 float top_r = bot_r + HEX_HEIGHT;
 
                 // Top face outline: hexagon at top_r
@@ -2568,6 +2582,7 @@ void hex_terrain_update(HexTerrain* ht, HMM_Vec3 camera_pos,
             chunk->base_layer = job->base_layer;
             memcpy(chunk->col_min_solid, job->col_min_solid, sizeof(chunk->col_min_solid));
             memcpy(chunk->col_max_solid, job->col_max_solid, sizeof(chunk->col_max_solid));
+            memcpy(chunk->col_ellip_r, job->col_ellip_r, sizeof(chunk->col_ellip_r));
             chunk->torch_scanned = false;  // Re-scan for torch instances
         }
 
@@ -2717,6 +2732,7 @@ void hex_terrain_update(HexTerrain* ht, HMM_Vec3 camera_pos,
                         job->has_voxels = true;
                         memcpy(job->col_min_solid, chunk->col_min_solid, sizeof(job->col_min_solid));
                         memcpy(job->col_max_solid, chunk->col_max_solid, sizeof(job->col_max_solid));
+                        memcpy(job->col_ellip_r, chunk->col_ellip_r, sizeof(job->col_ellip_r));
                     } else {
                         job->voxels = (uint8_t*)malloc(voxel_size);
                         job->has_voxels = false;
@@ -2790,6 +2806,7 @@ void hex_terrain_update(HexTerrain* ht, HMM_Vec3 camera_pos,
                 job->has_voxels = true;
                 memcpy(job->col_min_solid, chunk->col_min_solid, sizeof(job->col_min_solid));
                 memcpy(job->col_max_solid, chunk->col_max_solid, sizeof(job->col_max_solid));
+                memcpy(job->col_ellip_r, chunk->col_ellip_r, sizeof(job->col_ellip_r));
             } else {
                 job->voxels = (uint8_t*)malloc(voxel_size);
                 job->has_voxels = false;
@@ -2984,8 +3001,10 @@ HexHitResult hex_terrain_raycast(const HexTerrain* ht, HMM_Vec3 ray_origin,
         int gcol, grow;
         pixel_to_hex(lx, lz, &gcol, &grow);
 
-        // Compute layer from radius
-        float altitude = point_r - ht->planet_radius;
+        // Compute layer from radius (using per-column ellipsoid radius for moons)
+        float col_r = hex_terrain_col_base_r(ht, gcol, grow);
+        if (col_r < 1.0f) col_r = ht->planet_radius;
+        float altitude = point_r - col_r;
         int world_layer = (int)floorf(altitude / HEX_HEIGHT);
 
         // Skip if same voxel
@@ -3248,8 +3267,10 @@ bool hex_terrain_build_highlight(const HexTerrain* ht, const HexHitResult* hit,
     // Slightly oversized radius so outline wraps around the block
     float overshoot = HEX_RADIUS * 1.04f;
     float margin = 0.05f;  // radial outset so lines sit just outside block faces
-    float bot_r = ht->planet_radius + (float)hit->layer * HEX_HEIGHT + HEX_SURFACE_BIAS - margin;
-    float top_r = ht->planet_radius + (float)(hit->layer + 1) * HEX_HEIGHT + HEX_SURFACE_BIAS + margin;
+    float col_r = hex_terrain_col_base_r(ht, hit->gcol, hit->grow);
+    if (col_r < 1.0f) col_r = ht->planet_radius;
+    float bot_r = col_r + (float)hit->layer * HEX_HEIGHT + HEX_SURFACE_BIAS - margin;
+    float top_r = col_r + (float)(hit->layer + 1) * HEX_HEIGHT + HEX_SURFACE_BIAS + margin;
 
     // Compute 6 vertex directions (oversized hex)
     HMM_Vec3 dirs[6];
@@ -3307,7 +3328,9 @@ int hex_terrain_build_placement_face(const HexTerrain* ht, const HexHitResult* h
     hex_local_pos(hit->gcol, hit->grow, &lx, &lz);
 
     // Use the same offset as the white wireframe (slightly oversized to avoid z-fighting)
-    float bot_r = ht->planet_radius + (float)hit->layer * HEX_HEIGHT + HEX_SURFACE_BIAS;
+    float col_r = hex_terrain_col_base_r(ht, hit->gcol, hit->grow);
+    if (col_r < 1.0f) col_r = ht->planet_radius;
+    float bot_r = col_r + (float)hit->layer * HEX_HEIGHT + HEX_SURFACE_BIAS;
     float top_r = bot_r + HEX_HEIGHT;
 
     // Inset factor: shrink vertices toward face center (0.85 = 15% inset)
@@ -3435,6 +3458,27 @@ uint8_t hex_terrain_get_voxel(const HexTerrain* ht, int gcol, int grow, int worl
     return HEX_VOXEL(chunk->voxels, local_col, local_row, local_layer);
 }
 
+// Helper: get the per-column base radius from a chunk.
+static float chunk_col_base_r(const HexTerrain* ht, const HexChunk* chunk,
+                                int local_col, int local_row) {
+    if (ht->body_type == LOD_BODY_MOON)
+        return chunk->col_ellip_r[local_col][local_row];
+    return ht->planet_radius;
+}
+
+float hex_terrain_col_base_r(const HexTerrain* ht, int gcol, int grow) {
+    int cx = (int)floorf((float)gcol / HEX_CHUNK_SIZE);
+    int cz = (int)floorf((float)grow / HEX_CHUNK_SIZE);
+    int local_col = gcol - cx * HEX_CHUNK_SIZE;
+    int local_row = grow - cz * HEX_CHUNK_SIZE;
+    if (local_col < 0) { local_col += HEX_CHUNK_SIZE; cx--; }
+    if (local_row < 0) { local_row += HEX_CHUNK_SIZE; cz--; }
+
+    int idx = find_chunk_const(ht, cx, cz);
+    if (idx < 0) return 0.0f;
+    return chunk_col_base_r(ht, &ht->chunks[idx], local_col, local_row);
+}
+
 float hex_terrain_ground_height(const HexTerrain* ht, int gcol, int grow) {
     int cx = (int)floorf((float)gcol / HEX_CHUNK_SIZE);
     int cz = (int)floorf((float)grow / HEX_CHUNK_SIZE);
@@ -3449,9 +3493,11 @@ float hex_terrain_ground_height(const HexTerrain* ht, int gcol, int grow) {
     const HexChunk* chunk = &ht->chunks[idx];
     if (!chunk->voxels) return 0.0f;
 
+    float base_r = chunk_col_base_r(ht, chunk, local_col, local_row);
+
     // Scan from max_solid downward to find topmost solid with air above
     int max_s = chunk->col_max_solid[local_col][local_row];
-    if (max_s < 0) return ht->planet_radius + chunk->base_layer * HEX_HEIGHT;
+    if (max_s < 0) return base_r + chunk->base_layer * HEX_HEIGHT;
 
     for (int l = max_s; l >= 0; l--) {
         if (!is_transparent(HEX_VOXEL(chunk->voxels, local_col, local_row, l))) {
@@ -3460,12 +3506,12 @@ float hex_terrain_ground_height(const HexTerrain* ht, int gcol, int grow) {
                 : VOXEL_AIR;
             if (is_transparent(above)) {
                 int world_layer = l + chunk->base_layer;
-                return ht->planet_radius + (world_layer + 1) * HEX_HEIGHT;
+                return base_r + (world_layer + 1) * HEX_HEIGHT;
             }
         }
     }
 
-    return ht->planet_radius + chunk->base_layer * HEX_HEIGHT;
+    return base_r + chunk->base_layer * HEX_HEIGHT;
 }
 
 float hex_terrain_ground_height_below(const HexTerrain* ht, int gcol, int grow,
@@ -3483,10 +3529,12 @@ float hex_terrain_ground_height_below(const HexTerrain* ht, int gcol, int grow,
     const HexChunk* chunk = &ht->chunks[idx];
     if (!chunk->voxels) return 0.0f;
 
+    float base_r = chunk_col_base_r(ht, chunk, local_col, local_row);
+
     // Convert max_world_layer to local layer, clamp to chunk range
     int start_local = max_world_layer - chunk->base_layer;
     if (start_local >= HEX_CHUNK_LAYERS) start_local = HEX_CHUNK_LAYERS - 1;
-    if (start_local < 0) return ht->planet_radius + chunk->base_layer * HEX_HEIGHT;
+    if (start_local < 0) return base_r + chunk->base_layer * HEX_HEIGHT;
 
     // Scan downward from start_local to find topmost solid with transparent above
     for (int l = start_local; l >= 0; l--) {
@@ -3496,12 +3544,12 @@ float hex_terrain_ground_height_below(const HexTerrain* ht, int gcol, int grow,
                 : VOXEL_AIR;
             if (is_transparent(above)) {
                 int world_layer = l + chunk->base_layer;
-                return ht->planet_radius + (world_layer + 1) * HEX_HEIGHT;
+                return base_r + (world_layer + 1) * HEX_HEIGHT;
             }
         }
     }
 
-    return ht->planet_radius + chunk->base_layer * HEX_HEIGHT;
+    return base_r + chunk->base_layer * HEX_HEIGHT;
 }
 
 bool hex_terrain_has_headroom(const HexTerrain* ht, int gcol, int grow,
@@ -3521,7 +3569,9 @@ void hex_terrain_world_to_hex(const HexTerrain* ht, HMM_Vec3 world_pos,
     pixel_to_hex(lx, lz, out_gcol, out_grow);
 
     float point_r = sqrtf(vec3_dot(world_pos, world_pos));
-    float altitude = point_r - ht->planet_radius;
+    float col_r = hex_terrain_col_base_r(ht, *out_gcol, *out_grow);
+    if (col_r < 1.0f) col_r = ht->planet_radius;
+    float altitude = point_r - col_r;
     *out_layer = (int)floorf(altitude / HEX_HEIGHT);
 }
 
@@ -3535,7 +3585,9 @@ void hex_terrain_hex_to_world(const HexTerrain* ht, int gcol, int grow, int laye
     }
     float lx, lz;
     hex_local_pos(gcol, grow, &lx, &lz);
-    float radius = ht->planet_radius + layer * HEX_HEIGHT + HEX_SURFACE_BIAS;
+    float col_r = hex_terrain_col_base_r(ht, gcol, grow);
+    if (col_r < 1.0f) col_r = ht->planet_radius;
+    float radius = col_r + layer * HEX_HEIGHT + HEX_SURFACE_BIAS;
     HMM_Vec3 pos = tangent_to_world(ht, lx, lz, radius);
     *out_x = pos.X;
     *out_y = pos.Y;

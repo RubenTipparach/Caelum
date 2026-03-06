@@ -106,15 +106,42 @@ static void ico_subdivide(IcoMesh* mesh) {
 }
 
 /* ---- Moon surface radius at a unit direction ---- */
+float moon_ellipsoid_radius(const MoonShapeParams* shape, HMM_Vec3 unit_dir) {
+    if (shape->shape_type == MOON_SHAPE_CAPSULE) {
+        /* Capsule: cylinder + two hemispherical endcaps */
+        float half_h = shape->capsule_half_h;
+        float cap_r  = shape->capsule_cap_r;
+        float da = fabsf(unit_dir.X * shape->capsule_axis[0] +
+                         unit_dir.Y * shape->capsule_axis[1] +
+                         unit_dir.Z * shape->capsule_axis[2]);
+        float threshold = half_h / sqrtf(cap_r * cap_r + half_h * half_h);
+
+        if (da <= threshold) {
+            /* Cylinder region */
+            float sin2 = 1.0f - da * da;
+            if (sin2 < 1e-8f) sin2 = 1e-8f;
+            return cap_r / sqrtf(sin2);
+        } else {
+            /* Cap region */
+            float under = cap_r * cap_r - half_h * half_h * (1.0f - da * da);
+            if (under < 0.0f) under = 0.0f;
+            return half_h * da + sqrtf(under);
+        }
+    } else {
+        /* Ellipsoid */
+        HMM_Vec3 scaled = {{
+            unit_dir.X * shape->ellipsoid_scale[0],
+            unit_dir.Y * shape->ellipsoid_scale[1],
+            unit_dir.Z * shape->ellipsoid_scale[2]
+        }};
+        float scale_len = HMM_LenV3(scaled);
+        if (scale_len < 1e-6f) scale_len = 1.0f;
+        return shape->base_radius / scale_len;
+    }
+}
+
 float moon_surface_radius(const MoonShapeParams* shape, HMM_Vec3 unit_dir) {
-    /* Apply ellipsoid scaling */
-    HMM_Vec3 scaled = {{
-        unit_dir.X * shape->ellipsoid_scale[0],
-        unit_dir.Y * shape->ellipsoid_scale[1],
-        unit_dir.Z * shape->ellipsoid_scale[2]
-    }};
-    float scale_len = HMM_LenV3(scaled);
-    if (scale_len < 1e-6f) scale_len = 1.0f;
+    float base_r = moon_ellipsoid_radius(shape, unit_dir);
 
     /* Noise displacement */
     fnl_state noise = fnlCreateState();
@@ -129,9 +156,7 @@ float moon_surface_radius(const MoonShapeParams* shape, HMM_Vec3 unit_dir) {
         unit_dir.Y * 100.0f,
         unit_dir.Z * 100.0f);
 
-    /* Result: base radius * ellipsoid distortion * (1 + noise) */
-    float ellipsoid_r = shape->base_radius / scale_len;
-    return ellipsoid_r * (1.0f + n * shape->noise_amplitude);
+    return base_r * (1.0f + n * shape->noise_amplitude);
 }
 
 /* ---- Generate icosphere mesh for a moon ---- */
@@ -412,117 +437,74 @@ static void kepler_position(const OrbitParams* orbit, double t, double out_pos[3
     out_pos[2] = Py * x_orb + Qy * y_orb;
 }
 
+/* ---- Precompute capsule params from ellipsoid scale ---- */
+static void precompute_capsule(MoonShapeParams* shape) {
+    const float* s = shape->ellipsoid_scale;
+    /* Find longest axis */
+    int axis_idx = 0;
+    float max_s = s[0];
+    if (s[1] > max_s) { max_s = s[1]; axis_idx = 1; }
+    if (s[2] > max_s) { max_s = s[2]; axis_idx = 2; }
+
+    /* Average of two shorter scales */
+    float other1 = s[(axis_idx + 1) % 3];
+    float other2 = s[(axis_idx + 2) % 3];
+    float avg_short = (other1 + other2) * 0.5f;
+
+    shape->capsule_cap_r  = shape->base_radius * avg_short;
+    float total_extent    = shape->base_radius * max_s;
+    shape->capsule_half_h = total_extent - shape->capsule_cap_r;
+    if (shape->capsule_half_h < 0.0f) shape->capsule_half_h = 0.0f;
+
+    /* Unit vector along capsule axis */
+    shape->capsule_axis[0] = (axis_idx == 0) ? 1.0f : 0.0f;
+    shape->capsule_axis[1] = (axis_idx == 1) ? 1.0f : 0.0f;
+    shape->capsule_axis[2] = (axis_idx == 2) ? 1.0f : 0.0f;
+}
+
 /* ---- Solar system initialization ---- */
-void solar_system_init(SolarSystem* ss) {
+void solar_system_init(SolarSystem* ss, const SolarSystemConfig* cfg) {
     memset(ss, 0, sizeof(SolarSystem));
     ss->gravity_body = -1;
     ss->pinned_body = -1;
+    ss->moon_count = cfg->moon_count;
 
-    /* Define 10 moons: 5 large (5-10km), 5 small (1-5km) */
-    typedef struct {
-        const char* name;
-        float semi_major;   /* orbital distance from Tenebris (m) */
-        float period;       /* orbital period (seconds) */
-        float incl_deg;     /* orbital inclination (degrees) */
-        float lon_asc_deg;  /* longitude of ascending node (degrees) */
-        float ecc;          /* eccentricity */
-        float base_r;       /* base radius (m) */
-        float ell[3];       /* ellipsoid scale */
-        int seed;
-        float noise_freq;
-        float noise_amp;
-        int noise_oct;
-        HMM_Vec3 base_col, hi_col, shadow_col;
-    } MoonDef;
-
-    /*
-     * Orbital periods: Kepler's 3rd law scaling (T ~ a^1.5).
-     * Innermost moon (2Mm) = 1 hour (3600s), scale outward from there.
-     * Reference: a0 = 2,000,000m, T0 = 3600s.
-     * T = T0 * (a/a0)^1.5
-     */
-    /*
-     * All moons are grey rocky bodies — cool blue-gray tones to match moon.png texture.
-     * Colors: base=mid blue-gray, highlight=light blue-gray (peaks), shadow=dark blue-gray (crevices).
-     */
-    MoonDef defs[MAX_MOONS] = {
-        /* --- 2 giant moons (50-100km radius) --- */
-        /* noise_amp = 0.01 for all moons (1% of radius, matching Tenebris 8km/800km ratio) */
-        { "Gorrath",  5000000.0f, 14230.0f,  5.0f,   0.0f, 0.02f,
-          80000.0f, {1.0f, 0.9f, 1.05f}, 100, 0.3f, 0.01f, 4,
-          {{0.38f, 0.38f, 0.42f}}, {{0.52f, 0.52f, 0.57f}}, {{0.18f, 0.18f, 0.22f}} },
-
-        { "Atheron", 10000000.0f, 40250.0f, 10.0f,  90.0f, 0.03f,
-          55000.0f, {1.05f, 0.95f, 1.0f}, 150, 0.4f, 0.01f, 4,
-          {{0.40f, 0.40f, 0.44f}}, {{0.55f, 0.55f, 0.60f}}, {{0.20f, 0.20f, 0.24f}} },
-
-        /* --- 3 large moons (5-10km radius) --- */
-        { "Kelthos",  3000000.0f, 6600.0f, 12.0f,  45.0f, 0.04f,
-          7000.0f, {0.95f, 1.10f, 1.0f}, 300, 0.5f, 0.01f, 4,
-          {{0.36f, 0.37f, 0.40f}}, {{0.50f, 0.51f, 0.55f}}, {{0.17f, 0.17f, 0.20f}} },
-
-        { "Dravok",   6500000.0f, 21100.0f, 18.0f, 200.0f, 0.06f,
-          6000.0f, {1.20f, 0.80f, 0.95f}, 400, 0.6f, 0.01f, 3,
-          {{0.34f, 0.34f, 0.38f}}, {{0.48f, 0.48f, 0.53f}}, {{0.16f, 0.16f, 0.19f}} },
-
-        { "Serath",   8500000.0f, 31560.0f,  8.0f, 300.0f, 0.03f,
-          5000.0f, {1.0f, 1.0f, 1.15f}, 500, 0.4f, 0.01f, 3,
-          {{0.42f, 0.42f, 0.46f}}, {{0.57f, 0.57f, 0.62f}}, {{0.22f, 0.22f, 0.25f}} },
-
-        /* --- 5 small moons (1-5km radius) --- */
-        { "Cryx",     2000000.0f, 3600.0f, 25.0f,  60.0f, 0.08f,
-          3000.0f, {1.3f, 0.7f, 1.0f}, 600, 0.5f, 0.01f, 2,
-          {{0.32f, 0.32f, 0.36f}}, {{0.46f, 0.46f, 0.51f}}, {{0.15f, 0.15f, 0.18f}} },
-
-        { "Nyctra",   4500000.0f, 12150.0f, 30.0f, 150.0f, 0.05f,
-          2000.0f, {0.8f, 1.2f, 1.1f}, 700, 0.6f, 0.01f, 2,
-          {{0.37f, 0.38f, 0.42f}}, {{0.52f, 0.53f, 0.58f}}, {{0.18f, 0.18f, 0.22f}} },
-
-        { "Thalwen",  7500000.0f, 26200.0f, 15.0f, 270.0f, 0.07f,
-          4000.0f, {1.1f, 0.9f, 1.2f}, 800, 0.5f, 0.01f, 3,
-          {{0.35f, 0.35f, 0.40f}}, {{0.50f, 0.50f, 0.56f}}, {{0.17f, 0.17f, 0.21f}} },
-
-        { "Vexis",   11000000.0f, 46440.0f, 40.0f,  90.0f, 0.09f,
-          1500.0f, {1.4f, 0.6f, 1.0f}, 900, 0.7f, 0.01f, 2,
-          {{0.33f, 0.33f, 0.38f}}, {{0.47f, 0.47f, 0.53f}}, {{0.15f, 0.15f, 0.19f}} },
-
-        { "Zephyros", 13000000.0f, 59720.0f, 10.0f, 330.0f, 0.02f,
-          1000.0f, {1.0f, 1.3f, 0.8f}, 1000, 0.7f, 0.01f, 2,
-          {{0.39f, 0.40f, 0.44f}}, {{0.54f, 0.55f, 0.60f}}, {{0.19f, 0.20f, 0.23f}} },
-    };
-
-    ss->moon_count = MAX_MOONS;
-
-    for (int i = 0; i < MAX_MOONS; i++) {
+    for (int i = 0; i < cfg->moon_count; i++) {
         CelestialBody* m = &ss->moons[i];
-        MoonDef* d = &defs[i];
+        const MoonConfig* d = &cfg->moons[i];
         memset(m, 0, sizeof(CelestialBody));
 
-        /* Copy name */
         snprintf(m->name, sizeof(m->name), "%s", d->name);
 
-        m->shape.base_radius = d->base_r;
-        m->shape.ellipsoid_scale[0] = d->ell[0];
-        m->shape.ellipsoid_scale[1] = d->ell[1];
-        m->shape.ellipsoid_scale[2] = d->ell[2];
-        m->shape.noise_seed = d->seed;
-        m->shape.noise_frequency = d->noise_freq;
-        m->shape.noise_amplitude = d->noise_amp;
-        m->shape.noise_octaves = d->noise_oct;
+        m->shape.shape_type = d->shape_type;
+        m->shape.base_radius = d->base_radius;
+        m->shape.ellipsoid_scale[0] = d->ellipsoid_scale[0];
+        m->shape.ellipsoid_scale[1] = d->ellipsoid_scale[1];
+        m->shape.ellipsoid_scale[2] = d->ellipsoid_scale[2];
+        m->shape.noise_seed = d->noise_seed;
+        m->shape.noise_frequency = d->noise_frequency;
+        m->shape.noise_amplitude = d->noise_amplitude;
+        m->shape.noise_octaves = d->noise_octaves;
 
-        m->palette.base_color = d->base_col;
-        m->palette.highlight_color = d->hi_col;
-        m->palette.shadow_color = d->shadow_col;
+        /* Precompute capsule geometry if needed */
+        if (d->shape_type == MOON_SHAPE_CAPSULE) {
+            precompute_capsule(&m->shape);
+        }
 
-        m->orbit.semi_major_axis = d->semi_major;
-        m->orbit.eccentricity = d->ecc;
-        m->orbit.inclination = d->incl_deg * (float)(M_PI / 180.0);
-        m->orbit.longitude_ascending = d->lon_asc_deg * (float)(M_PI / 180.0);
-        m->orbit.argument_periapsis = (float)(i * 36.0 * M_PI / 180.0);  /* Spread evenly */
-        m->orbit.mean_anomaly_epoch = (float)(i * 0.628);  /* Spread initial positions */
+        m->palette.base_color = d->base_color;
+        m->palette.highlight_color = d->highlight_color;
+        m->palette.shadow_color = d->shadow_color;
+
+        m->orbit.semi_major_axis = d->semi_major_axis;
+        m->orbit.eccentricity = d->eccentricity;
+        m->orbit.inclination = d->inclination_deg * (float)(M_PI / 180.0);
+        m->orbit.longitude_ascending = d->lon_ascending_deg * (float)(M_PI / 180.0);
+        m->orbit.argument_periapsis = (float)(i * 36.0 * M_PI / 180.0);
+        m->orbit.mean_anomaly_epoch = (float)(i * 0.628);
         m->orbit.period = d->period;
 
-        m->radius = d->base_r;  /* Will be updated after mesh gen */
+        m->radius = d->base_radius;
+        m->surface_gravity = d->surface_gravity;
 
         /* Initial position */
         kepler_position(&m->orbit, 0.0, m->pos_d);
@@ -534,8 +516,10 @@ void solar_system_init(SolarSystem* ss) {
         /* Generate mesh */
         moon_generate_mesh(m);
 
-        printf("[CELESTIAL] Moon '%s': orbit=%.0fkm radius=%.0fm\n",
-               m->name, d->semi_major / 1000.0f, m->radius);
+        printf("[CELESTIAL] Moon '%s' (%s): orbit=%.0fkm radius=%.0fm\n",
+               m->name,
+               d->shape_type == MOON_SHAPE_CAPSULE ? "capsule" : "ellipsoid",
+               d->semi_major_axis / 1000.0f, m->radius);
     }
 
     /* Create sgl pipeline for depth-tested orbit lines */

@@ -997,7 +997,12 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
         double bdy = cam->pos_d[1] - r->lod_tree.body_center_d[1];
         double bdz = cam->pos_d[2] - r->lod_tree.body_center_d[2];
         float cam_r = (float)sqrt(bdx*bdx + bdy*bdy + bdz*bdz);
-        float altitude = cam_r - r->lod_tree.planet_radius;
+        float surface_r = r->lod_tree.planet_radius;
+        if (r->lod_tree.body_type == LOD_BODY_MOON && cam_r > 1.0f) {
+            HMM_Vec3 cam_dir = {{ (float)(bdx/cam_r), (float)(bdy/cam_r), (float)(bdz/cam_r) }};
+            surface_r = moon_surface_radius(&r->lod_tree.moon_shape, cam_dir);
+        }
+        float altitude = cam_r - surface_r;
         float body_r_km = r->lod_tree.planet_radius / 1000.0f;
         sdtx_color3f(0.6f, 0.8f, 1.0f);
         sdtx_printf("alt: %.0fm  R: %.0fkm\n", altitude, body_r_km);

@@ -32,6 +32,7 @@
 #include "world.h"
 #include "lobby.h"
 #include "touch_controls.h"
+#include "solar_config.h"
 
 typedef enum {
     STATE_MENU,
@@ -95,6 +96,9 @@ static struct {
 
     // Lobby
     LobbyRequest lobby_req;
+
+    // Solar system config (centralized, used at init and SOI transitions)
+    SolarSystemConfig solar_cfg;
 
     // Save restore state
     bool restore_moon_local;    // Skip world→moon transform on next SOI transition (loading from save)
@@ -903,11 +907,14 @@ static void frame(void) {
             render_init(&app.renderer, &app.planet, &app.camera, app.active_edits_dir);
             printf("[GAME] PHASE 2: render_init done\n"); fflush(stdout);
 
-            // Initialize solar system (moons + Tenebris fallback mesh)
-            solar_system_init(&app.renderer.solar_system);
+            // Initialize solar system from config (moons + Tenebris fallback mesh)
+            app.solar_cfg = solar_system_default_config();
+            solar_system_init(&app.renderer.solar_system, &app.solar_cfg);
+            app.camera.tenebris_gravity = app.solar_cfg.tenebris.surface_gravity;
             {
                 float surface_r = app.planet.radius + app.planet.sea_level * app.planet.layer_thickness;
-                solar_system_generate_planet_mesh(&app.renderer.solar_system, surface_r, 42);
+                solar_system_generate_planet_mesh(&app.renderer.solar_system, surface_r,
+                    app.solar_cfg.tenebris.noise_seed);
             }
             printf("[GAME] Solar system initialized: %d moons\n",
                    app.renderer.solar_system.moon_count);
@@ -1063,9 +1070,9 @@ static void frame(void) {
                 double center[3] = {0, 0, 0};
                 lod_tree_retarget(&app.renderer.lod_tree, LOD_BODY_PLANET,
                     center, app.planet.radius, app.planet.layer_thickness,
-                    app.planet.sea_level, 42, NULL, NULL);
+                    app.planet.sea_level, app.solar_cfg.tenebris.noise_seed, NULL, NULL);
                 hex_terrain_retarget(&app.renderer.hex_terrain, LOD_BODY_PLANET,
-                    app.planet.radius, 42, NULL, NULL);
+                    app.planet.radius, app.solar_cfg.tenebris.noise_seed, NULL, NULL);
                 ss->pinned_body = -1;
             } else {
                 // Entering moon SOI — transform camera to moon-local coords
