@@ -107,6 +107,10 @@ int solar_system_find_gravity_body(const SolarSystem* ss,
 /* Get smooth ellipsoid radius at a given direction (no noise) */
 float moon_ellipsoid_radius(const MoonShapeParams* shape, HMM_Vec3 unit_dir);
 
+/* Get outward surface normal of the ellipsoid at a given direction.
+   For spherical moons (all scales ~1.0), this equals the radial direction. */
+HMM_Vec3 moon_ellipsoid_normal(const MoonShapeParams* shape, HMM_Vec3 unit_dir);
+
 /* Get surface radius at a given direction on a moon (ellipsoid + noise) */
 float moon_surface_radius(const MoonShapeParams* shape, HMM_Vec3 unit_dir);
 

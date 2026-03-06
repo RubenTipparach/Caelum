@@ -52,7 +52,8 @@ typedef struct HexChunk {
     // Per-column optimization cache (local layer indices, -1 = all air)
     int16_t col_min_solid[HEX_CHUNK_SIZE][HEX_CHUNK_SIZE];
     int16_t col_max_solid[HEX_CHUNK_SIZE][HEX_CHUNK_SIZE];
-    float   col_ellip_r[HEX_CHUNK_SIZE][HEX_CHUNK_SIZE];  // per-column ellipsoid radius (moons)
+    float   ground_r;  // reference radius at tangent center (used for planet path)
+    float   col_ellip_r[HEX_CHUNK_SIZE][HEX_CHUNK_SIZE];  // per-column ellipsoid radius (moons only)
 
     // GPU mesh
     sg_buffer gpu_buffer;
@@ -98,9 +99,10 @@ typedef struct HexTerrain {
 
     // Tangent frame (computed from camera ground-projected position)
     HMM_Vec3 tangent_origin;   // World position of grid origin on surface
-    HMM_Vec3 tangent_up;       // Local up (radial outward)
+    HMM_Vec3 tangent_up;       // Local up (ellipsoid surface normal for moons, radial for planet)
     HMM_Vec3 tangent_east;     // Tangent plane X axis
     HMM_Vec3 tangent_north;    // Tangent plane Z axis
+    float ground_r;            // Ellipsoid radius at tangent center (single reference for patch)
 
     // Stable frame: tangent frame is locked and only re-anchored when camera
     // drifts far from the frame origin. This prevents constant chunk regen.
@@ -216,8 +218,8 @@ void hex_terrain_sample_height(int seed, float planet_radius, HMM_Vec3 unit_pos,
 // Get voxel type at global hex coords + world layer. Returns VOXEL_AIR if out of range.
 uint8_t hex_terrain_get_voxel(const HexTerrain* ht, int gcol, int grow, int world_layer);
 
-// Get per-column base radius for layer↔radius conversion.
-// For moons: col_ellip_r (smooth ellipsoid radius).  For planet: planet_radius.
+// Get base radius for layer↔radius conversion at a hex column.
+// For moons: chunk ground_r (ellipsoid radius at tangent center).  For planet: planet_radius.
 // Returns 0 if chunk not loaded.
 float hex_terrain_col_base_r(const HexTerrain* ht, int gcol, int grow);
 

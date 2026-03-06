@@ -329,17 +329,25 @@ static void compute_tangent_frame(HexTerrain* ht, HMM_Vec3 camera_pos) {
     if (cam_r < 1.0f) cam_r = 1.0f;
     HMM_Vec3 cam_dir = vec3_scale(camera_pos, 1.0f / cam_r);
 
-    ht->tangent_up = cam_dir;
+    /* Use ellipsoid surface normal for moons (not radial direction).
+       This ensures the tangent plane is actually tangent to the ellipsoid surface. */
+    if (ht->body_type == LOD_BODY_MOON)
+        ht->tangent_up = moon_ellipsoid_normal(&ht->moon_shape, cam_dir);
+    else
+        ht->tangent_up = cam_dir;
+
     float ground_r = ht_ground_r(ht, cam_dir);
+    ht->ground_r = ground_r;
     ht->tangent_origin = vec3_scale(cam_dir, ground_r);
 
+    HMM_Vec3 up = ht->tangent_up;
     HMM_Vec3 world_y = (HMM_Vec3){{0.0f, 1.0f, 0.0f}};
-    if (fabsf(vec3_dot(cam_dir, world_y)) > 0.99f) {
+    if (fabsf(vec3_dot(up, world_y)) > 0.99f) {
         world_y = (HMM_Vec3){{1.0f, 0.0f, 0.0f}};
     }
 
-    ht->tangent_east = vec3_normalize(vec3_cross(world_y, cam_dir));
-    ht->tangent_north = vec3_normalize(vec3_cross(cam_dir, ht->tangent_east));
+    ht->tangent_east = vec3_normalize(vec3_cross(world_y, up));
+    ht->tangent_north = vec3_normalize(vec3_cross(up, ht->tangent_east));
 }
 
 // ---- Hex position computation ----
@@ -370,9 +378,10 @@ static void world_to_tangent(const HexTerrain* ht, HMM_Vec3 world_pos,
         *out_lz = 0.0f;
         return;
     }
-    // ground_r = |tangent_origin|
-    float ground_r = ht_ground_r(ht, ht->tangent_up);
-    float k = ground_r / cos_theta;
+    /* Perpendicular distance from origin to the tangent plane.
+       Works correctly whether tangent_up is radial (planet) or surface normal (moon). */
+    float plane_dist = vec3_dot(ht->tangent_origin, ht->tangent_up);
+    float k = plane_dist / cos_theta;
     *out_lx = k * vec3_dot(dir, ht->tangent_east);
     *out_lz = k * vec3_dot(dir, ht->tangent_north);
 }
@@ -444,6 +453,7 @@ typedef struct HexMeshJob {
     bool has_voxels;  // true = voxels already populated (remesh only, skip terrain gen)
     int16_t col_min_solid[HEX_CHUNK_SIZE][HEX_CHUNK_SIZE];
     int16_t col_max_solid[HEX_CHUNK_SIZE][HEX_CHUNK_SIZE];
+    float   ground_r;  // reference radius at tangent center
     float   col_ellip_r[HEX_CHUNK_SIZE][HEX_CHUNK_SIZE];  // per-column ellipsoid radius (moons)
 
     // Cached arch data (computed once per job)
@@ -1568,7 +1578,7 @@ static void generate_chunk_mesh(HexMeshJob* job) {
                 float effective_h;
                 int surface_layer;
                 VoxelType surface_type;
-                float col_ellip_r = 0.0f;  // per-column ellipsoid radius
+                float col_ellip_r = 0.0f;
                 if (job->body_type == LOD_BODY_MOON) {
                     float surface_r = moon_surface_radius(&job->moon_shape, unit);
                     col_ellip_r = moon_ellipsoid_radius(&job->moon_shape, unit);
@@ -1941,7 +1951,9 @@ static void generate_chunk_mesh(HexMeshJob* job) {
                     ));
             }
 
-            // Per-column base radius for voxel layer placement
+            // Base radius for voxel layer placement
+            // Moons: per-column ellipsoid radius (conforms to ellipsoid surface)
+            // Planet: constant planet_radius
             float col_base_r = (job->body_type == LOD_BODY_MOON)
                 ? job->col_ellip_r[col][row] : job->planet_radius;
 
@@ -2582,6 +2594,7 @@ void hex_terrain_update(HexTerrain* ht, HMM_Vec3 camera_pos,
             chunk->base_layer = job->base_layer;
             memcpy(chunk->col_min_solid, job->col_min_solid, sizeof(chunk->col_min_solid));
             memcpy(chunk->col_max_solid, job->col_max_solid, sizeof(chunk->col_max_solid));
+            chunk->ground_r = job->ground_r;
             memcpy(chunk->col_ellip_r, job->col_ellip_r, sizeof(chunk->col_ellip_r));
             chunk->torch_scanned = false;  // Re-scan for torch instances
         }
@@ -2716,6 +2729,7 @@ void hex_terrain_update(HexTerrain* ht, HMM_Vec3 camera_pos,
                     job->tangent_up = ht->tangent_up;
                     job->tangent_east = ht->tangent_east;
                     job->tangent_north = ht->tangent_north;
+                    job->ground_r = ht->ground_r;
                     job->origin[0] = (float)ht->world_origin[0];
                     job->origin[1] = (float)ht->world_origin[1];
                     job->origin[2] = (float)ht->world_origin[2];
@@ -2732,6 +2746,7 @@ void hex_terrain_update(HexTerrain* ht, HMM_Vec3 camera_pos,
                         job->has_voxels = true;
                         memcpy(job->col_min_solid, chunk->col_min_solid, sizeof(job->col_min_solid));
                         memcpy(job->col_max_solid, chunk->col_max_solid, sizeof(job->col_max_solid));
+                        job->ground_r = chunk->ground_r;
                         memcpy(job->col_ellip_r, chunk->col_ellip_r, sizeof(job->col_ellip_r));
                     } else {
                         job->voxels = (uint8_t*)malloc(voxel_size);
@@ -2792,6 +2807,7 @@ void hex_terrain_update(HexTerrain* ht, HMM_Vec3 camera_pos,
             job->tangent_up = ht->tangent_up;
             job->tangent_east = ht->tangent_east;
             job->tangent_north = ht->tangent_north;
+            job->ground_r = ht->ground_r;
             job->origin[0] = (float)ht->world_origin[0];
             job->origin[1] = (float)ht->world_origin[1];
             job->origin[2] = (float)ht->world_origin[2];
@@ -2806,6 +2822,7 @@ void hex_terrain_update(HexTerrain* ht, HMM_Vec3 camera_pos,
                 job->has_voxels = true;
                 memcpy(job->col_min_solid, chunk->col_min_solid, sizeof(job->col_min_solid));
                 memcpy(job->col_max_solid, chunk->col_max_solid, sizeof(job->col_max_solid));
+                job->ground_r = chunk->ground_r;
                 memcpy(job->col_ellip_r, chunk->col_ellip_r, sizeof(job->col_ellip_r));
             } else {
                 job->voxels = (uint8_t*)malloc(voxel_size);
@@ -3458,7 +3475,8 @@ uint8_t hex_terrain_get_voxel(const HexTerrain* ht, int gcol, int grow, int worl
     return HEX_VOXEL(chunk->voxels, local_col, local_row, local_layer);
 }
 
-// Helper: get the per-column base radius from a chunk.
+// Helper: get the base radius for a hex column.
+// Moons: per-column ellipsoid radius.  Planet: constant planet_radius.
 static float chunk_col_base_r(const HexTerrain* ht, const HexChunk* chunk,
                                 int local_col, int local_row) {
     if (ht->body_type == LOD_BODY_MOON)

@@ -140,6 +140,18 @@ float moon_ellipsoid_radius(const MoonShapeParams* shape, HMM_Vec3 unit_dir) {
     }
 }
 
+HMM_Vec3 moon_ellipsoid_normal(const MoonShapeParams* shape, HMM_Vec3 unit_dir) {
+    /* Ellipsoid implicit surface: (x*sx)^2 + (y*sy)^2 + (z*sz)^2 = R^2
+       Gradient (outward normal) proportional to (x*sx^2, y*sy^2, z*sz^2) */
+    float sx2 = shape->ellipsoid_scale[0] * shape->ellipsoid_scale[0];
+    float sy2 = shape->ellipsoid_scale[1] * shape->ellipsoid_scale[1];
+    float sz2 = shape->ellipsoid_scale[2] * shape->ellipsoid_scale[2];
+    HMM_Vec3 n = {{unit_dir.X * sx2, unit_dir.Y * sy2, unit_dir.Z * sz2}};
+    float len = HMM_LenV3(n);
+    if (len < 1e-6f) return unit_dir;  /* fallback to radial */
+    return (HMM_Vec3){{n.X / len, n.Y / len, n.Z / len}};
+}
+
 float moon_surface_radius(const MoonShapeParams* shape, HMM_Vec3 unit_dir) {
     float base_r = moon_ellipsoid_radius(shape, unit_dir);
 
