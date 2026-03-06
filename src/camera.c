@@ -20,7 +20,7 @@ extern void platform_macos_poll_events(void);
 #define WALK_SPEED      4.0f    // Meters per second on tangent plane
 #define SPRINT_SPEED    8.0f
 #define JUMP_FORCE      8.0f    // Initial upward velocity on jump (m/s)
-#define BASE_GRAVITY    20.0f   // Gravitational acceleration toward center (m/s^2)
+#define DEFAULT_GRAVITY 20.0f   // Fallback gravity if tenebris_gravity not set
 #define PLAYER_EYE_HEIGHT 1.6f  // Eye height above feet (meters)
 #define PLAYER_HEIGHT   1.8f    // Total player height (1.8m, fits in 2m caves)
 #define PLAYER_RADIUS   0.3f    // Horizontal collision radius (meters)
@@ -143,7 +143,7 @@ void camera_init(Camera* cam) {
 
     cam->velocity = (HMM_Vec3){{0, 0, 0}};
     cam->eye_height = PLAYER_EYE_HEIGHT;
-    cam->gravity = BASE_GRAVITY;
+    cam->gravity = DEFAULT_GRAVITY;
     cam->on_ground = false;
     cam->jetpack_active = false;
     cam->jetpack_speed_mult = 1.0f;
@@ -302,6 +302,13 @@ void camera_update(Camera* cam, Planet* planet, const LodTree* lod,
     // No orbital delta needed — when on a moon, cam->pos_d is already moon-local
     // and the moon doesn't move in its own reference frame.
 
+    // Set gravity based on current body
+    if (cam->gravity_body >= 0 && solar) {
+        cam->gravity = solar->moons[cam->gravity_body].surface_gravity;
+    } else {
+        cam->gravity = cam->tenebris_gravity > 0.0f ? cam->tenebris_gravity : DEFAULT_GRAVITY;
+    }
+
     // ---- Compute body-relative distance and local_up ----
     // body_dist: distance from gravity body center (for altitude, collision, ground snap)
     // pos_len:   distance from world origin (for space mode planet check)
@@ -312,11 +319,16 @@ void camera_update(Camera* cam, Planet* planet, const LodTree* lod,
     if (body_dist_d < 0.001) body_dist_d = 0.001;
     float body_dist = (float)body_dist_d;
 
-    cam->local_up = (HMM_Vec3){{
+    // Radial direction (sphere normal)
+    HMM_Vec3 radial_up = {{
         (float)(body_dx / body_dist_d),
         (float)(body_dy / body_dist_d),
         (float)(body_dz / body_dist_d)
     }};
+
+    // For all bodies (planet + moons): use radial up.
+    // This matches the hex grid tangent frame which also uses radial direction.
+    cam->local_up = radial_up;
 
     // pos_len: distance from Tenebris center (world-space, for planet altitude check)
     double pos_len_d = sqrt(world_pos_d[0]*world_pos_d[0] +
@@ -503,8 +515,9 @@ void camera_update(Camera* cam, Planet* planet, const LodTree* lod,
     float current_ground_r = body_dist;
     if (cam->gravity_body >= 0 && solar) {
         // On a moon: use the moon's shape model (NOT the Tenebris LOD tree)
+        // Use radial direction (not ellipsoid normal) for surface radius lookup
         current_ground_r = moon_surface_radius(
-            &solar->moons[cam->gravity_body].shape, cam->local_up);
+            &solar->moons[cam->gravity_body].shape, radial_up);
     } else if (lod) {
         current_ground_r = (float)lod_tree_terrain_height(lod, cam->position);
     } else if (planet) {
@@ -583,7 +596,9 @@ void camera_update(Camera* cam, Planet* planet, const LodTree* lod,
         int cur_gcol, cur_grow, cur_layer;
         hex_terrain_world_to_hex(hex, cam->position, &cur_gcol, &cur_grow, &cur_layer);
         // Double-precision altitude to avoid catastrophic cancellation at 800km
-        int cur_feet_layer = (int)floor((pos_len_d - (double)cam->eye_height - (double)hex->planet_radius) / (double)HEX_HEIGHT);
+        float cur_col_r = hex_terrain_col_base_r(hex, cur_gcol, cur_grow);
+        if (cur_col_r < 1.0f) cur_col_r = hex->planet_radius;
+        int cur_feet_layer = (int)floor((pos_len_d - (double)cam->eye_height - (double)cur_col_r) / (double)HEX_HEIGHT);
         int search_ceiling = cur_feet_layer + (int)ceilf(AUTO_STEP_HEIGHT / HEX_HEIGHT) + 1;
         float cur_ground_r = hex_terrain_ground_height_below(hex, cur_gcol, cur_grow, search_ceiling);
         if (cur_ground_r < 1.0f) cur_ground_r = hex_terrain_ground_height(hex, cur_gcol, cur_grow);
@@ -640,7 +655,9 @@ void camera_update(Camera* cam, Planet* planet, const LodTree* lod,
             }
 
             // Headroom check: PLAYER_HEIGHT layers of air above dest ground
-            int dest_ground_layer = (int)floorf((dest_ground_r - hex->planet_radius) / HEX_HEIGHT);
+            float dest_col_r = hex_terrain_col_base_r(hex, dest_gcol, dest_grow);
+            if (dest_col_r < 1.0f) dest_col_r = hex->planet_radius;
+            int dest_ground_layer = (int)floorf((dest_ground_r - dest_col_r) / HEX_HEIGHT);
             if (!hex_terrain_has_headroom(hex, dest_gcol, dest_grow,
                                           dest_ground_layer + 1, (int)ceilf(PLAYER_HEIGHT))) {
                 // Ceiling too low — BLOCKED
@@ -678,7 +695,9 @@ void camera_update(Camera* cam, Planet* planet, const LodTree* lod,
         double pr_snap = sqrt(cam->pos_d[0]*cam->pos_d[0] +
                               cam->pos_d[1]*cam->pos_d[1] +
                               cam->pos_d[2]*cam->pos_d[2]);
-        int snap_feet_layer = (int)floor((pr_snap - (double)cam->eye_height - (double)hex->planet_radius) / (double)HEX_HEIGHT);
+        float snap_col_r = hex_terrain_col_base_r(hex, cur_gcol, cur_grow);
+        if (snap_col_r < 1.0f) snap_col_r = hex->planet_radius;
+        int snap_feet_layer = (int)floor((pr_snap - (double)cam->eye_height - (double)snap_col_r) / (double)HEX_HEIGHT);
 
         // When on ground, allow step-up margin so walking auto-steps.
         // When airborne, search only at/below feet — don't find surfaces above the player.
@@ -953,7 +972,9 @@ void camera_update(Camera* cam, Planet* planet, const LodTree* lod,
         double pr_d = sqrt(cam->pos_d[0]*cam->pos_d[0] +
                            cam->pos_d[1]*cam->pos_d[1] +
                            cam->pos_d[2]*cam->pos_d[2]);
-        double feet_alt = pr_d - (double)cam->eye_height - (double)hex->planet_radius;
+        float vox_col_r = hex_terrain_col_base_r(hex, gcol, grow);
+        if (vox_col_r < 1.0f) vox_col_r = hex->planet_radius;
+        double feet_alt = pr_d - (double)cam->eye_height - (double)vox_col_r;
         int feet_layer = (int)floor(feet_alt / (double)HEX_HEIGHT);
         int head_layer = feet_layer + (int)ceil((double)PLAYER_HEIGHT / (double)HEX_HEIGHT);
 
@@ -975,7 +996,9 @@ void camera_update(Camera* cam, Planet* planet, const LodTree* lod,
             double old_pr_d = sqrt(old_pos_d[0]*old_pos_d[0] +
                                    old_pos_d[1]*old_pos_d[1] +
                                    old_pos_d[2]*old_pos_d[2]);
-            double old_feet_alt = old_pr_d - (double)cam->eye_height - (double)hex->planet_radius;
+            float old_col_r = hex_terrain_col_base_r(hex, old_gcol, old_grow);
+            if (old_col_r < 1.0f) old_col_r = hex->planet_radius;
+            double old_feet_alt = old_pr_d - (double)cam->eye_height - (double)old_col_r;
             int old_feet_layer = (int)floor(old_feet_alt / (double)HEX_HEIGHT);
             int old_head_layer = old_feet_layer + (int)ceil((double)PLAYER_HEIGHT / (double)HEX_HEIGHT);
 

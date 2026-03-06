@@ -52,6 +52,7 @@ typedef struct HexChunk {
     // Per-column optimization cache (local layer indices, -1 = all air)
     int16_t col_min_solid[HEX_CHUNK_SIZE][HEX_CHUNK_SIZE];
     int16_t col_max_solid[HEX_CHUNK_SIZE][HEX_CHUNK_SIZE];
+    float   col_ellip_r[HEX_CHUNK_SIZE][HEX_CHUNK_SIZE];  // per-column ellipsoid radius (moons)
 
     // GPU mesh
     sg_buffer gpu_buffer;
@@ -215,8 +216,13 @@ void hex_terrain_sample_height(int seed, float planet_radius, HMM_Vec3 unit_pos,
 // Get voxel type at global hex coords + world layer. Returns VOXEL_AIR if out of range.
 uint8_t hex_terrain_get_voxel(const HexTerrain* ht, int gcol, int grow, int world_layer);
 
+// Get per-column base radius for layer↔radius conversion.
+// For moons: col_ellip_r (smooth ellipsoid radius).  For planet: planet_radius.
+// Returns 0 if chunk not loaded.
+float hex_terrain_col_base_r(const HexTerrain* ht, int gcol, int grow);
+
 // Get ground height at a global hex column (world layer of topmost solid with air above).
-// Returns planet_radius + ground_layer * HEX_HEIGHT in meters.
+// Returns col_base_r + ground_layer * HEX_HEIGHT in meters.
 float hex_terrain_ground_height(const HexTerrain* ht, int gcol, int grow);
 
 // Arch/cave-aware ground height: find ground at or below max_world_layer.

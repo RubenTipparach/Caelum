@@ -1152,21 +1152,21 @@ static void generate_hex_mesh_for_moon(
     HMM_Vec3 hex_origin, HMM_Vec3 hex_east, HMM_Vec3 hex_north,
     HexVertex** out_vertices, int* out_count)
 {
-    (void)body_radius;  // Use base_radius for consistent height math
-    float base_r = moon_shape->base_radius;
+    (void)body_radius;
+    float center_r = moon_ellipsoid_radius(moon_shape, hex_origin);
 
     HMM_Vec3 center = hex_origin;
     HMM_Vec3 east = hex_east;
     HMM_Vec3 north = hex_north;
 
-    // Project triangle vertices to 2D tangent plane (using base_radius for consistency)
+    // Project triangle vertices to 2D tangent plane
     float tvx[3], tvz[3];
     HMM_Vec3 verts[3] = { tri->v0, tri->v1, tri->v2 };
     for (int i = 0; i < 3; i++) {
         float dot_vc = vec3_dot(verts[i], center);
         HMM_Vec3 offset = vec3_sub(verts[i], vec3_scale(center, dot_vc));
-        tvx[i] = vec3_dot(offset, east) * base_r;
-        tvz[i] = vec3_dot(offset, north) * base_r;
+        tvx[i] = vec3_dot(offset, east) * center_r;
+        tvz[i] = vec3_dot(offset, north) * center_r;
     }
 
     float margin = LOD_HEX_RADIUS * 1.5f;
@@ -1176,7 +1176,7 @@ static void generate_hex_mesh_for_moon(
     float max_z = fmaxf(tvz[0], fmaxf(tvz[1], tvz[2])) + margin;
 
     fnl_state cnoise = create_color_noise(seed);
-    HMM_Vec3 center_scaled = vec3_scale(center, base_r);
+    HMM_Vec3 center_scaled = vec3_scale(center, center_r);
 
     int col_min = (int)floorf(min_x / LOD_HEX_COL_SPACING);
     int col_max = (int)ceilf(max_x / LOD_HEX_COL_SPACING);
@@ -1212,7 +1212,8 @@ static void generate_hex_mesh_for_moon(
 
             // Moon terrain: ellipsoid + noise
             float surface_r = moon_surface_radius(moon_shape, cdir);
-            float h_m = surface_r - base_r;
+            float ellip_r = moon_ellipsoid_radius(moon_shape, cdir);
+            float h_m = surface_r - ellip_r;
             float eff = fmaxf(h_m, 0.0f);  // No sea level on moons
             int h = (int)ceilf(eff);
 
@@ -1221,7 +1222,7 @@ static void generate_hex_mesh_for_moon(
             hm_atlas[gi] = LOD_ATLAS_MOON;  // Moon surface = moon rock
 
             // Moon palette color based on height
-            float height_t = (surface_r - base_r * 0.9f) / (base_r * 0.2f);
+            float height_t = (surface_r - ellip_r * 0.9f) / (ellip_r * 0.2f);
             if (height_t < 0.0f) height_t = 0.0f;
             if (height_t > 1.0f) height_t = 1.0f;
             HMM_Vec3 vert_color = vec3_lerp(moon_palette->shadow_color,
@@ -1308,7 +1309,8 @@ static void generate_hex_mesh_for_moon(
                     vec3_add(vec3_scale(east, hx), vec3_scale(north, hz))));
             HMM_Vec3 local_up = cdir;
 
-            float cap_r = base_r + (float)h + LOD_HEX_SURFACE_BIAS;
+            float cell_ellip_r = moon_ellipsoid_radius(moon_shape, cdir);
+            float cap_r = cell_ellip_r + (float)h + LOD_HEX_SURFACE_BIAS;
 
             HMM_Vec3 hex_v[6];
             HMM_Vec3 hex_dirs[6];
@@ -1359,8 +1361,8 @@ static void generate_hex_mesh_for_moon(
                     wall_bottom = wall_top - LOD_HEX_MAX_WALL;
 
                 for (int layer = wall_bottom; layer < wall_top; layer++) {
-                    float bot_r = base_r + (float)layer + LOD_HEX_SURFACE_BIAS;
-                    float top_r = base_r + (float)(layer + 1) + LOD_HEX_SURFACE_BIAS;
+                    float bot_r = cell_ellip_r + (float)layer + LOD_HEX_SURFACE_BIAS;
+                    float top_r = cell_ellip_r + (float)(layer + 1) + LOD_HEX_SURFACE_BIAS;
 
                     HMM_Vec3 p0_bot = vec3_scale(hex_dirs[vi0], bot_r);
                     HMM_Vec3 p1_bot = vec3_scale(hex_dirs[vi1], bot_r);
@@ -1900,7 +1902,12 @@ static float patch_distance(const LodTree* tree, const LodNode* node) {
     float terrain_amp = (tree->body_type == LOD_BODY_MOON)
         ? tree->moon_shape.noise_amplitude * tree->moon_shape.base_radius
         : TERRAIN_AMPLITUDE_M;
-    float max_surface_r = tree->planet_radius + terrain_amp;
+    float max_surface_r;
+    if (tree->body_type == LOD_BODY_MOON && tree->moon_shape.shape_type == MOON_SHAPE_CAPSULE) {
+        max_surface_r = tree->moon_shape.capsule_half_h + tree->moon_shape.capsule_cap_r + terrain_amp;
+    } else {
+        max_surface_r = tree->planet_radius + terrain_amp;
+    }
     float altitude = cam_r - max_surface_r;
     if (altitude < 0.0f) altitude = 0.0f;
 
@@ -1926,7 +1933,12 @@ static float patch_center_distance(const LodTree* tree, const LodNode* node) {
     float terrain_amp = (tree->body_type == LOD_BODY_MOON)
         ? tree->moon_shape.noise_amplitude * tree->moon_shape.base_radius
         : TERRAIN_AMPLITUDE_M;
-    float max_surface_r = tree->planet_radius + terrain_amp;
+    float max_surface_r;
+    if (tree->body_type == LOD_BODY_MOON && tree->moon_shape.shape_type == MOON_SHAPE_CAPSULE) {
+        max_surface_r = tree->moon_shape.capsule_half_h + tree->moon_shape.capsule_cap_r + terrain_amp;
+    } else {
+        max_surface_r = tree->planet_radius + terrain_amp;
+    }
     float altitude = cam_r - max_surface_r;
     if (altitude < 0.0f) altitude = 0.0f;
 
@@ -2101,9 +2113,8 @@ void lod_tree_update(LodTree* tree, HMM_Vec3 camera_pos, HMM_Mat4 view_proj) {
     tree->splits_this_frame = 0;
 
     // Update shared hex tangent frame.
-    // All depth-13 patches use this single frame so their hex grids tile seamlessly.
-    // Re-anchor when camera drifts ~2km from current frame center (well beyond the
-    // ~1.3km depth-13 visible range, so old patches have naturally cycled out by then).
+    // All max-depth patches use this single frame so their hex grids tile seamlessly.
+    // Re-anchor when camera drifts ~2km surface distance from current frame center.
     {
         float cam_r = sqrtf(vec3_dot(camera_pos, camera_pos));
         if (cam_r < 1.0f) cam_r = 1.0f;
@@ -2112,8 +2123,12 @@ void lod_tree_update(LodTree* tree, HMM_Vec3 camera_pos, HMM_Mat4 view_proj) {
         bool need_reanchor = !tree->hex_frame_valid;
         if (!need_reanchor) {
             float d = vec3_dot(cam_dir, tree->hex_frame_origin);
-            // cos(angle) < 0.999997 ≈ 0.14° ≈ 2km at 800km radius
-            if (d < 0.999997f) need_reanchor = true;
+            // Scale threshold so ~2km surface distance triggers reanchor regardless of body radius
+            // cos(theta) ≈ 1 - theta²/2, theta = dist/R → cos ≈ 1 - dist²/(2R²)
+            float R = tree->planet_radius;
+            float reanchor_cos = 1.0f - (2000.0f * 2000.0f) / (2.0f * R * R);
+            if (reanchor_cos < 0.9f) reanchor_cos = 0.9f;  // safety clamp for tiny bodies
+            if (d < reanchor_cos) need_reanchor = true;
         }
         if (need_reanchor) {
             tree->hex_frame_origin = cam_dir;
