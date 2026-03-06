@@ -716,12 +716,13 @@ static void lod_emit_tri(LodVertex** verts, int* count, int* cap,
 // ---- Hex grid mesh generation for depth-13 LOD nodes ----
 
 // Texture atlas mapping (must match hex_terrain.c)
-#define LOD_HEX_ATLAS_TILES 9
+#define LOD_HEX_ATLAS_TILES 11
 #define LOD_ATLAS_WATER  0
 #define LOD_ATLAS_SAND   1
 #define LOD_ATLAS_GRASS  3
 #define LOD_ATLAS_STONE  4
 #define LOD_ATLAS_ICE    5
+#define LOD_ATLAS_MOON   10
 
 static int lod_hex_atlas(float height_m) {
     float rel = height_m - TERRAIN_SEA_LEVEL_M;
@@ -790,6 +791,7 @@ static int lod_side_atlas(int cap_atlas) {
 }
 
 static int lod_wall_atlas(int cap_atlas, float surface_h, float wall_y) {
+    if (cap_atlas == LOD_ATLAS_MOON) return LOD_ATLAS_MOON;
     float depth = surface_h - wall_y;
     if (depth < 1.0f) return lod_side_atlas(cap_atlas);
     if (depth < 3.0f) return LOD_ATLAS_DIRT;
@@ -1216,7 +1218,7 @@ static void generate_hex_mesh_for_moon(
 
             int gi = (col - col_min) * grid_rows + (row - row_min);
             hm_heights[gi] = (int16_t)h;
-            hm_atlas[gi] = LOD_ATLAS_STONE;  // Moon surface = stone
+            hm_atlas[gi] = LOD_ATLAS_MOON;  // Moon surface = moon rock
 
             // Moon palette color based on height
             float height_t = (surface_r - base_r * 0.9f) / (base_r * 0.2f);

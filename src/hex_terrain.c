@@ -228,6 +228,7 @@ static VoxelType ht_voxel_type(float height_m, int gcol, int grow, int seed) {
 
 // Voxel type at a specific layer depth below surface
 static VoxelType ht_voxel_type_at_depth(VoxelType surface_type, int depth_layers) {
+    if (surface_type == VOXEL_MOON_ROCK) return VOXEL_MOON_ROCK;
     if (depth_layers <= 0) return surface_type;
     if (depth_layers < 4) return VOXEL_DIRT;
     return VOXEL_STONE;
@@ -265,7 +266,7 @@ static HMM_Vec3 ht_terrain_color(float height_m) {
 }
 
 // ---- Texture atlas mapping ----
-#define HEX_ATLAS_TILES 10
+#define HEX_ATLAS_TILES 11
 #define ATLAS_WATER      0
 #define ATLAS_SAND       1
 #define ATLAS_DIRT       2
@@ -276,6 +277,7 @@ static HMM_Vec3 ht_terrain_color(float height_m) {
 #define ATLAS_DIRT_GRASS  7
 #define ATLAS_DIRT_SNOW   8
 #define ATLAS_TORCH      9
+#define ATLAS_MOON      10
 
 // Transparent voxels: don't emit hex geometry, don't occlude neighbor faces
 static inline bool is_transparent(uint8_t vtype) {
@@ -284,15 +286,16 @@ static inline bool is_transparent(uint8_t vtype) {
 
 static int voxel_top_atlas(VoxelType type) {
     switch (type) {
-        case VOXEL_WATER:   return ATLAS_WATER;
-        case VOXEL_SAND:    return ATLAS_SAND;
-        case VOXEL_DIRT:    return ATLAS_DIRT;
-        case VOXEL_GRASS:   return ATLAS_GRASS;
-        case VOXEL_STONE:   return ATLAS_STONE;
-        case VOXEL_ICE:     return ATLAS_ICE;
-        case VOXEL_BEDROCK: return ATLAS_STONE;
-        case VOXEL_TORCH:   return ATLAS_TORCH;
-        default:            return ATLAS_GRASS;
+        case VOXEL_WATER:     return ATLAS_WATER;
+        case VOXEL_SAND:      return ATLAS_SAND;
+        case VOXEL_DIRT:      return ATLAS_DIRT;
+        case VOXEL_GRASS:     return ATLAS_GRASS;
+        case VOXEL_STONE:     return ATLAS_STONE;
+        case VOXEL_ICE:       return ATLAS_ICE;
+        case VOXEL_BEDROCK:   return ATLAS_STONE;
+        case VOXEL_TORCH:     return ATLAS_TORCH;
+        case VOXEL_MOON_ROCK: return ATLAS_MOON;
+        default:              return ATLAS_GRASS;
     }
 }
 
@@ -313,13 +316,21 @@ static int voxel_bottom_atlas(VoxelType type) {
 
 // ---- Tangent frame computation ----
 
+// Ground radius for tangent frame placement.
+// Planet: planet_radius + sea_level_m.  Moon: planet_radius (no sea level).
+static float ht_ground_r(const HexTerrain* ht) {
+    if (ht->body_type == LOD_BODY_MOON)
+        return ht->planet_radius;
+    return ht->planet_radius + TERRAIN_SEA_LEVEL_M;
+}
+
 static void compute_tangent_frame(HexTerrain* ht, HMM_Vec3 camera_pos) {
     float cam_r = sqrtf(vec3_dot(camera_pos, camera_pos));
     if (cam_r < 1.0f) cam_r = 1.0f;
     HMM_Vec3 cam_dir = vec3_scale(camera_pos, 1.0f / cam_r);
 
     ht->tangent_up = cam_dir;
-    float ground_r = ht->planet_radius + TERRAIN_SEA_LEVEL_M;
+    float ground_r = ht_ground_r(ht);
     ht->tangent_origin = vec3_scale(cam_dir, ground_r);
 
     HMM_Vec3 world_y = (HMM_Vec3){{0.0f, 1.0f, 0.0f}};
@@ -359,8 +370,8 @@ static void world_to_tangent(const HexTerrain* ht, HMM_Vec3 world_pos,
         *out_lz = 0.0f;
         return;
     }
-    // ground_r = |tangent_origin| = planet_radius + sea_level
-    float ground_r = ht->planet_radius + TERRAIN_SEA_LEVEL_M;
+    // ground_r = |tangent_origin|
+    float ground_r = ht_ground_r(ht);
     float k = ground_r / cos_theta;
     *out_lx = k * vec3_dot(dir, ht->tangent_east);
     *out_lz = k * vec3_dot(dir, ht->tangent_north);
@@ -708,29 +719,41 @@ static uint8_t job_get_neighbor_voxel(const HexMeshJob* job,
         vec3_add(job->tangent_origin,
             vec3_add(vec3_scale(job->tangent_east, nlx),
                      vec3_scale(job->tangent_north, nlz))));
-    float nh_m = ht_sample_height_m(continental, mountain, warp, detail, ndir);
-    float nh_eff = fmaxf(nh_m, TERRAIN_SEA_LEVEL_M);
+
+    float nh_eff;
+    uint8_t solid_type;
+    if (job->body_type == LOD_BODY_MOON) {
+        float surface_r = moon_surface_radius(&job->moon_shape, ndir);
+        nh_eff = fmaxf(surface_r - job->moon_shape.base_radius, 0.0f);
+        solid_type = VOXEL_MOON_ROCK;
+    } else {
+        float nh_m = ht_sample_height_m(continental, mountain, warp, detail, ndir);
+        nh_eff = fmaxf(nh_m, TERRAIN_SEA_LEVEL_M);
+        solid_type = VOXEL_STONE;
+    }
     int surface_layer = (int)ceilf(nh_eff / HEX_HEIGHT);
 
-    // Check arch at this neighbor too
-    float alx, alz;
-    ht_arch_project(&job->arch_frame, vec3_normalize(ndir), job->planet_radius, &alx, &alz);
-    int ab, at;
-    ht_arch_query(alx, alz, job->arch_base, &ab, &at);
+    // Check arch at this neighbor too (planet only)
+    if (job->body_type != LOD_BODY_MOON) {
+        float alx, alz;
+        ht_arch_project(&job->arch_frame, vec3_normalize(ndir), job->planet_radius, &alx, &alz);
+        int ab, at;
+        ht_arch_query(alx, alz, job->arch_base, &ab, &at);
 
-    int margin = 2;
-
-    if (ab != INT16_MIN) {
-        if (world_layer >= ab - margin && world_layer <= at + margin) {
-            if (world_layer >= ab && world_layer <= at)
-                return VOXEL_STONE;
-            return VOXEL_AIR;
+        int margin = 2;
+        if (ab != INT16_MIN) {
+            if (world_layer >= ab - margin && world_layer <= at + margin) {
+                if (world_layer >= ab && world_layer <= at)
+                    return solid_type;
+                return VOXEL_AIR;
+            }
         }
     }
 
+    int margin = 2;
     if (world_layer >= surface_layer - margin && world_layer <= surface_layer + margin)
         return VOXEL_AIR;
-    if (world_layer < surface_layer - margin) return VOXEL_STONE;
+    if (world_layer < surface_layer - margin) return solid_type;
     return VOXEL_AIR;
 }
 
@@ -773,17 +796,25 @@ static int sky_neighbor_max_solid(const HexMeshJob* job,
         vec3_add(job->tangent_origin,
             vec3_add(vec3_scale(job->tangent_east, lx),
                      vec3_scale(job->tangent_north, lz))));
-    float nh_m = ht_sample_height_m(continental, mountain, warp, detail, ndir);
-    float nh_eff = fmaxf(nh_m, TERRAIN_SEA_LEVEL_M);
+    float nh_eff;
+    if (job->body_type == LOD_BODY_MOON) {
+        float surface_r = moon_surface_radius(&job->moon_shape, ndir);
+        nh_eff = fmaxf(surface_r - job->moon_shape.base_radius, 0.0f);
+    } else {
+        float nh_m = ht_sample_height_m(continental, mountain, warp, detail, ndir);
+        nh_eff = fmaxf(nh_m, TERRAIN_SEA_LEVEL_M);
+    }
     int surface_layer = (int)ceilf(nh_eff / HEX_HEIGHT);
 
-    // Check arch
-    float alx, alz;
-    ht_arch_project(&job->arch_frame, ndir, job->planet_radius, &alx, &alz);
-    int ab, at;
-    ht_arch_query(alx, alz, job->arch_base, &ab, &at);
-    if (ab != INT16_MIN && at > surface_layer)
-        surface_layer = at;
+    // Check arch (planet only)
+    if (job->body_type != LOD_BODY_MOON) {
+        float alx, alz;
+        ht_arch_project(&job->arch_frame, ndir, job->planet_radius, &alx, &alz);
+        int ab, at;
+        ht_arch_query(alx, alz, job->arch_base, &ab, &at);
+        if (ab != INT16_MIN && at > surface_layer)
+            surface_layer = at;
+    }
 
     int local_max = surface_layer - job->base_layer;
     if (local_max < 0) return -1;
@@ -1538,7 +1569,7 @@ static void generate_chunk_mesh(HexMeshJob* job) {
                     h_m = surface_r - job->moon_shape.base_radius;
                     effective_h = fmaxf(h_m, 0.0f);
                     surface_layer = (int)ceilf(effective_h / HEX_HEIGHT);
-                    surface_type = VOXEL_STONE;
+                    surface_type = VOXEL_MOON_ROCK;
                 } else {
                     h_m = ht_sample_height_m(&continental, &mountain, &warp, &detail, unit);
                     effective_h = fmaxf(h_m, TERRAIN_SEA_LEVEL_M);
@@ -1846,9 +1877,14 @@ static void generate_chunk_mesh(HexMeshJob* job) {
                         vec3_add(job->tangent_origin,
                             vec3_add(vec3_scale(job->tangent_east, vx),
                                      vec3_scale(job->tangent_north, vz))));
-                    float v_h = ht_sample_height_m(&continental, &mountain, &warp, &detail, vdir);
-                    float v_eff = fmaxf(v_h, TERRAIN_SEA_LEVEL_M);
-                    float v_r = job->planet_radius + v_eff + HEX_SURFACE_BIAS;
+                    float v_r;
+                    if (job->body_type == LOD_BODY_MOON) {
+                        v_r = moon_surface_radius(&job->moon_shape, vdir) + HEX_SURFACE_BIAS;
+                    } else {
+                        float v_h = ht_sample_height_m(&continental, &mountain, &warp, &detail, vdir);
+                        float v_eff = fmaxf(v_h, TERRAIN_SEA_LEVEL_M);
+                        v_r = job->planet_radius + v_eff + HEX_SURFACE_BIAS;
+                    }
                     hex_verts_top[i] = vec3_scale(vdir, v_r);
                     top_uvs[i] = hex_top_uv(vx, vz, lx, lz, top_atlas);
                 }
@@ -2448,12 +2484,17 @@ void hex_terrain_update(HexTerrain* ht, HMM_Vec3 camera_pos,
     // Disable hex terrain when camera is high above ground
     float cam_r = sqrtf(vec3_dot(camera_pos, camera_pos));
     HMM_Vec3 cam_dir = vec3_scale(camera_pos, 1.0f / fmaxf(cam_r, 1.0f));
-    fnl_state _c = ht_create_continental_noise(ht->seed);
-    fnl_state _m = ht_create_mountain_noise(ht->seed);
-    fnl_state _w = ht_create_warp_noise(ht->seed);
-    fnl_state _d = ht_create_detail_noise(ht->seed);
-    float ground_h = ht_sample_height_m(&_c, &_m, &_w, &_d, cam_dir);
-    float ground_r = ht->planet_radius + fmaxf(ground_h, TERRAIN_SEA_LEVEL_M);
+    float ground_r;
+    if (ht->body_type == LOD_BODY_MOON) {
+        ground_r = moon_surface_radius(&ht->moon_shape, cam_dir);
+    } else {
+        fnl_state _c = ht_create_continental_noise(ht->seed);
+        fnl_state _m = ht_create_mountain_noise(ht->seed);
+        fnl_state _w = ht_create_warp_noise(ht->seed);
+        fnl_state _d = ht_create_detail_noise(ht->seed);
+        float ground_h = ht_sample_height_m(&_c, &_m, &_w, &_d, cam_dir);
+        ground_r = ht->planet_radius + fmaxf(ground_h, TERRAIN_SEA_LEVEL_M);
+    }
     float altitude = cam_r - ground_r;
     if (altitude > HEX_MAX_DRAW_ALT) {
         for (int i = 0; i < HEX_MAX_CHUNKS; i++) {
