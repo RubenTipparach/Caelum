@@ -9,12 +9,6 @@
 #include "hex_vertex.h"
 #include "celestial.h"
 
-// Body type for LOD tree targeting
-typedef enum {
-    LOD_BODY_PLANET,    // Tenebris (complex terrain noise)
-    LOD_BODY_MOON,      // Moon (MoonShapeParams noise)
-} LodBodyType;
-
 // ---- Configuration ----
 #define LOD_MAX_DEPTH       13      // Max subdivision depth
 #define LOD_MAX_NODES       16384   // Node pool (intermediate + leaf nodes)

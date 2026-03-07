@@ -442,54 +442,53 @@ void solar_system_init(SolarSystem* ss) {
      * T = T0 * (a/a0)^1.5
      */
     /*
-     * All moons are grey rocky bodies — subtle tonal variation between them.
-     * Colors: base=mid grey, highlight=light grey (peaks), shadow=dark grey (crevices).
+     * All moons are grey rocky bodies — cool blue-gray tones to match moon.png texture.
+     * Colors: base=mid blue-gray, highlight=light blue-gray (peaks), shadow=dark blue-gray (crevices).
      */
     MoonDef defs[MAX_MOONS] = {
         /* --- 2 giant moons (50-100km radius) --- */
+        /* noise_amp = 0.01 for all moons (1% of radius, matching Tenebris 8km/800km ratio) */
         { "Gorrath",  5000000.0f, 14230.0f,  5.0f,   0.0f, 0.02f,
-          80000.0f, {1.0f, 0.9f, 1.05f}, 100, 0.3f, 0.08f, 4,
-          {{0.45f, 0.43f, 0.42f}}, {{0.62f, 0.60f, 0.58f}}, {{0.22f, 0.21f, 0.20f}} },
+          80000.0f, {1.0f, 0.9f, 1.05f}, 100, 0.3f, 0.01f, 4,
+          {{0.38f, 0.38f, 0.42f}}, {{0.52f, 0.52f, 0.57f}}, {{0.18f, 0.18f, 0.22f}} },
 
         { "Atheron", 10000000.0f, 40250.0f, 10.0f,  90.0f, 0.03f,
-          55000.0f, {1.05f, 0.95f, 1.0f}, 150, 0.4f, 0.06f, 4,
-          {{0.50f, 0.50f, 0.52f}}, {{0.68f, 0.68f, 0.70f}}, {{0.25f, 0.25f, 0.27f}} },
+          55000.0f, {1.05f, 0.95f, 1.0f}, 150, 0.4f, 0.01f, 4,
+          {{0.40f, 0.40f, 0.44f}}, {{0.55f, 0.55f, 0.60f}}, {{0.20f, 0.20f, 0.24f}} },
 
         /* --- 3 large moons (5-10km radius) --- */
-        /*   Noise amplitude: ~50m peaks → amp = 50/radius                */
         { "Kelthos",  3000000.0f, 6600.0f, 12.0f,  45.0f, 0.04f,
-          7000.0f, {0.95f, 1.10f, 1.0f}, 300, 0.5f, 0.007f, 4,
-          {{0.48f, 0.47f, 0.45f}}, {{0.65f, 0.63f, 0.60f}}, {{0.24f, 0.23f, 0.22f}} },
+          7000.0f, {0.95f, 1.10f, 1.0f}, 300, 0.5f, 0.01f, 4,
+          {{0.36f, 0.37f, 0.40f}}, {{0.50f, 0.51f, 0.55f}}, {{0.17f, 0.17f, 0.20f}} },
 
         { "Dravok",   6500000.0f, 21100.0f, 18.0f, 200.0f, 0.06f,
-          6000.0f, {1.20f, 0.80f, 0.95f}, 400, 0.6f, 0.007f, 3,
-          {{0.42f, 0.40f, 0.38f}}, {{0.58f, 0.56f, 0.53f}}, {{0.20f, 0.19f, 0.18f}} },
+          6000.0f, {1.20f, 0.80f, 0.95f}, 400, 0.6f, 0.01f, 3,
+          {{0.34f, 0.34f, 0.38f}}, {{0.48f, 0.48f, 0.53f}}, {{0.16f, 0.16f, 0.19f}} },
 
         { "Serath",   8500000.0f, 31560.0f,  8.0f, 300.0f, 0.03f,
-          5000.0f, {1.0f, 1.0f, 1.15f}, 500, 0.4f, 0.006f, 3,
-          {{0.52f, 0.52f, 0.53f}}, {{0.70f, 0.70f, 0.72f}}, {{0.28f, 0.28f, 0.29f}} },
+          5000.0f, {1.0f, 1.0f, 1.15f}, 500, 0.4f, 0.01f, 3,
+          {{0.42f, 0.42f, 0.46f}}, {{0.57f, 0.57f, 0.62f}}, {{0.22f, 0.22f, 0.25f}} },
 
         /* --- 5 small moons (1-5km radius) --- */
-        /*   Noise amplitude: ~10-30m peaks → amp = peak/radius            */
         { "Cryx",     2000000.0f, 3600.0f, 25.0f,  60.0f, 0.08f,
-          3000.0f, {1.3f, 0.7f, 1.0f}, 600, 0.5f, 0.007f, 2,
-          {{0.40f, 0.38f, 0.37f}}, {{0.55f, 0.53f, 0.51f}}, {{0.18f, 0.17f, 0.16f}} },
+          3000.0f, {1.3f, 0.7f, 1.0f}, 600, 0.5f, 0.01f, 2,
+          {{0.32f, 0.32f, 0.36f}}, {{0.46f, 0.46f, 0.51f}}, {{0.15f, 0.15f, 0.18f}} },
 
         { "Nyctra",   4500000.0f, 12150.0f, 30.0f, 150.0f, 0.05f,
-          2000.0f, {0.8f, 1.2f, 1.1f}, 700, 0.6f, 0.008f, 2,
-          {{0.46f, 0.45f, 0.47f}}, {{0.63f, 0.62f, 0.65f}}, {{0.23f, 0.22f, 0.24f}} },
+          2000.0f, {0.8f, 1.2f, 1.1f}, 700, 0.6f, 0.01f, 2,
+          {{0.37f, 0.38f, 0.42f}}, {{0.52f, 0.53f, 0.58f}}, {{0.18f, 0.18f, 0.22f}} },
 
         { "Thalwen",  7500000.0f, 26200.0f, 15.0f, 270.0f, 0.07f,
-          4000.0f, {1.1f, 0.9f, 1.2f}, 800, 0.5f, 0.006f, 3,
-          {{0.44f, 0.43f, 0.42f}}, {{0.60f, 0.58f, 0.57f}}, {{0.21f, 0.20f, 0.19f}} },
+          4000.0f, {1.1f, 0.9f, 1.2f}, 800, 0.5f, 0.01f, 3,
+          {{0.35f, 0.35f, 0.40f}}, {{0.50f, 0.50f, 0.56f}}, {{0.17f, 0.17f, 0.21f}} },
 
         { "Vexis",   11000000.0f, 46440.0f, 40.0f,  90.0f, 0.09f,
-          1500.0f, {1.4f, 0.6f, 1.0f}, 900, 0.7f, 0.008f, 2,
-          {{0.38f, 0.38f, 0.40f}}, {{0.53f, 0.53f, 0.56f}}, {{0.17f, 0.17f, 0.19f}} },
+          1500.0f, {1.4f, 0.6f, 1.0f}, 900, 0.7f, 0.01f, 2,
+          {{0.33f, 0.33f, 0.38f}}, {{0.47f, 0.47f, 0.53f}}, {{0.15f, 0.15f, 0.19f}} },
 
         { "Zephyros", 13000000.0f, 59720.0f, 10.0f, 330.0f, 0.02f,
-          1000.0f, {1.0f, 1.3f, 0.8f}, 1000, 0.7f, 0.010f, 2,
-          {{0.50f, 0.49f, 0.48f}}, {{0.67f, 0.65f, 0.64f}}, {{0.26f, 0.25f, 0.24f}} },
+          1000.0f, {1.0f, 1.3f, 0.8f}, 1000, 0.7f, 0.01f, 2,
+          {{0.39f, 0.40f, 0.44f}}, {{0.54f, 0.55f, 0.60f}}, {{0.19f, 0.20f, 0.23f}} },
     };
 
     ss->moon_count = MAX_MOONS;
@@ -623,18 +622,31 @@ void solar_system_render(const SolarSystem* ss,
                          const void* planet_fallback_fs) {
     sg_apply_pipeline(pip);
 
+    /* When on a moon (pinned_body >= 0), cam->pos_d is moon-local.
+       Reconstruct world-space camera for rendering external bodies. */
+    double cam_world[3];
+    if (ss->pinned_body >= 0) {
+        cam_world[0] = cam->pos_d[0] + ss->pinned_center_d[0];
+        cam_world[1] = cam->pos_d[1] + ss->pinned_center_d[1];
+        cam_world[2] = cam->pos_d[2] + ss->pinned_center_d[2];
+    } else {
+        cam_world[0] = cam->pos_d[0];
+        cam_world[1] = cam->pos_d[1];
+        cam_world[2] = cam->pos_d[2];
+    }
+
     for (int i = 0; i < ss->moon_count; i++) {
         if (i == lod_target_body) continue;  /* LOD tree renders this one */
         const CelestialBody* m = &ss->moons[i];
         if (!m->mesh_ready) continue;
 
-        /* Camera offset = cam_pos - moon_pos (in double, relative to world origin)
+        /* Camera offset = cam_world - moon_pos (in double)
            Moon vertices are in moon-local coords (centered at 0).
            Shader does: cam_rel = vert_pos - camera_offset = vert_pos - cam + moon = world_vert - cam */
         double cam_off_d[3] = {
-            cam->pos_d[0] - m->pos_d[0],
-            cam->pos_d[1] - m->pos_d[1],
-            cam->pos_d[2] - m->pos_d[2],
+            cam_world[0] - m->pos_d[0],
+            cam_world[1] - m->pos_d[1],
+            cam_world[2] - m->pos_d[2],
         };
         float hi_x = (float)cam_off_d[0];
         float hi_y = (float)cam_off_d[1];
@@ -677,11 +689,11 @@ void solar_system_render(const SolarSystem* ss,
     /* Draw Tenebris fallback mesh when LOD targets a moon */
     if (lod_target_body >= 0 && ss->planet_mesh_ready) {
         /* Tenebris mesh vertices are centered at origin (planet-local coords).
-           Camera offset = cam_pos - planet_center = cam_pos - (0,0,0) = cam_pos */
+           Camera offset = cam_world - planet_center = cam_world - (0,0,0) = cam_world */
         double cam_off_d[3] = {
-            cam->pos_d[0],
-            cam->pos_d[1],
-            cam->pos_d[2],
+            cam_world[0],
+            cam_world[1],
+            cam_world[2],
         };
         float hi_x = (float)cam_off_d[0];
         float hi_y = (float)cam_off_d[1];

@@ -8,6 +8,7 @@
 #include "hex_vertex.h"
 #include "job_system.h"
 #include "voxel_edits.h"
+#include "celestial.h"
 
 // ---- Configuration ----
 #define HEX_RADIUS          1.0f        // Circumradius of each hex (center to vertex) in meters
@@ -84,11 +85,15 @@ typedef struct HexTerrain {
     HexChunk chunks[HEX_MAX_CHUNKS];
     int active_count;
 
-    // Planet parameters
+    // Body parameters (retargetable to planet or any moon)
+    LodBodyType body_type;
     float planet_radius;
     float layer_thickness;
     int sea_level;
     int seed;
+    MoonShapeParams moon_shape;
+    MoonColorPalette moon_palette;
+    char edits_dir[256];  // Cached for retarget
 
     // Tangent frame (computed from camera ground-projected position)
     HMM_Vec3 tangent_origin;   // World position of grid origin on surface
@@ -143,6 +148,13 @@ void hex_terrain_init(HexTerrain* ht, float planet_radius, float layer_thickness
                       const char* edits_dir);
 
 void hex_terrain_destroy(HexTerrain* ht);
+
+// Switch hex terrain to a different celestial body.
+// Frees all chunks and reinitializes for the new body.
+void hex_terrain_retarget(HexTerrain* ht, LodBodyType type,
+                          float radius, int seed,
+                          const MoonShapeParams* moon_shape,
+                          const MoonColorPalette* moon_palette);
 
 // Update: load/unload chunks based on camera position, generate meshes
 void hex_terrain_update(HexTerrain* ht, HMM_Vec3 camera_pos,
