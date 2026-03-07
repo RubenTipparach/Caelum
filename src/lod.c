@@ -1152,21 +1152,21 @@ static void generate_hex_mesh_for_moon(
     HMM_Vec3 hex_origin, HMM_Vec3 hex_east, HMM_Vec3 hex_north,
     HexVertex** out_vertices, int* out_count)
 {
-    (void)body_radius;  // Use base_radius for consistent height math
-    float base_r = moon_shape->base_radius;
+    (void)body_radius;
+    float center_r = moon_ellipsoid_radius(moon_shape, hex_origin);
 
     HMM_Vec3 center = hex_origin;
     HMM_Vec3 east = hex_east;
     HMM_Vec3 north = hex_north;
 
-    // Project triangle vertices to 2D tangent plane (using base_radius for consistency)
+    // Project triangle vertices to 2D tangent plane
     float tvx[3], tvz[3];
     HMM_Vec3 verts[3] = { tri->v0, tri->v1, tri->v2 };
     for (int i = 0; i < 3; i++) {
         float dot_vc = vec3_dot(verts[i], center);
         HMM_Vec3 offset = vec3_sub(verts[i], vec3_scale(center, dot_vc));
-        tvx[i] = vec3_dot(offset, east) * base_r;
-        tvz[i] = vec3_dot(offset, north) * base_r;
+        tvx[i] = vec3_dot(offset, east) * center_r;
+        tvz[i] = vec3_dot(offset, north) * center_r;
     }
 
     float margin = LOD_HEX_RADIUS * 1.5f;
@@ -1176,7 +1176,7 @@ static void generate_hex_mesh_for_moon(
     float max_z = fmaxf(tvz[0], fmaxf(tvz[1], tvz[2])) + margin;
 
     fnl_state cnoise = create_color_noise(seed);
-    HMM_Vec3 center_scaled = vec3_scale(center, base_r);
+    HMM_Vec3 center_scaled = vec3_scale(center, center_r);
 
     int col_min = (int)floorf(min_x / LOD_HEX_COL_SPACING);
     int col_max = (int)ceilf(max_x / LOD_HEX_COL_SPACING);
@@ -1210,18 +1210,19 @@ static void generate_hex_mesh_for_moon(
                 vec3_add(center_scaled,
                     vec3_add(vec3_scale(east, hx), vec3_scale(north, hz))));
 
-            // Moon terrain: ellipsoid + noise
+            // Moon terrain: per-cell ellipsoid radius (conforms to ellipsoid surface)
             float surface_r = moon_surface_radius(moon_shape, cdir);
-            float h_m = surface_r - base_r;
-            float eff = fmaxf(h_m, 0.0f);  // No sea level on moons
+            float ellip_r = moon_ellipsoid_radius(moon_shape, cdir);
+            float h_m = surface_r - ellip_r;
+            float eff = fmaxf(h_m, 0.0f);
             int h = (int)ceilf(eff);
 
             int gi = (col - col_min) * grid_rows + (row - row_min);
             hm_heights[gi] = (int16_t)h;
-            hm_atlas[gi] = LOD_ATLAS_MOON;  // Moon surface = moon rock
+            hm_atlas[gi] = LOD_ATLAS_MOON;
 
             // Moon palette color based on height
-            float height_t = (surface_r - base_r * 0.9f) / (base_r * 0.2f);
+            float height_t = (surface_r - ellip_r * 0.9f) / (ellip_r * 0.2f);
             if (height_t < 0.0f) height_t = 0.0f;
             if (height_t > 1.0f) height_t = 1.0f;
             HMM_Vec3 vert_color = vec3_lerp(moon_palette->shadow_color,
@@ -1306,12 +1307,15 @@ static void generate_hex_mesh_for_moon(
             HMM_Vec3 cdir = vec3_normalize(
                 vec3_add(center_scaled,
                     vec3_add(vec3_scale(east, hx), vec3_scale(north, hz))));
-            HMM_Vec3 local_up = cdir;
+            HMM_Vec3 local_up = moon_ellipsoid_normal(moon_shape, cdir);
 
-            float cap_r = base_r + (float)h + LOD_HEX_SURFACE_BIAS;
+            float cell_ellip_r = moon_ellipsoid_radius(moon_shape, cdir);
+            float cap_h = (float)h + LOD_HEX_SURFACE_BIAS;
 
             HMM_Vec3 hex_v[6];
             HMM_Vec3 hex_dirs[6];
+            HMM_Vec3 hex_surface[6];
+            HMM_Vec3 hex_normals[6];
             LodHexUV hex_uvs[6];
             for (int i = 0; i < 6; i++) {
                 float vx = hx + LOD_HEX_RADIUS * LOD_HEX_COS[i];
@@ -1319,7 +1323,9 @@ static void generate_hex_mesh_for_moon(
                 hex_dirs[i] = vec3_normalize(
                     vec3_add(center_scaled,
                         vec3_add(vec3_scale(east, vx), vec3_scale(north, vz))));
-                hex_v[i] = vec3_scale(hex_dirs[i], cap_r);
+                hex_surface[i] = vec3_scale(hex_dirs[i], moon_ellipsoid_radius(moon_shape, hex_dirs[i]));
+                hex_normals[i] = moon_ellipsoid_normal(moon_shape, hex_dirs[i]);
+                hex_v[i] = vec3_add(hex_surface[i], vec3_scale(hex_normals[i], cap_h));
                 hex_uvs[i] = lod_hex_top_uv(vx, vz, hx, hz, cap_atlas_idx);
             }
 
@@ -1359,13 +1365,13 @@ static void generate_hex_mesh_for_moon(
                     wall_bottom = wall_top - LOD_HEX_MAX_WALL;
 
                 for (int layer = wall_bottom; layer < wall_top; layer++) {
-                    float bot_r = base_r + (float)layer + LOD_HEX_SURFACE_BIAS;
-                    float top_r = base_r + (float)(layer + 1) + LOD_HEX_SURFACE_BIAS;
+                    float bot_h = (float)layer + LOD_HEX_SURFACE_BIAS;
+                    float top_h_w = (float)(layer + 1) + LOD_HEX_SURFACE_BIAS;
 
-                    HMM_Vec3 p0_bot = vec3_scale(hex_dirs[vi0], bot_r);
-                    HMM_Vec3 p1_bot = vec3_scale(hex_dirs[vi1], bot_r);
-                    HMM_Vec3 p0_top = vec3_scale(hex_dirs[vi0], top_r);
-                    HMM_Vec3 p1_top = vec3_scale(hex_dirs[vi1], top_r);
+                    HMM_Vec3 p0_bot = vec3_add(hex_surface[vi0], vec3_scale(hex_normals[vi0], bot_h));
+                    HMM_Vec3 p1_bot = vec3_add(hex_surface[vi1], vec3_scale(hex_normals[vi1], bot_h));
+                    HMM_Vec3 p0_top = vec3_add(hex_surface[vi0], vec3_scale(hex_normals[vi0], top_h_w));
+                    HMM_Vec3 p1_top = vec3_add(hex_surface[vi1], vec3_scale(hex_normals[vi1], top_h_w));
 
                     float wall_y = (float)layer + 0.5f;
                     float surface_h = (float)h;
@@ -1900,7 +1906,12 @@ static float patch_distance(const LodTree* tree, const LodNode* node) {
     float terrain_amp = (tree->body_type == LOD_BODY_MOON)
         ? tree->moon_shape.noise_amplitude * tree->moon_shape.base_radius
         : TERRAIN_AMPLITUDE_M;
-    float max_surface_r = tree->planet_radius + terrain_amp;
+    float max_surface_r;
+    if (tree->body_type == LOD_BODY_MOON && tree->moon_shape.shape_type == MOON_SHAPE_CAPSULE) {
+        max_surface_r = tree->moon_shape.capsule_half_h + tree->moon_shape.capsule_cap_r + terrain_amp;
+    } else {
+        max_surface_r = tree->planet_radius + terrain_amp;
+    }
     float altitude = cam_r - max_surface_r;
     if (altitude < 0.0f) altitude = 0.0f;
 
@@ -1926,7 +1937,12 @@ static float patch_center_distance(const LodTree* tree, const LodNode* node) {
     float terrain_amp = (tree->body_type == LOD_BODY_MOON)
         ? tree->moon_shape.noise_amplitude * tree->moon_shape.base_radius
         : TERRAIN_AMPLITUDE_M;
-    float max_surface_r = tree->planet_radius + terrain_amp;
+    float max_surface_r;
+    if (tree->body_type == LOD_BODY_MOON && tree->moon_shape.shape_type == MOON_SHAPE_CAPSULE) {
+        max_surface_r = tree->moon_shape.capsule_half_h + tree->moon_shape.capsule_cap_r + terrain_amp;
+    } else {
+        max_surface_r = tree->planet_radius + terrain_amp;
+    }
     float altitude = cam_r - max_surface_r;
     if (altitude < 0.0f) altitude = 0.0f;
 
@@ -1939,9 +1955,10 @@ static float patch_center_distance(const LodTree* tree, const LodNode* node) {
 static bool should_split(const LodTree* tree, const LodNode* node) {
     if (node->depth >= tree->max_depth_effective) return false;
 
-    // For the planet, don't split to hex-voxel depth — hex_terrain system handles close-range detail.
-    // For moons, max_depth_effective is already capped appropriately.
-    if (tree->body_type == LOD_BODY_PLANET && node->depth + 1 >= tree->max_depth_effective) return false;
+    // Don't split to hex-voxel depth — hex_terrain system handles close-range detail.
+    // This applies to both planet and moons: LOD provides smooth/coarse patches,
+    // hex_terrain renders detailed voxel hex mesh on top with depth bias.
+    if (node->depth + 1 >= tree->max_depth_effective) return false;
 
     float dist = patch_center_distance(tree, node);
     float patch_arc = tree->depth_arc[node->depth];
@@ -2101,9 +2118,8 @@ void lod_tree_update(LodTree* tree, HMM_Vec3 camera_pos, HMM_Mat4 view_proj) {
     tree->splits_this_frame = 0;
 
     // Update shared hex tangent frame.
-    // All depth-13 patches use this single frame so their hex grids tile seamlessly.
-    // Re-anchor when camera drifts ~2km from current frame center (well beyond the
-    // ~1.3km depth-13 visible range, so old patches have naturally cycled out by then).
+    // All max-depth patches use this single frame so their hex grids tile seamlessly.
+    // Re-anchor when camera drifts ~2km surface distance from current frame center.
     {
         float cam_r = sqrtf(vec3_dot(camera_pos, camera_pos));
         if (cam_r < 1.0f) cam_r = 1.0f;
@@ -2112,16 +2128,29 @@ void lod_tree_update(LodTree* tree, HMM_Vec3 camera_pos, HMM_Mat4 view_proj) {
         bool need_reanchor = !tree->hex_frame_valid;
         if (!need_reanchor) {
             float d = vec3_dot(cam_dir, tree->hex_frame_origin);
-            // cos(angle) < 0.999997 ≈ 0.14° ≈ 2km at 800km radius
-            if (d < 0.999997f) need_reanchor = true;
+            // Reanchor distance: ~10% of circumference, clamped [500m, 2000m].
+            // Planet (r=796km): 2000m.  Small moon (r=5km): ~3.1km→2000m.
+            // cos(theta) ≈ 1 - theta²/2, theta = dist/R → cos ≈ 1 - dist²/(2R²)
+            float R = tree->planet_radius;
+            float dist = R * 0.628f;
+            if (dist < 500.0f)  dist = 500.0f;
+            if (dist > 2000.0f) dist = 2000.0f;
+            float reanchor_cos = 1.0f - (dist * dist) / (2.0f * R * R);
+            if (reanchor_cos < 0.9f) reanchor_cos = 0.9f;  // safety clamp
+            if (d < reanchor_cos) need_reanchor = true;
         }
         if (need_reanchor) {
             tree->hex_frame_origin = cam_dir;
+            /* Use ellipsoid surface normal for moons so LOD hex frame matches
+               hex terrain's tangent frame orientation */
+            HMM_Vec3 up = cam_dir;
+            if (tree->body_type == LOD_BODY_MOON)
+                up = moon_ellipsoid_normal(&tree->moon_shape, cam_dir);
             HMM_Vec3 wy = {{0.0f, 1.0f, 0.0f}};
-            if (fabsf(vec3_dot(cam_dir, wy)) > 0.99f)
+            if (fabsf(vec3_dot(up, wy)) > 0.99f)
                 wy = (HMM_Vec3){{1.0f, 0.0f, 0.0f}};
-            tree->hex_frame_east = vec3_normalize(vec3_cross(wy, cam_dir));
-            tree->hex_frame_north = vec3_normalize(vec3_cross(cam_dir, tree->hex_frame_east));
+            tree->hex_frame_east = vec3_normalize(vec3_cross(wy, up));
+            tree->hex_frame_north = vec3_normalize(vec3_cross(up, tree->hex_frame_east));
             tree->hex_frame_valid = true;
         }
     }

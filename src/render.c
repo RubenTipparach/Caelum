@@ -301,6 +301,15 @@ void render_init(Renderer* r, Planet* planet, const Camera* cam, const char* edi
 
     r->hex_selection.valid = false;
 
+    // ---- Normal debug arrows buffer (G key) ----
+    // 2 arrows: each = shaft(2 verts) + arrowhead(6 verts) = 8 verts. Total = 16 verts * 3 floats.
+    r->normal_debug_buf = sg_make_buffer(&(sg_buffer_desc){
+        .size = 16 * 3 * sizeof(float),
+        .usage.vertex_buffer = true,
+        .usage.stream_update = true,
+        .label = "normal-debug-arrows",
+    });
+
     // ---- Hex terrain textured pipeline ----
     printf("[RENDER] render_init: loading hex terrain textures...\n"); fflush(stdout);
     {
@@ -937,6 +946,97 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
         }
     }
 
+    // ---- G key: normal debug arrows (red=player up, blue=grid up) ----
+    if (cam->show_normal_debug && cam->gravity_body >= 0 && r->hex_terrain.frame_valid) {
+        const HexTerrain* ht = &r->hex_terrain;
+        float arrow_len = 100.0f;
+        float head_len = 15.0f;
+        float head_spread = 5.0f;
+        float verts[16 * 3]; // 16 vertices * 3 floats
+        int vi = 0;
+
+        // Helper: write vertex relative to world_origin
+        #define ARROW_V(px, py, pz) do { \
+            verts[vi++] = (px) - (float)r->lod_tree.world_origin[0]; \
+            verts[vi++] = (py) - (float)r->lod_tree.world_origin[1]; \
+            verts[vi++] = (pz) - (float)r->lod_tree.world_origin[2]; \
+        } while(0)
+
+        // Build a perpendicular vector to 'up' for arrowhead
+        HMM_Vec3 perp;
+        {
+            HMM_Vec3 ref = {{1, 0, 0}};
+            if (fabsf(HMM_DotV3(cam->local_up, ref)) > 0.9f) ref = (HMM_Vec3){{0, 1, 0}};
+            perp = HMM_NormV3(HMM_Cross(cam->local_up, ref));
+        }
+
+        // RED arrow: player position + local_up
+        {
+            float bx = (float)cam->pos_d[0], by = (float)cam->pos_d[1], bz = (float)cam->pos_d[2];
+            float tx = bx + cam->local_up.X * arrow_len;
+            float ty = by + cam->local_up.Y * arrow_len;
+            float tz = bz + cam->local_up.Z * arrow_len;
+            // Shaft
+            ARROW_V(bx, by, bz); ARROW_V(tx, ty, tz);
+            // Arrowhead lines (2 lines from tip pointing back)
+            float hx = tx - cam->local_up.X * head_len;
+            float hy = ty - cam->local_up.Y * head_len;
+            float hz = tz - cam->local_up.Z * head_len;
+            ARROW_V(tx, ty, tz);
+            ARROW_V(hx + perp.X * head_spread, hy + perp.Y * head_spread, hz + perp.Z * head_spread);
+            ARROW_V(tx, ty, tz);
+            ARROW_V(hx - perp.X * head_spread, hy - perp.Y * head_spread, hz - perp.Z * head_spread);
+        }
+
+        // BLUE arrow: grid center + tangent_up
+        {
+            HMM_Vec3 perp2;
+            HMM_Vec3 ref2 = {{1, 0, 0}};
+            if (fabsf(HMM_DotV3(ht->tangent_up, ref2)) > 0.9f) ref2 = (HMM_Vec3){{0, 1, 0}};
+            perp2 = HMM_NormV3(HMM_Cross(ht->tangent_up, ref2));
+
+            float bx = ht->tangent_origin.X, by = ht->tangent_origin.Y, bz = ht->tangent_origin.Z;
+            float tx = bx + ht->tangent_up.X * arrow_len;
+            float ty = by + ht->tangent_up.Y * arrow_len;
+            float tz = bz + ht->tangent_up.Z * arrow_len;
+            // Shaft
+            ARROW_V(bx, by, bz); ARROW_V(tx, ty, tz);
+            // Arrowhead
+            float hx = tx - ht->tangent_up.X * head_len;
+            float hy = ty - ht->tangent_up.Y * head_len;
+            float hz = tz - ht->tangent_up.Z * head_len;
+            ARROW_V(tx, ty, tz);
+            ARROW_V(hx + perp2.X * head_spread, hy + perp2.Y * head_spread, hz + perp2.Z * head_spread);
+            ARROW_V(tx, ty, tz);
+            ARROW_V(hx - perp2.X * head_spread, hy - perp2.Y * head_spread, hz - perp2.Z * head_spread);
+        }
+        #undef ARROW_V
+
+        sg_update_buffer(r->normal_debug_buf, &(sg_range){ verts, sizeof(verts) });
+
+        highlight_vs_params_t dbg_vs = {
+            .mvp = vp_terrain,
+            .camera_offset = vs_params.camera_offset,
+            .camera_offset_low = vs_params.camera_offset_low,
+            .log_depth = vs_params.log_depth,
+        };
+        sg_bindings dbg_bind = {0};
+        dbg_bind.vertex_buffers[0] = r->normal_debug_buf;
+
+        // Draw RED arrow (player local_up)
+        sg_apply_pipeline(r->highlight_face_pip);  // always-on-top depth
+        sg_apply_uniforms(UB_highlight_vs_params, &SG_RANGE(dbg_vs));
+        highlight_fs_params_t red_fs = { .color = (HMM_Vec4){{1.0f, 0.0f, 0.0f, 1.0f}} };
+        sg_apply_uniforms(UB_highlight_fs_params, &SG_RANGE(red_fs));
+        sg_apply_bindings(&dbg_bind);
+        sg_draw(0, 6, 1);  // 3 lines = 6 verts (shaft + 2 arrowhead)
+
+        // Draw BLUE arrow (grid tangent_up)
+        highlight_fs_params_t blue_fs = { .color = (HMM_Vec4){{0.0f, 0.4f, 1.0f, 1.0f}} };
+        sg_apply_uniforms(UB_highlight_fs_params, &SG_RANGE(blue_fs));
+        sg_draw(6, 6, 1);  // next 3 lines
+    }
+
     // ---- Profiler timing ----
     uint64_t render_end = stm_now();
     r->profile.accum_render_ms += (float)stm_ms(stm_diff(render_end, render_start));
@@ -997,7 +1097,12 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
         double bdy = cam->pos_d[1] - r->lod_tree.body_center_d[1];
         double bdz = cam->pos_d[2] - r->lod_tree.body_center_d[2];
         float cam_r = (float)sqrt(bdx*bdx + bdy*bdy + bdz*bdz);
-        float altitude = cam_r - r->lod_tree.planet_radius;
+        float surface_r = r->lod_tree.planet_radius;
+        if (r->lod_tree.body_type == LOD_BODY_MOON && cam_r > 1.0f) {
+            HMM_Vec3 cam_dir = {{ (float)(bdx/cam_r), (float)(bdy/cam_r), (float)(bdz/cam_r) }};
+            surface_r = moon_surface_radius(&r->lod_tree.moon_shape, cam_dir);
+        }
+        float altitude = cam_r - surface_r;
         float body_r_km = r->lod_tree.planet_radius / 1000.0f;
         sdtx_color3f(0.6f, 0.8f, 1.0f);
         sdtx_printf("alt: %.0fm  R: %.0fkm\n", altitude, body_r_km);

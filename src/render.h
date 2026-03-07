@@ -127,6 +127,9 @@ typedef struct Renderer {
     // Debug modes
     bool show_profiler;     // F3: performance overlay
     bool show_wireframe;    // P: wireframe overlay for physics debug
+
+    // Normal debug arrows (G key)
+    sg_buffer normal_debug_buf;
     ProfileStats profile;
 } Renderer;
 

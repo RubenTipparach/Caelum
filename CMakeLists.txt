@@ -60,6 +60,7 @@ add_executable(hex-planets
     src/world.c
     src/lobby.c
     src/celestial.c
+    src/solar_config.c
 )
 if(APPLE)
     target_sources(hex-planets PRIVATE src/screenshot_metal.m src/platform_macos.m)
