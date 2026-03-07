@@ -65,6 +65,49 @@ static bool dir_exists(const char* path) {
 #endif
 }
 
+// Recursively delete a directory and all its contents
+static void remove_dir_recursive(const char* path) {
+#ifdef _WIN32
+    WIN32_FIND_DATAA fd;
+    char pattern[512];
+    snprintf(pattern, sizeof(pattern), "%s\\*", path);
+    HANDLE h = FindFirstFileA(pattern, &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (fd.cFileName[0] == '.' && (fd.cFileName[1] == '\0' ||
+                (fd.cFileName[1] == '.' && fd.cFileName[2] == '\0')))
+                continue;
+            char child[512];
+            snprintf(child, sizeof(child), "%s\\%s", path, fd.cFileName);
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+                remove_dir_recursive(child);
+            else
+                DeleteFileA(child);
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+    RemoveDirectoryA(path);
+#else
+    DIR* d = opendir(path);
+    if (!d) return;
+    struct dirent* ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] == '.' && (ent->d_name[1] == '\0' ||
+            (ent->d_name[1] == '.' && ent->d_name[2] == '\0')))
+            continue;
+        char child[512];
+        snprintf(child, sizeof(child), "%s/%s", path, ent->d_name);
+        struct stat st;
+        if (stat(child, &st) == 0 && S_ISDIR(st.st_mode))
+            remove_dir_recursive(child);
+        else
+            remove(child);
+    }
+    closedir(d);
+    rmdir(path);
+#endif
+}
+
 // Copy a file from src to dst
 static bool copy_file(const char* src, const char* dst) {
 #ifdef _WIN32
@@ -243,6 +286,36 @@ int world_create_new(WorldList* list) {
 
     world_list_save(list);
     return idx;
+}
+
+// ---- Delete world ----
+
+bool world_delete(WorldList* list, int index) {
+    if (index < 0 || index >= list->count) return false;
+
+    WorldMeta* w = &list->worlds[index];
+    printf("[WORLD] Deleting world '%s' (id=%s)\n", w->name, w->id);
+    fflush(stdout);
+
+    // Delete world directory
+    char dir[256];
+    world_get_dir(w, dir, sizeof(dir));
+    if (dir_exists(dir))
+        remove_dir_recursive(dir);
+
+    // Shift remaining worlds down
+    for (int i = index; i < list->count - 1; i++)
+        list->worlds[i] = list->worlds[i + 1];
+    list->count--;
+
+    // Fix active_index
+    if (list->active_index == index)
+        list->active_index = -1;
+    else if (list->active_index > index)
+        list->active_index--;
+
+    world_list_save(list);
+    return true;
 }
 
 // ---- Legacy migration ----
