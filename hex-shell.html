@@ -1,0 +1,531 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Hex Shell</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Barlow:wght@300;400;600&display=swap');
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{background:#030609;overflow:hidden;font-family:'Barlow',sans-serif;color:#c8d8f0}
+canvas{display:block}
+
+#hud{position:absolute;inset:0;pointer-events:none}
+#hud::after{content:'';position:absolute;inset:0;background:repeating-linear-gradient(to bottom,transparent 0,transparent 3px,rgba(0,0,0,0.03) 3px,rgba(0,0,0,0.03) 4px);z-index:10;pointer-events:none}
+
+.corner{position:absolute;width:26px;height:26px;pointer-events:none}
+.corner.tl{top:14px;left:14px;border-top:1.5px solid #2af0c8;border-left:1.5px solid #2af0c8}
+.corner.tr{top:14px;right:14px;border-top:1.5px solid #2af0c8;border-right:1.5px solid #2af0c8}
+.corner.bl{bottom:14px;left:14px;border-bottom:1.5px solid #2af0c8;border-left:1.5px solid #2af0c8}
+.corner.br{bottom:14px;right:14px;border-bottom:1.5px solid #2af0c8;border-right:1.5px solid #2af0c8}
+
+#panel-left{position:absolute;top:50px;left:18px;width:222px;pointer-events:all}
+#panel-right{position:absolute;top:50px;right:18px;width:200px;pointer-events:none}
+
+.ptitle{font-family:'Share Tech Mono',monospace;font-size:9.5px;letter-spacing:.2em;text-transform:uppercase;color:#2af0c8;margin-bottom:5px;opacity:.75}
+.card{background:rgba(6,12,28,.9);border:1px solid rgba(42,240,200,.11);border-radius:3px;padding:10px 13px;margin-bottom:9px;backdrop-filter:blur(8px)}
+.row{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px}
+.lbl{font-family:'Share Tech Mono',monospace;color:#3a5870;font-size:9px;letter-spacing:.04em}
+.val{font-family:'Share Tech Mono',monospace;color:#cce8ff;font-size:10.5px}
+.val.hi{color:#2af0c8}.val.amber{color:#ffaa44}.val.red{color:#ff5555}
+
+.btn-row{display:flex;gap:5px;margin-top:2px;flex-wrap:wrap}
+button{font-family:'Share Tech Mono',monospace;font-size:9px;letter-spacing:.06em;padding:7px 0;background:rgba(42,240,200,.05);border:1px solid rgba(42,240,200,.18);color:#2af0c8;border-radius:2px;cursor:pointer;text-transform:uppercase;transition:background .12s,border-color .12s;pointer-events:all;flex:1;min-width:55px}
+button:hover{background:rgba(42,240,200,.14);border-color:rgba(42,240,200,.38)}
+button.on{background:rgba(42,240,200,.2);border-color:#2af0c8}
+#btn-add{background:rgba(42,240,200,.1);border-color:rgba(42,240,200,.4);font-size:10.5px;letter-spacing:.1em;padding:10px 0;width:100%}
+#btn-add:hover{background:rgba(42,240,200,.22);border-color:#2af0c8}
+
+.progress-bar{width:100%;height:4px;background:rgba(42,240,200,.08);border-radius:2px;overflow:hidden;margin-top:5px}
+.progress-fill{height:100%;background:linear-gradient(to right,#0a4a6a,#2af0c8);border-radius:2px;transition:width .35s ease}
+
+.keyhint{font-family:'Share Tech Mono',monospace;font-size:9px;color:#2e4a60;line-height:1.95}
+.keyhint span{color:#4a7a9a}.keyhint span.warn{color:#cc5522}
+
+#bottom-bar{position:absolute;bottom:20px;left:50%;transform:translateX(-50%);font-family:'Share Tech Mono',monospace;font-size:8.5px;letter-spacing:.2em;color:#1a2e40;text-transform:uppercase;pointer-events:none;white-space:nowrap}
+#sdot{display:inline-block;width:5px;height:5px;border-radius:50%;background:#2af0c8;margin-right:6px;animation:pulse 2.5s ease-in-out infinite;vertical-align:middle}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.2}}
+
+#flash{position:absolute;top:48%;left:50%;transform:translate(-50%,-50%);font-family:'Share Tech Mono',monospace;font-size:26px;pointer-events:none;opacity:0;text-shadow:0 0 20px currentColor;letter-spacing:.1em;transition:opacity .1s}
+</style>
+</head>
+<body>
+<div id="hud">
+  <div class="corner tl"></div><div class="corner tr"></div>
+  <div class="corner bl"></div><div class="corner br"></div>
+
+  <div id="panel-left">
+    <div class="ptitle">// Goldberg Hex Shell</div>
+
+    <div class="card">
+      <div class="ptitle" style="margin-bottom:7px">GP(n,0) · Depth 3 · Ellipsoid</div>
+      <div class="row"><span class="lbl">Hexagons</span><span class="val hi" id="v-hex">—</span></div>
+      <div class="row"><span class="lbl">Pentagons</span><span class="val amber" id="v-pent">—</span></div>
+      <div class="row"><span class="lbl">Semi-axes a/b/c</span><span class="val" style="font-size:9px">2.5 / 1.6 / 1.9</span></div>
+    </div>
+
+    <div class="card">
+      <div class="ptitle" style="margin-bottom:7px">Shell State</div>
+      <div class="row"><span class="lbl">Shell Layers</span><span class="val hi" id="v-shells">0 / 12</span></div>
+      <div class="row"><span class="lbl">Voxels Present</span><span class="val hi" id="v-present">0</span></div>
+      <div class="row"><span class="lbl">Voxels Carved</span><span class="val red" id="v-removed">0</span></div>
+      <div class="row"><span class="lbl">Coverage</span><span class="val" id="v-coverage">—</span></div>
+      <div class="progress-bar"><div class="progress-fill" id="v-prog" style="width:0%"></div></div>
+    </div>
+
+    <div class="card" id="hit-card" style="display:none">
+      <div class="ptitle" style="margin-bottom:7px">Last Carved</div>
+      <div class="row"><span class="lbl">Type</span><span class="val hi" id="v-type">—</span></div>
+      <div class="row"><span class="lbl">Layer</span><span class="val red" id="v-layer">—</span></div>
+      <div style="font-family:'Share Tech Mono',monospace;font-size:9px;color:#2af0c8;line-height:1.7;margin-top:4px" id="v-normal">—</div>
+    </div>
+
+    <div style="margin-bottom:6px">
+      <button id="btn-add">＋  Add Shell Layer</button>
+    </div>
+    <div class="btn-row">
+      <button id="btn-clear">Clear</button>
+      <button id="btn-pent" class="on">Pentagons</button>
+      <button id="btn-xray">X-Ray</button>
+    </div>
+  </div>
+
+  <div id="panel-right">
+    <div class="ptitle">Controls</div>
+    <div class="card">
+      <div class="keyhint">
+        <span>LMB drag</span> — orbit<br>
+        <span>RMB drag</span> — pan<br>
+        <span>Scroll</span> — zoom<br>
+        <span>+ Add Shell</span> — full layer<br>
+        <span class="warn">RMB click</span> — carve voxel
+      </div>
+    </div>
+    <div class="card">
+      <div class="keyhint">
+        Shells grow outward as<br>
+        a true <span>offset surface</span>:<br>
+        each vertex extruded<br>
+        along its own analytical<br>
+        <span>ellipsoid normal</span>.
+      </div>
+    </div>
+  </div>
+
+  <div id="bottom-bar"><span id="sdot"></span>Goldberg GP(n,0) · Offset Shell Builder · RMB = Carve</div>
+  <div id="flash"></div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+'use strict';
+
+// ═══════════════ SCENE ════════════════════════════════════════════════════════
+const scene    = new THREE.Scene();
+const camera   = new THREE.PerspectiveCamera(50, innerWidth/innerHeight, 0.01, 200);
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.setClearColor(0x030609);
+document.body.prepend(renderer.domElement);
+scene.fog = new THREE.FogExp2(0x030609, 0.016);
+
+// ═══════════════ CONSTANTS ═══════════════════════════════════════════════════
+const A=2.5, B=1.6, C=1.9;
+const SUB      = 3;
+const GAP      = 0.065;
+const LAYER_H  = 0.21;
+const MAX_SHELLS = 12;
+
+// ═══════════════ MATH ════════════════════════════════════════════════════════
+const v3 = (x,y,z) => new THREE.Vector3(x,y,z);
+function vnorm(v){ const l=Math.hypot(...v); return v.map(x=>x/l); }
+function vcross([ax,ay,az],[bx,by,bz]){ return [ay*bz-az*by, az*bx-ax*bz, ax*by-ay*bx]; }
+function vdot(a,b){ return a[0]*b[0]+a[1]*b[1]+a[2]*b[2]; }
+function toEllipsoid(x,y,z){
+  const t = 1/Math.sqrt(x*x/(A*A)+y*y/(B*B)+z*z/(C*C));
+  return v3(x*t, y*t, z*t);
+}
+function eNormal(p){ return v3(p.x/(A*A), p.y/(B*B), p.z/(C*C)).normalize(); }
+
+// ═══════════════ ICOSAHEDRON ══════════════════════════════════════════════════
+const PHI = (1+Math.sqrt(5))/2;
+const ICO_V = [
+  [-1,PHI,0],[1,PHI,0],[-1,-PHI,0],[1,-PHI,0],
+  [0,-1,PHI],[0,1,PHI],[0,-1,-PHI],[0,1,-PHI],
+  [PHI,0,-1],[PHI,0,1],[-PHI,0,-1],[-PHI,0,1]
+].map(vnorm);
+const ICO_F = [
+  [0,11,5],[0,5,1],[0,1,7],[0,7,10],[0,10,11],
+  [1,5,9],[5,11,4],[11,10,2],[10,7,6],[7,1,8],
+  [3,9,4],[3,4,2],[3,2,6],[3,6,8],[3,8,9],
+  [4,9,5],[2,4,11],[6,2,10],[8,6,7],[9,8,1]
+];
+
+// ═══════════════ GEODESIC SUBDIVISION ════════════════════════════════════════
+function buildGeodesic(depth){
+  let verts=ICO_V.map(v=>[...v]), faces=ICO_F.map(f=>[...f]);
+  for(let d=0;d<depth;d++){
+    const cache=new Map(), nv=verts.slice(), nf=[];
+    function mid(a,b){
+      const key=Math.min(a,b)+','+Math.max(a,b);
+      if(cache.has(key)) return cache.get(key);
+      const va=verts[a],vb=verts[b];
+      const m=vnorm([(va[0]+vb[0])*.5,(va[1]+vb[1])*.5,(va[2]+vb[2])*.5]);
+      const idx=nv.length; nv.push(m); cache.set(key,idx); return idx;
+    }
+    for(const [a,b,c] of faces){
+      const ab=mid(a,b),bc=mid(b,c),ca=mid(c,a);
+      nf.push([a,ab,ca],[b,bc,ab],[c,ca,bc],[ab,bc,ca]);
+    }
+    verts=nv; faces=nf;
+  }
+  return {verts,faces};
+}
+
+// ═══════════════ GOLDBERG DUAL TILES ═════════════════════════════════════════
+function buildDualTiles(verts,faces){
+  const v2f=verts.map(()=>[]);
+  faces.forEach((f,fi)=>f.forEach(vi=>v2f[vi].push(fi)));
+  const fCent=faces.map(([a,b,c])=>vnorm([
+    (verts[a][0]+verts[b][0]+verts[c][0])/3,
+    (verts[a][1]+verts[b][1]+verts[c][1])/3,
+    (verts[a][2]+verts[b][2]+verts[c][2])/3
+  ]));
+  const tiles=[];
+  verts.forEach((v,vi)=>{
+    const adjFi=v2f[vi]; if(adjFi.length<3) return;
+    const ref=Math.abs(v[0])<0.9?[1,0,0]:[0,1,0];
+    const u=vnorm(vcross(v,ref)), w=vcross(v,u);
+    const sortedFi=adjFi.slice().sort((fa,fb)=>{
+      const ca=fCent[fa],cb=fCent[fb];
+      const da=[ca[0]-v[0],ca[1]-v[1],ca[2]-v[2]];
+      const db=[cb[0]-v[0],cb[1]-v[1],cb[2]-v[2]];
+      return Math.atan2(vdot(da,w),vdot(da,u))-Math.atan2(vdot(db,w),vdot(db,u));
+    });
+    const poly=sortedFi.map(fi=>{const c=fCent[fi];return toEllipsoid(c[0],c[1],c[2]);});
+    const rawC=poly.reduce((a,p)=>a.add(p),v3(0,0,0)).divideScalar(poly.length);
+    const center=toEllipsoid(rawC.x,rawC.y,rawC.z);
+    const normal=eNormal(center);
+    // inset + re-project each polygon vertex
+    const contracted=poly.map(p=>{
+      const q=p.clone().lerp(center,GAP);
+      return toEllipsoid(q.x,q.y,q.z);
+    });
+    // Per-vertex normals: adjacent tiles share the same face-centroid point →
+    // same projected vertex → same normal → rings expand uniformly → closed shell
+    const vertNormals=contracted.map(p=>eNormal(p));
+    tiles.push({polygon:contracted,center,normal,vertNormals,isPentagon:adjFi.length===5});
+  });
+  return tiles;
+}
+
+// ═══════════════ TILE BASE MESH ══════════════════════════════════════════════
+function createTileMesh(tile,idx){
+  const poly=tile.polygon, n=poly.length, c=tile.center;
+  const pos=[];
+  for(let i=0;i<n;i++){
+    const p0=poly[i],p1=poly[(i+1)%n];
+    pos.push(c.x,c.y,c.z, p0.x,p0.y,p0.z, p1.x,p1.y,p1.z);
+  }
+  const geo=new THREE.BufferGeometry();
+  geo.setAttribute('position',new THREE.Float32BufferAttribute(pos,3));
+  geo.computeVertexNormals();
+  const mat=new THREE.MeshPhongMaterial({
+    color:   tile.isPentagon?0x2e0e00:0x040c1c,
+    emissive:tile.isPentagon?0x0d0500:0x010407,
+    specular:tile.isPentagon?0x5a2a10:0x0b1e30,
+    shininess:55, side:THREE.DoubleSide,
+    polygonOffset:true,polygonOffsetFactor:1,polygonOffsetUnits:1,
+  });
+  const m=new THREE.Mesh(geo,mat);
+  m.userData={tileIdx:idx,isTileBase:true};
+  return m;
+}
+
+// ═══════════════ TILE EDGE LINES ═════════════════════════════════════════════
+function buildEdgeLines(tiles){
+  const hp=[],pp=[];
+  tiles.forEach(t=>{
+    const pts=t.isPentagon?pp:hp, poly=t.polygon;
+    for(let i=0;i<poly.length;i++) pts.push(poly[i].clone(),poly[(i+1)%poly.length].clone());
+  });
+  const mk=(pts,col,op)=>new THREE.LineSegments(
+    new THREE.BufferGeometry().setFromPoints(pts),
+    new THREE.LineBasicMaterial({color:col,transparent:true,opacity:op})
+  );
+  return [mk(hp,0x1a5e80,.5), mk(pp,0xcc7722,.75)];
+}
+
+// ═══════════════ PRISM MESH ═══════════════════════════════════════════════════
+// Bottom ring: poly[i] + layerIdx       * LAYER_H * vertNormals[i]
+// Top ring:    poly[i] + (layerIdx + 1) * LAYER_H * vertNormals[i]
+//
+// Adjacent tiles share the same face-centroid vertices → same per-vertex normals
+// → rings expand at the same rate in the same direction → shell closes seamlessly.
+function buildPrismMesh(tile, tileIdx, layerIdx){
+  const poly=tile.polygon, N=poly.length;
+  const vn=tile.vertNormals;
+  const y0=layerIdx*LAYER_H, y1=(layerIdx+1)*LAYER_H;
+
+  const bot=poly.map((p,i)=>p.clone().addScaledVector(vn[i],y0));
+  const top=poly.map((p,i)=>p.clone().addScaledVector(vn[i],y1));
+  const capTop=tile.center.clone().addScaledVector(tile.normal,y1);
+  const capBot=tile.center.clone().addScaledVector(tile.normal,y0);
+
+  // Vertex buffer: [0..N-1]=bot, [N..2N-1]=top, [2N]=capTop, [2N+1]=capBot
+  const pos=[];
+  bot.forEach(v=>pos.push(v.x,v.y,v.z));
+  top.forEach(v=>pos.push(v.x,v.y,v.z));
+  pos.push(capTop.x,capTop.y,capTop.z);
+  pos.push(capBot.x,capBot.y,capBot.z);
+  const CT=2*N, CB=2*N+1;
+
+  const idx=[];
+  // Top cap
+  for(let i=0;i<N;i++) idx.push(CT, N+i, N+(i+1)%N);
+  // Bottom cap (reversed winding — face inward)
+  for(let i=0;i<N;i++) idx.push(CB, (i+1)%N, i);
+  // Sides
+  for(let i=0;i<N;i++){
+    const a=i, b=(i+1)%N;
+    idx.push(a,b,N+b,  a,N+b,N+a);
+  }
+
+  const geo=new THREE.BufferGeometry();
+  geo.setAttribute('position',new THREE.Float32BufferAttribute(pos,3));
+  geo.setIndex(idx);
+  geo.computeVertexNormals();
+
+  const t=layerIdx/(MAX_SHELLS-1);
+  const hue=0.53-t*0.04, lig=0.10+t*0.55;
+  const col=new THREE.Color().setHSL(hue,0.88,lig);
+  const emi=new THREE.Color().setHSL(hue,0.9,lig*0.14);
+
+  const mat=new THREE.MeshPhongMaterial({
+    color:col, emissive:emi,
+    specular:new THREE.Color(0.3,0.8,1.0),
+    shininess:220, side:THREE.DoubleSide,
+    transparent:true, opacity:0.97,
+  });
+
+  const mesh=new THREE.Mesh(geo,mat);
+  mesh.userData={isPrism:true, tileIdx, layerIdx,
+                 normal:tile.normal.clone(), isPentagon:tile.isPentagon};
+  return mesh;
+}
+
+// ═══════════════ SCENE OBJECTS ════════════════════════════════════════════════
+scene.add(new THREE.AmbientLight(0x060c20,2.8));
+const sun=new THREE.DirectionalLight(0x88ccff,2.2); sun.position.set(7,10,5); scene.add(sun);
+const rim=new THREE.DirectionalLight(0x2af0c8,0.8); rim.position.set(-6,-2,-7); scene.add(rim);
+const fil=new THREE.DirectionalLight(0x2244bb,0.45); fil.position.set(0,-9,3); scene.add(fil);
+const grid=new THREE.GridHelper(24,48,0x060d20,0x050a18); grid.position.y=-3.2; scene.add(grid);
+
+// Ghost ellipsoid inner shell
+{
+  const sg=new THREE.SphereGeometry(1,64,48), sp=sg.attributes.position;
+  for(let i=0;i<sp.count;i++) sp.setXYZ(i,sp.getX(i)*A,sp.getY(i)*B,sp.getZ(i)*C);
+  sp.needsUpdate=true;
+  scene.add(new THREE.Mesh(sg,new THREE.MeshBasicMaterial({
+    color:0x040a18,transparent:true,opacity:0.4,side:THREE.BackSide
+  })));
+}
+
+// ═══════════════ BUILD TILES ══════════════════════════════════════════════════
+const {verts,faces}=buildGeodesic(SUB);
+const tiles=buildDualTiles(verts,faces);
+tiles.forEach((t,i)=>t._idx=i);
+
+const tileMeshes=tiles.map(createTileMesh);
+const tileGroup=new THREE.Group();
+tileMeshes.forEach(m=>tileGroup.add(m));
+scene.add(tileGroup);
+
+const [hexEdges,pentEdges]=buildEdgeLines(tiles);
+scene.add(hexEdges); scene.add(pentEdges);
+
+document.getElementById('v-hex').textContent  = tiles.filter(t=>!t.isPentagon).length;
+document.getElementById('v-pent').textContent = tiles.filter(t=> t.isPentagon).length;
+
+// ═══════════════ SHELL STATE ══════════════════════════════════════════════════
+// prismMap[tileIdx][layerIdx] = Mesh  (deleted on carve)
+const prismGroup=new THREE.Group(); scene.add(prismGroup);
+const prismMap=Object.fromEntries(tiles.map((_,i)=>[i,{}]));
+let shellCount=0;
+
+function countPresent(){
+  let n=0;
+  Object.values(prismMap).forEach(bl=>Object.values(bl).forEach(m=>{if(m)n++;}));
+  return n;
+}
+
+function addShell(){
+  if(shellCount>=MAX_SHELLS) return;
+  const li=shellCount;
+  tiles.forEach((tile,ti)=>{
+    if(prismMap[ti][li]) return;
+    const mesh=buildPrismMesh(tile,ti,li);
+    prismGroup.add(mesh);
+    prismMap[ti][li]=mesh;
+  });
+  shellCount++;
+  refreshHUD();
+  flash('SHELL '+shellCount,'#2af0c8');
+}
+
+function carveVoxel(mesh){
+  const {tileIdx:ti,layerIdx:li,normal,isPentagon}=mesh.userData;
+  prismGroup.remove(mesh);
+  mesh.geometry.dispose(); mesh.material.dispose();
+  delete prismMap[ti][li];
+  refreshHUD(ti,li,normal,isPentagon);
+  flash('−1','#ff5555');
+}
+
+function refreshHUD(ti,li,norm,isPent){
+  const present=countPresent();
+  const total=shellCount*tiles.length;
+  const removed=total-present;
+  const pct=total>0?Math.round(present/total*100):0;
+  document.getElementById('v-shells').textContent  = shellCount+' / '+MAX_SHELLS;
+  document.getElementById('v-present').textContent = present;
+  document.getElementById('v-removed').textContent = removed;
+  document.getElementById('v-coverage').textContent= pct+'%';
+  document.getElementById('v-prog').style.width    = pct+'%';
+  if(ti!==undefined){
+    document.getElementById('hit-card').style.display='block';
+    document.getElementById('v-type').textContent  = isPent?'Pentagon':'Hexagon';
+    document.getElementById('v-layer').textContent = 'Layer '+(li+1);
+    document.getElementById('v-normal').textContent=
+      `nx ${norm.x.toFixed(4)}\nny ${norm.y.toFixed(4)}\nnz ${norm.z.toFixed(4)}`;
+  }
+}
+
+// ═══════════════ FLASH ════════════════════════════════════════════════════════
+function flash(txt,col){
+  const el=document.getElementById('flash');
+  el.textContent=txt; el.style.color=col; el.style.opacity='1';
+  clearTimeout(el._t); el._t=setTimeout(()=>{el.style.opacity='0';},700);
+}
+
+// ═══════════════ BUTTONS ══════════════════════════════════════════════════════
+document.getElementById('btn-add').addEventListener('click',addShell);
+
+document.getElementById('btn-clear').addEventListener('click',()=>{
+  Object.values(prismMap).forEach(bl=>Object.entries(bl).forEach(([k,m])=>{
+    if(!m) return;
+    prismGroup.remove(m); m.geometry.dispose(); m.material.dispose();
+    delete bl[k];
+  }));
+  shellCount=0;
+  document.getElementById('hit-card').style.display='none';
+  refreshHUD(); flash('CLEARED','#ffaa44');
+});
+
+let pentVisible=true;
+document.getElementById('btn-pent').addEventListener('click',function(){
+  pentVisible=!pentVisible;
+  tiles.forEach((t,i)=>{ if(t.isPentagon) tileMeshes[i].visible=pentVisible; });
+  pentEdges.visible=pentVisible;
+  Object.entries(prismMap).forEach(([ti,bl])=>{
+    if(!tiles[+ti].isPentagon) return;
+    Object.values(bl).forEach(m=>{ if(m) m.visible=pentVisible; });
+  });
+  this.classList.toggle('on',pentVisible);
+});
+
+let xray=false;
+document.getElementById('btn-xray').addEventListener('click',function(){
+  xray=!xray;
+  tileMeshes.forEach(m=>{
+    m.material.transparent=true; m.material.opacity=xray?0.12:1.0;
+    m.material.needsUpdate=true;
+  });
+  Object.values(prismMap).forEach(bl=>Object.values(bl).forEach(m=>{
+    if(!m) return;
+    m.material.transparent=true; m.material.opacity=xray?0.15:0.97;
+    m.material.needsUpdate=true;
+  }));
+  this.classList.toggle('on',xray);
+});
+
+// ═══════════════ ORBIT / PAN / ZOOM ══════════════════════════════════════════
+let sph={theta:0.4,phi:1.1,r:10};
+let pan=new THREE.Vector3();
+function applyCam(){
+  const {theta,phi,r}=sph;
+  camera.position.set(
+    r*Math.sin(phi)*Math.sin(theta)+pan.x,
+    r*Math.cos(phi)+pan.y,
+    r*Math.sin(phi)*Math.cos(theta)+pan.z
+  );
+  camera.lookAt(pan);
+}
+applyCam();
+
+let mDown=false,isRMB=false,lastM={x:0,y:0},startM={x:0,y:0},wasDrag=false;
+let autoRot=true,lastAct=Date.now();
+
+renderer.domElement.addEventListener('contextmenu',e=>e.preventDefault());
+renderer.domElement.addEventListener('mousedown',e=>{
+  mDown=true; isRMB=e.button===2;
+  lastM=startM={x:e.clientX,y:e.clientY};
+  wasDrag=false; autoRot=false; lastAct=Date.now();
+});
+window.addEventListener('mousemove',e=>{
+  if(!mDown) return;
+  const dx=e.clientX-lastM.x, dy=e.clientY-lastM.y;
+  if(Math.abs(e.clientX-startM.x)>4||Math.abs(e.clientY-startM.y)>4) wasDrag=true;
+  if(isRMB){
+    const r=new THREE.Vector3();
+    camera.getWorldDirection(r); r.cross(new THREE.Vector3(0,1,0)).normalize();
+    pan.addScaledVector(r,-dx*0.005);
+    pan.y+=dy*0.005;
+  } else {
+    sph.theta-=dx*0.007;
+    sph.phi=Math.max(0.04,Math.min(Math.PI-0.04,sph.phi+dy*0.007));
+  }
+  applyCam(); lastM={x:e.clientX,y:e.clientY};
+});
+window.addEventListener('mouseup',()=>{mDown=false;});
+renderer.domElement.addEventListener('wheel',e=>{
+  sph.r=Math.max(3,Math.min(22,sph.r+e.deltaY*0.009));
+  applyCam(); autoRot=false; lastAct=Date.now();
+},{passive:true});
+
+// ═══════════════ RAYCASTING ═══════════════════════════════════════════════════
+const RC=new THREE.Raycaster(), ndc=new THREE.Vector2();
+
+window.addEventListener('mouseup',e=>{
+  if(wasDrag) return;
+  ndc.set((e.clientX/innerWidth)*2-1,-(e.clientY/innerHeight)*2+1);
+  RC.setFromCamera(ndc,camera);
+
+  if(e.button===2){
+    // RMB click → carve the top-most hit prism
+    const prisms=[];
+    Object.values(prismMap).forEach(bl=>Object.values(bl).forEach(m=>{if(m&&m.visible) prisms.push(m);}));
+    const hits=RC.intersectObjects(prisms,false);
+    if(hits.length>0) carveVoxel(hits[0].object);
+  }
+});
+
+// ═══════════════ RENDER ═══════════════════════════════════════════════════════
+const clk=new THREE.Clock();
+(function animate(){
+  requestAnimationFrame(animate);
+  const dt=clk.getDelta();
+  if(!autoRot&&Date.now()-lastAct>7000) autoRot=true;
+  if(autoRot&&!mDown){sph.theta+=dt*0.04;applyCam();}
+  renderer.render(scene,camera);
+})();
+
+window.addEventListener('resize',()=>{
+  camera.aspect=innerWidth/innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth,innerHeight);
+});
+</script>
+</body>
+</html>

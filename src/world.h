@@ -33,6 +33,9 @@ bool world_list_save(const WorldList* list);
 // Create a new world (generates ID, names it "World N", creates dirs). Returns index.
 int  world_create_new(WorldList* list);
 
+// Delete a world by index (removes files + shifts list). Returns true on success.
+bool world_delete(WorldList* list, int index);
+
 // Path helpers — write into caller-provided buffers
 void world_get_dir(const WorldMeta* w, char* out, int size);
 void world_get_edits_dir(const WorldMeta* w, char* out, int size);
