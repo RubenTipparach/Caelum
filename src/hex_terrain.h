@@ -248,4 +248,7 @@ void hex_terrain_hex_to_world(const HexTerrain* ht, int gcol, int grow, int laye
                                float* out_x, float* out_y, float* out_z,
                                float* out_up_x, float* out_up_y, float* out_up_z);
 
+// Debug: print local voxel grid + collision state around world_pos to stdout.
+void hex_terrain_debug_dump(const HexTerrain* ht, HMM_Vec3 world_pos, float eye_height);
+
 #endif

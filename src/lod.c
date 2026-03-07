@@ -1307,13 +1307,15 @@ static void generate_hex_mesh_for_moon(
             HMM_Vec3 cdir = vec3_normalize(
                 vec3_add(center_scaled,
                     vec3_add(vec3_scale(east, hx), vec3_scale(north, hz))));
-            HMM_Vec3 local_up = cdir;
+            HMM_Vec3 local_up = moon_ellipsoid_normal(moon_shape, cdir);
 
             float cell_ellip_r = moon_ellipsoid_radius(moon_shape, cdir);
-            float cap_r = cell_ellip_r + (float)h + LOD_HEX_SURFACE_BIAS;
+            float cap_h = (float)h + LOD_HEX_SURFACE_BIAS;
 
             HMM_Vec3 hex_v[6];
             HMM_Vec3 hex_dirs[6];
+            HMM_Vec3 hex_surface[6];
+            HMM_Vec3 hex_normals[6];
             LodHexUV hex_uvs[6];
             for (int i = 0; i < 6; i++) {
                 float vx = hx + LOD_HEX_RADIUS * LOD_HEX_COS[i];
@@ -1321,7 +1323,9 @@ static void generate_hex_mesh_for_moon(
                 hex_dirs[i] = vec3_normalize(
                     vec3_add(center_scaled,
                         vec3_add(vec3_scale(east, vx), vec3_scale(north, vz))));
-                hex_v[i] = vec3_scale(hex_dirs[i], cap_r);
+                hex_surface[i] = vec3_scale(hex_dirs[i], moon_ellipsoid_radius(moon_shape, hex_dirs[i]));
+                hex_normals[i] = moon_ellipsoid_normal(moon_shape, hex_dirs[i]);
+                hex_v[i] = vec3_add(hex_surface[i], vec3_scale(hex_normals[i], cap_h));
                 hex_uvs[i] = lod_hex_top_uv(vx, vz, hx, hz, cap_atlas_idx);
             }
 
@@ -1361,13 +1365,13 @@ static void generate_hex_mesh_for_moon(
                     wall_bottom = wall_top - LOD_HEX_MAX_WALL;
 
                 for (int layer = wall_bottom; layer < wall_top; layer++) {
-                    float bot_r = cell_ellip_r + (float)layer + LOD_HEX_SURFACE_BIAS;
-                    float top_r = cell_ellip_r + (float)(layer + 1) + LOD_HEX_SURFACE_BIAS;
+                    float bot_h = (float)layer + LOD_HEX_SURFACE_BIAS;
+                    float top_h_w = (float)(layer + 1) + LOD_HEX_SURFACE_BIAS;
 
-                    HMM_Vec3 p0_bot = vec3_scale(hex_dirs[vi0], bot_r);
-                    HMM_Vec3 p1_bot = vec3_scale(hex_dirs[vi1], bot_r);
-                    HMM_Vec3 p0_top = vec3_scale(hex_dirs[vi0], top_r);
-                    HMM_Vec3 p1_top = vec3_scale(hex_dirs[vi1], top_r);
+                    HMM_Vec3 p0_bot = vec3_add(hex_surface[vi0], vec3_scale(hex_normals[vi0], bot_h));
+                    HMM_Vec3 p1_bot = vec3_add(hex_surface[vi1], vec3_scale(hex_normals[vi1], bot_h));
+                    HMM_Vec3 p0_top = vec3_add(hex_surface[vi0], vec3_scale(hex_normals[vi0], top_h_w));
+                    HMM_Vec3 p1_top = vec3_add(hex_surface[vi1], vec3_scale(hex_normals[vi1], top_h_w));
 
                     float wall_y = (float)layer + 0.5f;
                     float surface_h = (float)h;
@@ -1951,9 +1955,10 @@ static float patch_center_distance(const LodTree* tree, const LodNode* node) {
 static bool should_split(const LodTree* tree, const LodNode* node) {
     if (node->depth >= tree->max_depth_effective) return false;
 
-    // For the planet, don't split to hex-voxel depth — hex_terrain system handles close-range detail.
-    // For moons, max_depth_effective is already capped appropriately.
-    if (tree->body_type == LOD_BODY_PLANET && node->depth + 1 >= tree->max_depth_effective) return false;
+    // Don't split to hex-voxel depth — hex_terrain system handles close-range detail.
+    // This applies to both planet and moons: LOD provides smooth/coarse patches,
+    // hex_terrain renders detailed voxel hex mesh on top with depth bias.
+    if (node->depth + 1 >= tree->max_depth_effective) return false;
 
     float dist = patch_center_distance(tree, node);
     float patch_arc = tree->depth_arc[node->depth];
@@ -2123,11 +2128,15 @@ void lod_tree_update(LodTree* tree, HMM_Vec3 camera_pos, HMM_Mat4 view_proj) {
         bool need_reanchor = !tree->hex_frame_valid;
         if (!need_reanchor) {
             float d = vec3_dot(cam_dir, tree->hex_frame_origin);
-            // Scale threshold so ~2km surface distance triggers reanchor regardless of body radius
+            // Reanchor distance: ~10% of circumference, clamped [500m, 2000m].
+            // Planet (r=796km): 2000m.  Small moon (r=5km): ~3.1km→2000m.
             // cos(theta) ≈ 1 - theta²/2, theta = dist/R → cos ≈ 1 - dist²/(2R²)
             float R = tree->planet_radius;
-            float reanchor_cos = 1.0f - (2000.0f * 2000.0f) / (2.0f * R * R);
-            if (reanchor_cos < 0.9f) reanchor_cos = 0.9f;  // safety clamp for tiny bodies
+            float dist = R * 0.628f;
+            if (dist < 500.0f)  dist = 500.0f;
+            if (dist > 2000.0f) dist = 2000.0f;
+            float reanchor_cos = 1.0f - (dist * dist) / (2.0f * R * R);
+            if (reanchor_cos < 0.9f) reanchor_cos = 0.9f;  // safety clamp
             if (d < reanchor_cos) need_reanchor = true;
         }
         if (need_reanchor) {

@@ -124,6 +124,9 @@ static float menu_mouse_y = 0;
 // World select state
 static int ws_hover = -1;
 static int ws_pressed = -1;
+static int ws_del_hover = -1;   // delete X button hover
+static int ws_del_pressed = -1; // delete X button pressed
+static int ws_confirm_del = -1; // index awaiting confirmation (-1 = none)
 
 // Spawn select state
 static int sp_hover = -1;
@@ -495,10 +498,29 @@ static void frame(void) {
         float btn_w = 28.0f * char_px;
         float btn_y0 = title_y + 2.0f * char_px;
 
-        ws_hover = hit_test_buttons(total_btns, btn_w, btn_h, btn_gap,
-                                     margin_x, btn_y0, menu_mouse_x, menu_mouse_y);
+        // Delete X: 1-char wide hit area, right-aligned inside button
+        float del_w = 2.0f * char_px;  // wider hit area for comfort
+        float del_x0 = margin_x + btn_w - del_w - char_px * 0.5f;
 
-        // Draw button rects (reuse helper but with green tint for [New World])
+        // Hit-test delete buttons first (only for existing worlds, not [New World])
+        ws_del_hover = -1;
+        for (int i = 0; i < app.world_list.count; i++) {
+            float by = btn_y0 + i * (btn_h + btn_gap);
+            if (menu_mouse_x >= del_x0 && menu_mouse_x < del_x0 + del_w &&
+                menu_mouse_y >= by && menu_mouse_y < by + btn_h) {
+                ws_del_hover = i;
+                break;
+            }
+        }
+
+        // If hovering delete button, don't highlight the row button
+        if (ws_del_hover >= 0)
+            ws_hover = -1;
+        else
+            ws_hover = hit_test_buttons(total_btns, btn_w, btn_h, btn_gap,
+                                         margin_x, btn_y0, menu_mouse_x, menu_mouse_y);
+
+        // Draw button rects
         sgl_defaults();
         sgl_matrix_mode_projection();
         sgl_load_identity();
@@ -510,11 +532,13 @@ static void frame(void) {
             bool is_pressed = (ws_pressed == i && ws_hover == i);
             bool is_hovered = (ws_hover == i);
             bool is_new = (i == app.world_list.count);
+            bool is_confirming = (ws_confirm_del == i);
             float x0 = margin_x, y0 = btn_y0 + i * (btn_h + btn_gap);
             float x1 = x0 + btn_w, y1 = y0 + btn_h;
 
             float fr, fg, fb, fa;
-            if (is_pressed)      { fr = 0.25f; fg = 0.25f; fb = 0.3f; fa = 0.9f; }
+            if (is_confirming)   { fr = 0.25f; fg = 0.05f; fb = 0.05f; fa = 0.9f; }
+            else if (is_pressed) { fr = 0.25f; fg = 0.25f; fb = 0.3f; fa = 0.9f; }
             else if (is_hovered) { fr = is_new ? 0.08f : 0.12f; fg = is_new ? 0.18f : 0.14f; fb = 0.2f; fa = 0.8f; }
             else                 { fr = 0.08f; fg = 0.08f; fb = 0.12f; fa = 0.6f; }
             sgl_begin_quads();
@@ -523,7 +547,9 @@ static void frame(void) {
             sgl_end();
 
             float br, bg_, bb;
-            if (is_new) {
+            if (is_confirming) {
+                br = 0.8f; bg_ = 0.2f; bb = 0.2f;
+            } else if (is_new) {
                 if (is_pressed)      { br = 0.5f; bg_ = 1.0f; bb = 0.5f; }
                 else if (is_hovered) { br = 0.3f; bg_ = 1.0f; bb = 0.3f; }
                 else                 { br = 0.2f; bg_ = 0.5f; bb = 0.2f; }
@@ -540,6 +566,7 @@ static void frame(void) {
             sgl_v2f(x0, y0); sgl_v2f(x0 + bw, y0); sgl_v2f(x0 + bw, y1); sgl_v2f(x0, y1);
             sgl_v2f(x1 - bw, y0); sgl_v2f(x1, y0); sgl_v2f(x1, y1); sgl_v2f(x1 - bw, y1);
             sgl_end();
+
         }
         sgl_draw();
 
@@ -554,16 +581,32 @@ static void frame(void) {
         for (int i = 0; i < total_btns; i++) {
             bool pressed = (ws_pressed == i && ws_hover == i);
             bool hovered = (ws_hover == i);
+            bool confirming = (ws_confirm_del == i);
             float by = btn_y0 + i * (btn_h + btn_gap);
             float tx = margin_x + 2.0f * char_px;
             float ty = by + (btn_h - char_px) * 0.5f;
             sdtx_pos(tx / char_px, ty / char_px);
 
             if (i < app.world_list.count) {
-                if (pressed)      sdtx_color3f(1.0f, 1.0f, 1.0f);
-                else if (hovered) sdtx_color3f(1.0f, 1.0f, 0.3f);
-                else              sdtx_color3f(0.6f, 0.6f, 0.6f);
-                sdtx_puts(app.world_list.worlds[i].name);
+                if (confirming) {
+                    sdtx_color3f(1.0f, 0.3f, 0.3f);
+                    sdtx_printf("Delete %s? [Y/N]", app.world_list.worlds[i].name);
+                } else {
+                    if (pressed)      sdtx_color3f(1.0f, 1.0f, 1.0f);
+                    else if (hovered) sdtx_color3f(1.0f, 1.0f, 0.3f);
+                    else              sdtx_color3f(0.6f, 0.6f, 0.6f);
+                    sdtx_puts(app.world_list.worlds[i].name);
+
+                    // Red X delete button (text)
+                    bool del_hov = (ws_del_hover == i);
+                    bool del_press = (ws_del_pressed == i && del_hov);
+                    float xtx = del_x0 + (del_w - char_px) * 0.5f;
+                    sdtx_pos(xtx / char_px, ty / char_px);
+                    if (del_press)        sdtx_color3f(1.0f, 0.2f, 0.2f);
+                    else if (del_hov)     sdtx_color3f(1.0f, 0.4f, 0.4f);
+                    else                  sdtx_color3f(0.5f, 0.15f, 0.15f);
+                    sdtx_putc('X');
+                }
             } else {
                 if (pressed)      sdtx_color3f(0.5f, 1.0f, 0.5f);
                 else if (hovered) sdtx_color3f(0.3f, 1.0f, 0.3f);
@@ -1289,17 +1332,40 @@ static void event(const sapp_event* ev) {
 
     // ---- STATE_WORLD_SELECT ----
     if (app.state == STATE_WORLD_SELECT) {
+        // Confirmation mode: Y to delete, N/ESC to cancel
+        if (ws_confirm_del >= 0) {
+            if (ev->type == SAPP_EVENTTYPE_KEY_DOWN) {
+                if (ev->key_code == SAPP_KEYCODE_Y) {
+                    world_delete(&app.world_list, ws_confirm_del);
+                    ws_confirm_del = -1;
+                } else if (ev->key_code == SAPP_KEYCODE_N ||
+                           ev->key_code == SAPP_KEYCODE_ESCAPE) {
+                    ws_confirm_del = -1;
+                }
+            }
+            return;
+        }
+
         if (ev->type == SAPP_EVENTTYPE_KEY_DOWN && ev->key_code == SAPP_KEYCODE_ESCAPE) {
             app.state = app.is_multiplayer ? STATE_MULTI_MENU : STATE_MENU;
             return;
         }
         if ((ev->type == SAPP_EVENTTYPE_MOUSE_DOWN &&
              ev->mouse_button == SAPP_MOUSEBUTTON_LEFT) || touch_began) {
-            ws_pressed = ws_hover;
+            if (ws_del_hover >= 0)
+                ws_del_pressed = ws_del_hover;
+            else
+                ws_pressed = ws_hover;
             return;
         }
         if ((ev->type == SAPP_EVENTTYPE_MOUSE_UP &&
              ev->mouse_button == SAPP_MOUSEBUTTON_LEFT) || touch_ended) {
+            // Delete X button released
+            if (ws_del_pressed >= 0 && ws_del_pressed == ws_del_hover) {
+                ws_confirm_del = ws_del_pressed;
+            }
+            ws_del_pressed = -1;
+            // World button released
             if (ws_pressed >= 0 && ws_pressed == ws_hover) {
                 world_select_activate(ws_pressed);
             }
@@ -1599,6 +1665,80 @@ static void event(const sapp_event* ev) {
             }
         }
     }
+    // F key: toggle continuous movement diagnostic (ground mode only)
+    if (ev->type == SAPP_EVENTTYPE_KEY_DOWN && ev->key_code == SAPP_KEYCODE_F &&
+        !app.camera.space_mode && app.camera.mouse_locked) {
+        app.camera.move_debug = !app.camera.move_debug;
+        printf("[MOVE_DEBUG] %s\n", app.camera.move_debug ? "ON" : "OFF");
+        fflush(stdout);
+        // Also dump snapshot on enable
+        if (app.camera.move_debug) {
+            hex_terrain_debug_dump(&app.renderer.hex_terrain, app.camera.position,
+                                    app.camera.eye_height);
+        }
+    }
+
+    // G key: toggle normal debug arrows (moon only)
+    if (ev->type == SAPP_EVENTTYPE_KEY_DOWN && ev->key_code == SAPP_KEYCODE_G &&
+        app.camera.mouse_locked && app.camera.gravity_body >= 0) {
+        app.camera.show_normal_debug = !app.camera.show_normal_debug;
+        printf("[NORMAL_DEBUG] %s\n", app.camera.show_normal_debug ? "ON" : "OFF");
+        if (app.camera.show_normal_debug) {
+            const HexTerrain* ht = &app.renderer.hex_terrain;
+            const Camera* cam = &app.camera;
+            int mi = cam->gravity_body;
+            const CelestialBody* moon = &app.renderer.solar_system.moons[mi];
+
+            // Player position (moon-local, relative to ellipse center)
+            printf("[NORMAL_DEBUG] === PLAYER ===\n");
+            printf("  pos_d = (%.6f, %.6f, %.6f)  [moon-local]\n",
+                cam->pos_d[0], cam->pos_d[1], cam->pos_d[2]);
+            double pr = sqrt(cam->pos_d[0]*cam->pos_d[0] +
+                             cam->pos_d[1]*cam->pos_d[1] +
+                             cam->pos_d[2]*cam->pos_d[2]);
+            printf("  radial_dist = %.6f\n", pr);
+            HMM_Vec3 radial_dir = {{(float)(cam->pos_d[0]/pr), (float)(cam->pos_d[1]/pr), (float)(cam->pos_d[2]/pr)}};
+            float surf_r = moon_surface_radius(&moon->shape, radial_dir);
+            HMM_Vec3 surf_pt = HMM_MulV3F(radial_dir, surf_r);
+            printf("  surface_pt = (%.4f, %.4f, %.4f)  r=%.4f\n",
+                surf_pt.X, surf_pt.Y, surf_pt.Z, surf_r);
+            printf("  local_up = (%.6f, %.6f, %.6f)  [ellipsoid normal]\n",
+                cam->local_up.X, cam->local_up.Y, cam->local_up.Z);
+            printf("  gravity_center = (%.6f, %.6f, %.6f)\n",
+                cam->gravity_center_d[0], cam->gravity_center_d[1], cam->gravity_center_d[2]);
+
+            // Grid center
+            printf("[NORMAL_DEBUG] === GRID CENTER ===\n");
+            if (ht->frame_valid) {
+                float to_len = sqrtf(ht->tangent_origin.X*ht->tangent_origin.X +
+                                     ht->tangent_origin.Y*ht->tangent_origin.Y +
+                                     ht->tangent_origin.Z*ht->tangent_origin.Z);
+                printf("  tangent_origin = (%.4f, %.4f, %.4f)  r=%.4f\n",
+                    ht->tangent_origin.X, ht->tangent_origin.Y, ht->tangent_origin.Z, to_len);
+                printf("  tangent_up     = (%.6f, %.6f, %.6f)\n",
+                    ht->tangent_up.X, ht->tangent_up.Y, ht->tangent_up.Z);
+                printf("  tangent_east   = (%.6f, %.6f, %.6f)\n",
+                    ht->tangent_east.X, ht->tangent_east.Y, ht->tangent_east.Z);
+                printf("  tangent_north  = (%.6f, %.6f, %.6f)\n",
+                    ht->tangent_north.X, ht->tangent_north.Y, ht->tangent_north.Z);
+
+                // Space check: gravity_center should be (0,0,0) for moon-local
+                double gc_len = sqrt(cam->gravity_center_d[0]*cam->gravity_center_d[0] +
+                                     cam->gravity_center_d[1]*cam->gravity_center_d[1] +
+                                     cam->gravity_center_d[2]*cam->gravity_center_d[2]);
+                if (gc_len > 1.0) {
+                    printf("  *** ERROR: gravity_center is NOT at origin (%.3f) — coordinate spaces may differ! ***\n", gc_len);
+                }
+                float dot = HMM_DotV3(cam->local_up, ht->tangent_up);
+                printf("  dot(local_up, tangent_up) = %.8f  (angular diff = %.4f deg)\n",
+                    dot, acosf(fminf(fmaxf(dot, -1.0f), 1.0f)) * 57.2958f);
+            } else {
+                printf("  (hex terrain not valid)\n");
+            }
+        }
+        fflush(stdout);
+    }
+
     camera_handle_event(&app.camera, ev);
 }
 
