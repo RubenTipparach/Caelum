@@ -5,17 +5,12 @@
 #ifdef _WIN32
 #include <direct.h>
 #include <windows.h>
+#else
+#include <dirent.h>
 #endif
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
-
-#ifdef SOKOL_D3D11
-
-#include "sokol_app.h"
-
-#define COBJMACROS
-#include <d3d11.h>
 
 static int screenshot_counter = -1;  // -1 = not initialized
 
@@ -46,9 +41,50 @@ static int find_highest_screenshot(void) {
         } while (FindNextFileA(hFind, &fd));
         FindClose(hFind);
     }
+#else
+    DIR* dir = opendir("screenshots");
+    if (dir) {
+        struct dirent* ent;
+        while ((ent = readdir(dir)) != NULL) {
+            int num = 0;
+            if (sscanf(ent->d_name, "screenshot_%d.png", &num) == 1) {
+                if (num > highest) highest = num;
+            }
+        }
+        closedir(dir);
+    }
 #endif
     return highest;
 }
+
+// Save RGB buffer to numbered PNG file
+static void save_screenshot_png(unsigned char* rgb, int w, int h) {
+    ensure_screenshots_dir();
+
+    if (screenshot_counter < 0) {
+        screenshot_counter = find_highest_screenshot();
+    }
+
+    char filename[128];
+    screenshot_counter++;
+    snprintf(filename, sizeof(filename), "screenshots/screenshot_%04d.png", screenshot_counter);
+
+    int stride = w * 3;
+    if (stbi_write_png(filename, w, h, 3, rgb, stride)) {
+        printf("[SCREENSHOT] Saved %s (%dx%d)\n", filename, w, h);
+    } else {
+        printf("[SCREENSHOT] Failed: could not write %s\n", filename);
+    }
+    fflush(stdout);
+}
+
+// ---- D3D11 backend (Windows) ----
+#ifdef SOKOL_D3D11
+
+#include "sokol_app.h"
+
+#define COBJMACROS
+#include <d3d11.h>
 
 void screenshot_capture(void) {
     sapp_environment env = sapp_get_environment();
@@ -81,7 +117,6 @@ void screenshot_capture(void) {
     D3D11_TEXTURE2D_DESC desc;
     ID3D11Texture2D_GetDesc(backbuffer, &desc);
 
-    // Create staging texture for CPU readback
     D3D11_TEXTURE2D_DESC staging_desc = desc;
     staging_desc.Usage = D3D11_USAGE_STAGING;
     staging_desc.BindFlags = 0;
@@ -99,7 +134,6 @@ void screenshot_capture(void) {
         return;
     }
 
-    // If MSAA, resolve first; otherwise just copy
     if (desc.SampleDesc.Count > 1) {
         D3D11_TEXTURE2D_DESC resolve_desc = desc;
         resolve_desc.SampleDesc.Count = 1;
@@ -132,7 +166,6 @@ void screenshot_capture(void) {
 
     ID3D11Texture2D_Release(backbuffer);
 
-    // Map the staging texture
     D3D11_MAPPED_SUBRESOURCE mapped;
     hr = ID3D11DeviceContext_Map(context, (ID3D11Resource*)staging, 0,
         D3D11_MAP_READ, 0, &mapped);
@@ -146,7 +179,6 @@ void screenshot_capture(void) {
     int w = (int)desc.Width;
     int h = (int)desc.Height;
 
-    // Convert to RGB (top-down, for stbi_write_png)
     unsigned char* rgb = (unsigned char*)malloc((size_t)w * h * 3);
     const unsigned char* src = (const unsigned char*)mapped.pData;
 
@@ -156,14 +188,13 @@ void screenshot_capture(void) {
             unsigned char* dst = &rgb[(y * w + x) * 3];
             if (desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM ||
                 desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) {
-                dst[0] = row[x * 4 + 0]; // R
-                dst[1] = row[x * 4 + 1]; // G
-                dst[2] = row[x * 4 + 2]; // B
+                dst[0] = row[x * 4 + 0];
+                dst[1] = row[x * 4 + 1];
+                dst[2] = row[x * 4 + 2];
             } else {
-                // B8G8R8A8: swap R and B
-                dst[0] = row[x * 4 + 2]; // R
-                dst[1] = row[x * 4 + 1]; // G
-                dst[2] = row[x * 4 + 0]; // B
+                dst[0] = row[x * 4 + 2];
+                dst[1] = row[x * 4 + 1];
+                dst[2] = row[x * 4 + 0];
             }
         }
     }
@@ -171,31 +202,31 @@ void screenshot_capture(void) {
     ID3D11DeviceContext_Unmap(context, (ID3D11Resource*)staging, 0);
     ID3D11Texture2D_Release(staging);
 
-    // Write PNG to screenshots/ folder
-    ensure_screenshots_dir();
-
-    // On first capture, find the highest existing screenshot number
-    if (screenshot_counter < 0) {
-        screenshot_counter = find_highest_screenshot();
-    }
-
-    char filename[128];
-    screenshot_counter++;
-    snprintf(filename, sizeof(filename), "screenshots/screenshot_%04d.png", screenshot_counter);
-
-    int stride = w * 3;
-    if (stbi_write_png(filename, w, h, 3, rgb, stride)) {
-        printf("[SCREENSHOT] Saved %s (%dx%d)\n", filename, w, h);
-    } else {
-        printf("[SCREENSHOT] Failed: could not write %s\n", filename);
-    }
-    fflush(stdout);
-
+    save_screenshot_png(rgb, w, h);
     free(rgb);
 }
 
+// ---- Metal backend (macOS) ----
+#elif defined(SOKOL_METAL)
+
+// Implemented in screenshot_metal.m (Objective-C)
+extern unsigned char* screenshot_metal_capture(int* out_w, int* out_h);
+
+void screenshot_capture(void) {
+    int w = 0, h = 0;
+    unsigned char* rgb = screenshot_metal_capture(&w, &h);
+    if (!rgb) {
+        printf("[SCREENSHOT] Failed: could not capture Metal framebuffer\n");
+        fflush(stdout);
+        return;
+    }
+
+    save_screenshot_png(rgb, w, h);
+    free(rgb);
+}
+
+// ---- Other backends: no-op ----
 #else
-// Non-D3D11 backends: no-op
 void screenshot_capture(void) {
     printf("[SCREENSHOT] Not implemented on this backend\n");
     fflush(stdout);

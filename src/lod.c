@@ -716,12 +716,13 @@ static void lod_emit_tri(LodVertex** verts, int* count, int* cap,
 // ---- Hex grid mesh generation for depth-13 LOD nodes ----
 
 // Texture atlas mapping (must match hex_terrain.c)
-#define LOD_HEX_ATLAS_TILES 9
+#define LOD_HEX_ATLAS_TILES 11
 #define LOD_ATLAS_WATER  0
 #define LOD_ATLAS_SAND   1
 #define LOD_ATLAS_GRASS  3
 #define LOD_ATLAS_STONE  4
 #define LOD_ATLAS_ICE    5
+#define LOD_ATLAS_MOON   10
 
 static int lod_hex_atlas(float height_m) {
     float rel = height_m - TERRAIN_SEA_LEVEL_M;
@@ -790,6 +791,7 @@ static int lod_side_atlas(int cap_atlas) {
 }
 
 static int lod_wall_atlas(int cap_atlas, float surface_h, float wall_y) {
+    if (cap_atlas == LOD_ATLAS_MOON) return LOD_ATLAS_MOON;
     float depth = surface_h - wall_y;
     if (depth < 1.0f) return lod_side_atlas(cap_atlas);
     if (depth < 3.0f) return LOD_ATLAS_DIRT;
@@ -1141,6 +1143,261 @@ static void generate_hex_mesh_for_triangle(
     #undef HEX_POS
 }
 
+// Moon variant: hex grid using moon_surface_radius() for height and MoonColorPalette for color.
+// Same tangent frame + hex grid structure as planet version, different terrain sampling.
+static void generate_hex_mesh_for_moon(
+    const SphericalTriangle* tri, float body_radius,
+    const MoonShapeParams* moon_shape, const MoonColorPalette* moon_palette,
+    int seed,
+    HMM_Vec3 hex_origin, HMM_Vec3 hex_east, HMM_Vec3 hex_north,
+    HexVertex** out_vertices, int* out_count)
+{
+    (void)body_radius;  // Use base_radius for consistent height math
+    float base_r = moon_shape->base_radius;
+
+    HMM_Vec3 center = hex_origin;
+    HMM_Vec3 east = hex_east;
+    HMM_Vec3 north = hex_north;
+
+    // Project triangle vertices to 2D tangent plane (using base_radius for consistency)
+    float tvx[3], tvz[3];
+    HMM_Vec3 verts[3] = { tri->v0, tri->v1, tri->v2 };
+    for (int i = 0; i < 3; i++) {
+        float dot_vc = vec3_dot(verts[i], center);
+        HMM_Vec3 offset = vec3_sub(verts[i], vec3_scale(center, dot_vc));
+        tvx[i] = vec3_dot(offset, east) * base_r;
+        tvz[i] = vec3_dot(offset, north) * base_r;
+    }
+
+    float margin = LOD_HEX_RADIUS * 1.5f;
+    float min_x = fminf(tvx[0], fminf(tvx[1], tvx[2])) - margin;
+    float max_x = fmaxf(tvx[0], fmaxf(tvx[1], tvx[2])) + margin;
+    float min_z = fminf(tvz[0], fminf(tvz[1], tvz[2])) - margin;
+    float max_z = fmaxf(tvz[0], fmaxf(tvz[1], tvz[2])) + margin;
+
+    fnl_state cnoise = create_color_noise(seed);
+    HMM_Vec3 center_scaled = vec3_scale(center, base_r);
+
+    int col_min = (int)floorf(min_x / LOD_HEX_COL_SPACING);
+    int col_max = (int)ceilf(max_x / LOD_HEX_COL_SPACING);
+    int row_min = (int)floorf(min_z / LOD_HEX_ROW_SPACING) - 1;
+    int row_max = (int)ceilf(max_z / LOD_HEX_ROW_SPACING) + 1;
+
+    #define HEX_POS_M(col, row, hx, hz) do { \
+        (hx) = (float)(col) * LOD_HEX_COL_SPACING; \
+        (hz) = (((col) & 1) ? ((row) + 0.5f) : (float)(row)) * LOD_HEX_ROW_SPACING; \
+    } while(0)
+
+    // Phase 1: Build height map using moon noise
+    int grid_cols = col_max - col_min + 1;
+    int grid_rows = row_max - row_min + 1;
+    int grid_size = grid_cols * grid_rows;
+    int16_t* hm_heights = (int16_t*)malloc(grid_size * sizeof(int16_t));
+    uint8_t* hm_atlas = (uint8_t*)malloc(grid_size * sizeof(uint8_t));
+    HMM_Vec3* hm_colors = (HMM_Vec3*)malloc(grid_size * sizeof(HMM_Vec3));
+    for (int i = 0; i < grid_size; i++) {
+        hm_heights[i] = INT16_MIN;
+    }
+
+    for (int col = col_min; col <= col_max; col++) {
+        for (int row = row_min; row <= row_max; row++) {
+            float hx, hz;
+            HEX_POS_M(col, row, hx, hz);
+            if (!point_in_triangle_margin(hx, hz, tvx, tvz, margin))
+                continue;
+
+            HMM_Vec3 cdir = vec3_normalize(
+                vec3_add(center_scaled,
+                    vec3_add(vec3_scale(east, hx), vec3_scale(north, hz))));
+
+            // Moon terrain: ellipsoid + noise
+            float surface_r = moon_surface_radius(moon_shape, cdir);
+            float h_m = surface_r - base_r;
+            float eff = fmaxf(h_m, 0.0f);  // No sea level on moons
+            int h = (int)ceilf(eff);
+
+            int gi = (col - col_min) * grid_rows + (row - row_min);
+            hm_heights[gi] = (int16_t)h;
+            hm_atlas[gi] = LOD_ATLAS_MOON;  // Moon surface = moon rock
+
+            // Moon palette color based on height
+            float height_t = (surface_r - base_r * 0.9f) / (base_r * 0.2f);
+            if (height_t < 0.0f) height_t = 0.0f;
+            if (height_t > 1.0f) height_t = 1.0f;
+            HMM_Vec3 vert_color = vec3_lerp(moon_palette->shadow_color,
+                                             moon_palette->base_color, height_t);
+            vert_color = vec3_lerp(vert_color,
+                                   moon_palette->highlight_color,
+                                   height_t * height_t * 0.5f);
+            hm_colors[gi] = perturb_color(vert_color, &cnoise, cdir);
+        }
+    }
+
+    // Phase 1.5: Slope normals (identical to planet version)
+    HMM_Vec3* hm_slopes = (HMM_Vec3*)malloc(grid_size * sizeof(HMM_Vec3));
+    for (int col = col_min; col <= col_max; col++) {
+        for (int row = row_min; row <= row_max; row++) {
+            int gi = (col - col_min) * grid_rows + (row - row_min);
+            if (hm_heights[gi] == INT16_MIN) {
+                hm_slopes[gi] = center;
+                continue;
+            }
+
+            float hx, hz;
+            HEX_POS_M(col, row, hx, hz);
+            int h = hm_heights[gi];
+
+            float grad_e = 0.0f, grad_n = 0.0f;
+            int ncount = 0;
+            for (int dir = 0; dir < 6; dir++) {
+                int ncol, nrow;
+                lod_hex_neighbor(col, row, dir, &ncol, &nrow);
+                if (ncol < col_min || ncol > col_max ||
+                    nrow < row_min || nrow > row_max) continue;
+                int ni = (ncol - col_min) * grid_rows + (nrow - row_min);
+                if (hm_heights[ni] == INT16_MIN) continue;
+
+                float nhx, nhz;
+                HEX_POS_M(ncol, nrow, nhx, nhz);
+                float dx = nhx - hx;
+                float dz = nhz - hz;
+                float dh = (float)(hm_heights[ni] - h);
+                float dist_sq = dx * dx + dz * dz;
+                if (dist_sq < 0.01f) continue;
+                grad_e += dh * dx / dist_sq;
+                grad_n += dh * dz / dist_sq;
+                ncount++;
+            }
+            if (ncount > 0) {
+                grad_e /= ncount;
+                grad_n /= ncount;
+            }
+
+            HMM_Vec3 cdir = vec3_normalize(
+                vec3_add(center_scaled,
+                    vec3_add(vec3_scale(east, hx), vec3_scale(north, hz))));
+            HMM_Vec3 slope = vec3_normalize(
+                vec3_sub(cdir,
+                    vec3_add(vec3_scale(east, grad_e), vec3_scale(north, grad_n))));
+            if (vec3_dot(slope, cdir) < 0.1f) slope = cdir;
+            hm_slopes[gi] = slope;
+        }
+    }
+
+    // Phase 2: Generate cap + wall geometry (identical structure to planet)
+    int vert_cap = grid_size * 48;
+    if (vert_cap < 64) vert_cap = 64;
+    *out_vertices = (HexVertex*)malloc(vert_cap * sizeof(HexVertex));
+    *out_count = 0;
+
+    for (int col = col_min; col <= col_max; col++) {
+        for (int row = row_min; row <= row_max; row++) {
+            int gi = (col - col_min) * grid_rows + (row - row_min);
+            if (hm_heights[gi] == INT16_MIN) continue;
+
+            int h = hm_heights[gi];
+            int cap_atlas_idx = hm_atlas[gi];
+            HMM_Vec3 hex_color = hm_colors[gi];
+            HMM_Vec3 slope_normal = hm_slopes[gi];
+
+            float hx, hz;
+            HEX_POS_M(col, row, hx, hz);
+
+            HMM_Vec3 cdir = vec3_normalize(
+                vec3_add(center_scaled,
+                    vec3_add(vec3_scale(east, hx), vec3_scale(north, hz))));
+            HMM_Vec3 local_up = cdir;
+
+            float cap_r = base_r + (float)h + LOD_HEX_SURFACE_BIAS;
+
+            HMM_Vec3 hex_v[6];
+            HMM_Vec3 hex_dirs[6];
+            LodHexUV hex_uvs[6];
+            for (int i = 0; i < 6; i++) {
+                float vx = hx + LOD_HEX_RADIUS * LOD_HEX_COS[i];
+                float vz = hz + LOD_HEX_RADIUS * LOD_HEX_SIN[i];
+                hex_dirs[i] = vec3_normalize(
+                    vec3_add(center_scaled,
+                        vec3_add(vec3_scale(east, vx), vec3_scale(north, vz))));
+                hex_v[i] = vec3_scale(hex_dirs[i], cap_r);
+                hex_uvs[i] = lod_hex_top_uv(vx, vz, hx, hz, cap_atlas_idx);
+            }
+
+            // Cap triangles
+            for (int i = 0; i < 4; i++) {
+                lod_hex_emit_tri(out_vertices, out_count, &vert_cap,
+                    hex_v[0], hex_v[i + 1], hex_v[i + 2],
+                    local_up, slope_normal,
+                    hex_uvs[0], hex_uvs[i + 1], hex_uvs[i + 2],
+                    hex_color);
+            }
+
+            // Walls
+            for (int dir = 0; dir < 6; dir++) {
+                int ncol, nrow;
+                lod_hex_neighbor(col, row, dir, &ncol, &nrow);
+                if (ncol < col_min || ncol > col_max ||
+                    nrow < row_min || nrow > row_max)
+                    continue;
+                int ni = (ncol - col_min) * grid_rows + (nrow - row_min);
+                if (hm_heights[ni] == INT16_MIN) continue;
+                int nh = hm_heights[ni];
+                if (h <= nh) continue;
+
+                int edge = LOD_DIR_TO_EDGE[dir];
+                int vi0 = edge;
+                int vi1 = (edge + 1) % 6;
+
+                float mx = (LOD_HEX_COS[vi0] + LOD_HEX_COS[vi1]) * 0.5f * LOD_HEX_RADIUS;
+                float mz = (LOD_HEX_SIN[vi0] + LOD_HEX_SIN[vi1]) * 0.5f * LOD_HEX_RADIUS;
+                HMM_Vec3 wall_outward = vec3_normalize(
+                    vec3_add(vec3_scale(east, mx), vec3_scale(north, mz)));
+
+                int wall_bottom = nh;
+                int wall_top = h;
+                if (wall_top - wall_bottom > LOD_HEX_MAX_WALL)
+                    wall_bottom = wall_top - LOD_HEX_MAX_WALL;
+
+                for (int layer = wall_bottom; layer < wall_top; layer++) {
+                    float bot_r = base_r + (float)layer + LOD_HEX_SURFACE_BIAS;
+                    float top_r = base_r + (float)(layer + 1) + LOD_HEX_SURFACE_BIAS;
+
+                    HMM_Vec3 p0_bot = vec3_scale(hex_dirs[vi0], bot_r);
+                    HMM_Vec3 p1_bot = vec3_scale(hex_dirs[vi1], bot_r);
+                    HMM_Vec3 p0_top = vec3_scale(hex_dirs[vi0], top_r);
+                    HMM_Vec3 p1_top = vec3_scale(hex_dirs[vi1], top_r);
+
+                    float wall_y = (float)layer + 0.5f;
+                    float surface_h = (float)h;
+                    int wall_atlas_idx = lod_wall_atlas(cap_atlas_idx, surface_h, wall_y);
+
+                    LodHexUV wuv_bl = { (float)wall_atlas_idx / (float)LOD_HEX_ATLAS_TILES, 1.0f };
+                    LodHexUV wuv_br = { ((float)wall_atlas_idx + 1.0f) / (float)LOD_HEX_ATLAS_TILES, 1.0f };
+                    LodHexUV wuv_tl = { (float)wall_atlas_idx / (float)LOD_HEX_ATLAS_TILES, 0.0f };
+                    LodHexUV wuv_tr = { ((float)wall_atlas_idx + 1.0f) / (float)LOD_HEX_ATLAS_TILES, 0.0f };
+
+                    lod_hex_emit_tri(out_vertices, out_count, &vert_cap,
+                        p0_bot, p1_bot, p1_top,
+                        wall_outward, slope_normal,
+                        wuv_bl, wuv_br, wuv_tr,
+                        hex_color);
+                    lod_hex_emit_tri(out_vertices, out_count, &vert_cap,
+                        p0_bot, p1_top, p0_top,
+                        wall_outward, slope_normal,
+                        wuv_bl, wuv_tr, wuv_tl,
+                        hex_color);
+                }
+            }
+        }
+    }
+
+    free(hm_heights);
+    free(hm_atlas);
+    free(hm_colors);
+    free(hm_slopes);
+    #undef HEX_POS_M
+}
+
 // Generate mesh for a coarse node (tessellated spherical triangle).
 // Thread-safe: takes all inputs by value, writes to output pointers.
 static void generate_coarse_mesh_params(
@@ -1359,32 +1616,25 @@ static void mesh_gen_worker(void* data) {
     MeshGenJob* job = (MeshGenJob*)data;
 
     if (job->depth >= job->max_depth_effective) {
-        // Hex mesh: output is HexVertex[] (only for planet; moons use coarse at max depth)
+        // Hex mesh at max depth: HexVertex[] for both planet and moons
+        HexVertex* hex_verts = NULL;
+        int hex_count = 0;
         if (job->body_type == LOD_BODY_PLANET) {
-            HexVertex* hex_verts = NULL;
-            int hex_count = 0;
             generate_hex_mesh_for_triangle(
                 &job->tri, job->planet_radius, job->seed,
                 job->hex_frame_origin, job->hex_frame_east, job->hex_frame_north,
                 &hex_verts, &hex_count);
-            job->vertices = hex_verts;
-            job->vertex_count = hex_count;
-            job->vertex_stride = sizeof(HexVertex);
-            job->is_hex_mesh = true;
         } else {
-            // Moon at max depth: just use fine coarse mesh (no hex voxels)
-            LodVertex* lod_verts = NULL;
-            int lod_count = 0;
-            generate_coarse_mesh_params(
-                &job->tri, job->depth, job->max_depth_effective,
-                job->planet_radius, job->layer_thickness, job->sea_level, job->seed,
-                job->body_type, &job->moon_shape, &job->moon_palette, job->body_center_d,
-                &lod_verts, &lod_count);
-            job->vertices = lod_verts;
-            job->vertex_count = lod_count;
-            job->vertex_stride = sizeof(LodVertex);
-            job->is_hex_mesh = false;
+            generate_hex_mesh_for_moon(
+                &job->tri, job->planet_radius,
+                &job->moon_shape, &job->moon_palette, job->seed,
+                job->hex_frame_origin, job->hex_frame_east, job->hex_frame_north,
+                &hex_verts, &hex_count);
         }
+        job->vertices = hex_verts;
+        job->vertex_count = hex_count;
+        job->vertex_stride = sizeof(HexVertex);
+        job->is_hex_mesh = true;
     } else {
         // Tessellated mesh: smooth terrain (all non-hex depths)
         LodVertex* lod_verts = NULL;
@@ -1409,13 +1659,21 @@ static void mesh_gen_worker(void* data) {
 
 // Synchronous mesh generation (fallback when no job system)
 static void generate_node_mesh(LodTree* tree, LodNode* node) {
-    if (node->depth >= tree->max_depth_effective && tree->body_type == LOD_BODY_PLANET) {
+    if (node->depth >= tree->max_depth_effective) {
         HexVertex* hex_verts = NULL;
         int hex_count = 0;
-        generate_hex_mesh_for_triangle(
-            &node->tri, tree->planet_radius, tree->seed,
-            tree->hex_frame_origin, tree->hex_frame_east, tree->hex_frame_north,
-            &hex_verts, &hex_count);
+        if (tree->body_type == LOD_BODY_PLANET) {
+            generate_hex_mesh_for_triangle(
+                &node->tri, tree->planet_radius, tree->seed,
+                tree->hex_frame_origin, tree->hex_frame_east, tree->hex_frame_north,
+                &hex_verts, &hex_count);
+        } else {
+            generate_hex_mesh_for_moon(
+                &node->tri, tree->planet_radius,
+                &tree->moon_shape, &tree->moon_palette, tree->seed,
+                tree->hex_frame_origin, tree->hex_frame_east, tree->hex_frame_north,
+                &hex_verts, &hex_count);
+        }
         node->cpu_vertices = hex_verts;
         node->cpu_vertex_count = hex_count;
         node->cpu_vertex_stride = sizeof(HexVertex);

@@ -53,6 +53,24 @@ typedef struct Camera {
     float space_prev_yaw;        // yaw at last frame (for computing mouse deltas)
     float space_prev_pitch;      // pitch at last frame (for computing mouse deltas)
     bool key_q, key_e;           // roll keys
+    float mouse_dx_accum;        // accumulated mouse delta (applied once per frame)
+    float mouse_dy_accum;
+
+    // Mouse diagnostics (toggled with Alt+M)
+    bool mouse_diag_enabled;
+    int mouse_events_this_frame;  // count of MOUSE_MOVE events since last camera_update
+    uint64_t mouse_last_event_time; // timestamp of last mouse event
+    float mouse_max_gap_ms;       // largest gap between consecutive events this frame
+    float mouse_max_delta;        // largest single-event delta this frame
+    // Rolling stats for periodic log
+    int diag_frame_count;
+    int diag_total_events;
+    int diag_zero_event_frames;   // frames with no mouse events while locked
+    float diag_max_gap_ms;
+    float diag_max_delta;
+    float diag_max_accum;         // largest accumulated delta applied in one frame
+    float diag_max_frame_ms;
+
     int gravity_body;             // -1 = Tenebris, 0-9 = moon index
     double gravity_center_d[3];   // Fixed center of gravity body (latched on transition)
     float transition_alpha;       // 0.0 = space, 1.0 = grounded (lerps over 0.5s)

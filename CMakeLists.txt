@@ -3,6 +3,11 @@ project(hex-planets C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
+# macOS Metal backend requires Objective-C for Sokol
+if(APPLE)
+    enable_language(OBJC)
+endif()
+
 set(SOKOL_DIR ${CMAKE_SOURCE_DIR}/third_party/sokol)
 
 # Platform detection for Sokol backend
@@ -20,6 +25,9 @@ endif()
 add_library(sokol STATIC src/sokol_impl.c)
 target_include_directories(sokol PUBLIC ${SOKOL_DIR})
 target_compile_definitions(sokol PUBLIC ${SOKOL_BACKEND})
+if(APPLE)
+    set_source_files_properties(src/sokol_impl.c PROPERTIES LANGUAGE OBJC)
+endif()
 
 if(WIN32)
     target_link_libraries(sokol PUBLIC kernel32 user32 gdi32 d3d11 dxgi dxguid ole32 dbghelp winhttp)
@@ -53,6 +61,9 @@ add_executable(hex-planets
     src/lobby.c
     src/celestial.c
 )
+if(APPLE)
+    target_sources(hex-planets PRIVATE src/screenshot_metal.m src/platform_macos.m)
+endif()
 
 target_include_directories(hex-planets PRIVATE
     ${CMAKE_SOURCE_DIR}/src
@@ -69,7 +80,7 @@ endif()
 
 # ---- Shader compilation with sokol-shdc ----
 set(SOKOL_SHDC "${CMAKE_SOURCE_DIR}/tools/sokol-shdc${CMAKE_EXECUTABLE_SUFFIX}")
-set(SHADER_SLANG "hlsl5:glsl430:glsl300es:wgsl")
+set(SHADER_SLANG "hlsl5:glsl430:glsl300es:metal_macos:wgsl")
 set(SHADER_DIR "${CMAKE_SOURCE_DIR}/shaders")
 
 # Only compile shaders if sokol-shdc is available (CI uses pre-committed .glsl.h headers)

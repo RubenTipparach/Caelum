@@ -17,7 +17,8 @@ typedef enum {
     VOXEL_STONE,
     VOXEL_ICE,
     VOXEL_BEDROCK,  // Unbreakable dark-grey floor at bottom of world
-    VOXEL_TORCH,    // Placeable torch (renders as model, emits light)
+    VOXEL_TORCH,      // Placeable torch (renders as model, emits light)
+    VOXEL_MOON_ROCK,  // Moon surface rock (uses moon.png texture)
     VOXEL_TYPE_COUNT,
 } VoxelType;
 
