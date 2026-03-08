@@ -660,7 +660,18 @@ void lod_tree_retarget(LodTree* tree, LodBodyType type,
     tree->splits_this_frame = 0;
     tree->retarget_diag_frames = 30;  // Log next 30 frames
 
-    printf("[LOD] Retarget complete: max_depth=%d\n", tree->max_depth_effective);
+    printf("[LOD] Retarget complete: max_depth=%d, split_factor=%.1f\n",
+           tree->max_depth_effective, tree->split_factor);
+    printf("[LOD] Depth  PatchArc(m)  SplitDist(m)  MergeDist(m)\n");
+    for (int d = 0; d <= tree->max_depth_effective; d++) {
+        float arc = tree->depth_arc[d];
+        float split_d = arc * tree->split_factor;
+        float merge_d = split_d * 2.0f;
+        printf("[LOD]   %2d   %10.1f   %11.1f   %11.1f%s\n",
+               d, arc, split_d, merge_d,
+               d == tree->max_depth_effective ? "  <-- max (hex terrain)" : "");
+    }
+    printf("[LOD] HEX_RANGE=%.0fm  suppress_range will be set when hex active\n", HEX_RANGE);
     fflush(stdout);
 }
 
@@ -1214,8 +1225,7 @@ static void generate_hex_mesh_for_moon(
             float surface_r = moon_surface_radius(moon_shape, cdir);
             float ellip_r = moon_ellipsoid_radius(moon_shape, cdir);
             float h_m = surface_r - ellip_r;
-            float eff = fmaxf(h_m, 0.0f);
-            int h = (int)ceilf(eff);
+            int h = (int)ceilf(h_m);  /* allow negative for crater bowls */
 
             int gi = (col - col_min) * grid_rows + (row - row_min);
             hm_heights[gi] = (int16_t)h;
@@ -2318,8 +2328,13 @@ static void draw_node(const LodTree* tree, const LodNode* node, RenderState* rs)
         node->gpu_buffer.id == SG_INVALID_ID)
         return;
 
-    // No LOD suppression: LOD always renders everywhere.
-    // Hex terrain renders on top with depth bias — no gaps possible.
+    // Suppress LOD patches that fall within the hex terrain range.
+    // Hex terrain renders voxel detail; drawing LOD underneath causes Z-fighting.
+    if (tree->suppress_range > 0.0f) {
+        float dist = patch_distance(tree, node);
+        if (dist < tree->suppress_range)
+            return;
+    }
 
     if (node->is_hex_mesh && rs->hex) {
         // Switch to hex pipeline if not already active
