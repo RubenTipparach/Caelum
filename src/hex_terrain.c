@@ -364,40 +364,47 @@ static HMM_Vec3 tangent_to_world(const HexTerrain* ht, float lx, float lz, float
     return vec3_scale(vec3_normalize(world_dir), radius);
 }
 
+// Gnomonic projection helper: projects a DIRECTION onto the tangent plane.
+static void gnomonic_project(const HexTerrain* ht, HMM_Vec3 dir,
+                              float* out_lx, float* out_lz) {
+    float cos_theta = vec3_dot(dir, ht->tangent_up);
+    if (fabsf(cos_theta) < 0.001f) {
+        *out_lx = 0.0f;
+        *out_lz = 0.0f;
+        return;
+    }
+    float plane_dist = vec3_dot(ht->tangent_origin, ht->tangent_up);
+    float k = plane_dist / cos_theta;
+    HMM_Vec3 P = vec3_scale(dir, k);
+    HMM_Vec3 offset = vec3_sub(P, ht->tangent_origin);
+    *out_lx = vec3_dot(offset, ht->tangent_east);
+    *out_lz = vec3_dot(offset, ht->tangent_north);
+}
+
 // Inverse of tangent_to_world: world position → tangent-plane (lx, lz).
-// Uses gnomonic (central) projection onto the tangent plane, then subtracts
-// the tangent_origin offset so that (0,0) maps to tangent_origin correctly.
-// On ellipsoids tangent_origin has a non-zero component along east/north
-// because it's placed along the radial direction while east/north are
-// perpendicular to the ellipsoid surface normal.
+// On spheres: simple gnomonic projection.
+// On ellipsoidal moons: mesh vertices are at surface_pt + normal * h, which
+// shifts the radial direction away from the column center by up to ~10m at
+// typical terrain heights. We correct by projecting the point down to the
+// estimated ellipsoid surface before gnomonic projection.
 static void world_to_tangent(const HexTerrain* ht, HMM_Vec3 world_pos,
                               float* out_lx, float* out_lz) {
+    HMM_Vec3 dir = vec3_normalize(world_pos);
+
     if (ht->body_type == LOD_BODY_MOON) {
-        // Moon (ellipsoid): project along tangent_up (plane normal) for consistency
-        // with how hex mesh vertices are constructed. Radial projection introduces
-        // angular offset because radial ≠ ellipsoid normal on non-spherical bodies.
-        float plane_dist = vec3_dot(ht->tangent_origin, ht->tangent_up);
-        float pt_dist = vec3_dot(world_pos, ht->tangent_up);
-        HMM_Vec3 P = vec3_sub(world_pos, vec3_scale(ht->tangent_up, pt_dist - plane_dist));
-        HMM_Vec3 offset = vec3_sub(P, ht->tangent_origin);
-        *out_lx = vec3_dot(offset, ht->tangent_east);
-        *out_lz = vec3_dot(offset, ht->tangent_north);
-    } else {
-        // Planet (sphere): gnomonic (radial) projection — standard for spherical tangent planes
-        HMM_Vec3 dir = vec3_normalize(world_pos);
-        float cos_theta = vec3_dot(dir, ht->tangent_up);
-        if (cos_theta < 0.01f) {
-            *out_lx = 0.0f;
-            *out_lz = 0.0f;
-            return;
+        // Correct for normal-vs-radial offset on ellipsoids.
+        // Subtract the estimated normal offset to recover the column direction.
+        float point_r = sqrtf(vec3_dot(world_pos, world_pos));
+        float ellip_r = moon_ellipsoid_radius(&ht->moon_shape, dir);
+        float h_approx = point_r - ellip_r;
+        if (fabsf(h_approx) > 0.01f) {
+            HMM_Vec3 normal = moon_ellipsoid_normal(&ht->moon_shape, dir);
+            HMM_Vec3 surface_approx = vec3_sub(world_pos, vec3_scale(normal, h_approx));
+            dir = vec3_normalize(surface_approx);
         }
-        float plane_dist = vec3_dot(ht->tangent_origin, ht->tangent_up);
-        float k = plane_dist / cos_theta;
-        HMM_Vec3 P = vec3_scale(dir, k);
-        HMM_Vec3 offset = vec3_sub(P, ht->tangent_origin);
-        *out_lx = vec3_dot(offset, ht->tangent_east);
-        *out_lz = vec3_dot(offset, ht->tangent_north);
     }
+
+    gnomonic_project(ht, dir, out_lx, out_lz);
 }
 
 // Convert tangent-plane pixel position to hex grid coordinates
@@ -750,7 +757,7 @@ static uint8_t job_get_neighbor_voxel(const HexMeshJob* job,
     if (job->body_type == LOD_BODY_MOON) {
         float surface_r = moon_surface_radius(&job->moon_shape, ndir);
         float ellip_r = moon_ellipsoid_radius(&job->moon_shape, ndir);
-        nh_eff = fmaxf(surface_r - ellip_r, 0.0f);
+        nh_eff = surface_r - ellip_r;  /* allow negative for crater bowls */
         solid_type = VOXEL_MOON_ROCK;
     } else {
         float nh_m = ht_sample_height_m(continental, mountain, warp, detail, ndir);
@@ -826,7 +833,7 @@ static int sky_neighbor_max_solid(const HexMeshJob* job,
     if (job->body_type == LOD_BODY_MOON) {
         float surface_r = moon_surface_radius(&job->moon_shape, ndir);
         float ellip_r = moon_ellipsoid_radius(&job->moon_shape, ndir);
-        nh_eff = fmaxf(surface_r - ellip_r, 0.0f);
+        nh_eff = surface_r - ellip_r;  /* allow negative for crater bowls */
     } else {
         float nh_m = ht_sample_height_m(continental, mountain, warp, detail, ndir);
         nh_eff = fmaxf(nh_m, TERRAIN_SEA_LEVEL_M);
@@ -1564,7 +1571,7 @@ static void generate_chunk_mesh(HexMeshJob* job) {
                 } else {
                     h_m = ht_sample_height_m(&continental, &mountain, &warp, &detail, dir);
                 }
-                float sea = (job->body_type == LOD_BODY_MOON) ? 0.0f : TERRAIN_SEA_LEVEL_M;
+                float sea = (job->body_type == LOD_BODY_MOON) ? -1e6f : TERRAIN_SEA_LEVEL_M;
                 int h_layers = (int)floorf(fmaxf(h_m, sea) / HEX_HEIGHT);
                 if (h_layers < min_h) min_h = h_layers;
             }
@@ -1597,7 +1604,7 @@ static void generate_chunk_mesh(HexMeshJob* job) {
                     float surface_r = moon_surface_radius(&job->moon_shape, unit);
                     col_ellip_r = moon_ellipsoid_radius(&job->moon_shape, unit);
                     h_m = surface_r - col_ellip_r;
-                    effective_h = fmaxf(h_m, 0.0f);
+                    effective_h = h_m;  /* allow negative for crater bowls */
                     surface_layer = (int)ceilf(effective_h / HEX_HEIGHT);
                     surface_type = VOXEL_MOON_ROCK;
                 } else {
@@ -2107,10 +2114,10 @@ static void generate_chunk_mesh(HexMeshJob* job) {
                     HexUV wuv11 = { ((float)wall_atlas + 1.0f) / (float)HEX_ATLAS_TILES, 0.0f };
 
                     hex_emit_tri(&job->vertices, &job->vertex_count, &cap,
-                        p0b, p1b, p1t, wall_outs[dir], local_up, wuv00, wuv10, wuv11,
+                        p0b, p1b, p1t, wall_outs[dir], wall_outs[dir], wuv00, wuv10, wuv11,
                         col_color, face_sky, face_torch);
                     hex_emit_tri(&job->vertices, &job->vertex_count, &cap,
-                        p0b, p1t, p0t, wall_outs[dir], local_up, wuv00, wuv11, wuv01,
+                        p0b, p1t, p0t, wall_outs[dir], wall_outs[dir], wuv00, wuv11, wuv01,
                         col_color, face_sky, face_torch);
                 }
             }
@@ -3121,19 +3128,20 @@ HexHitResult hex_terrain_raycast(const HexTerrain* ht, HMM_Vec3 ray_origin,
         int gcol, grow;
         pixel_to_hex(lx, lz, &gcol, &grow);
 
-        // Compute layer from altitude (normal-aligned for moons, radial for planet)
+        // Normal-aligned altitude for moons (matches mesh vertex placement:
+        // surface_pt + ellipsoid_normal * h).  Radial for planet.
         float col_r = hex_terrain_col_base_r(ht, gcol, grow);
         if (col_r < 1.0f) col_r = ht->planet_radius;
         float altitude;
         if (ht->body_type == LOD_BODY_MOON) {
-            // Normal-aligned: use column center direction for surface point
-            float col_lx = gcol * HEX_COL_SPACING;
-            float col_lz = ((gcol & 1) ? (grow + 0.5f) : (float)grow) * HEX_ROW_SPACING;
+            float clx, clz;
+            hex_local_pos(gcol, grow, &clx, &clz);
             HMM_Vec3 col_dir = vec3_normalize(vec3_add(ht->tangent_origin,
-                vec3_add(vec3_scale(ht->tangent_east, col_lx),
-                         vec3_scale(ht->tangent_north, col_lz))));
+                vec3_add(vec3_scale(ht->tangent_east, clx),
+                         vec3_scale(ht->tangent_north, clz))));
             HMM_Vec3 surface_pt = vec3_scale(col_dir, col_r);
-            altitude = vec3_dot(vec3_sub(world_pt, surface_pt), ht->tangent_up);
+            HMM_Vec3 col_normal = moon_ellipsoid_normal(&ht->moon_shape, col_dir);
+            altitude = vec3_dot(vec3_sub(world_pt, surface_pt), col_normal);
         } else {
             altitude = point_r - col_r;
         }
@@ -3719,23 +3727,21 @@ void hex_terrain_world_to_hex(const HexTerrain* ht, HMM_Vec3 world_pos,
 
     float col_r = hex_terrain_col_base_r(ht, *out_gcol, *out_grow);
     if (col_r < 1.0f) col_r = ht->planet_radius;
-    float altitude;
+    // Normal-aligned altitude for moons (matches mesh), radial for planet
     if (ht->body_type == LOD_BODY_MOON) {
-        // Use column center direction (not player direction) for the surface point.
-        // col_r is the ellipsoid radius at the column center, so the surface
-        // point must also be along the column center direction.
-        float col_lx = *out_gcol * HEX_COL_SPACING;
-        float col_lz = ((*out_gcol & 1) ? (*out_grow + 0.5f) : (float)*out_grow) * HEX_ROW_SPACING;
+        float clx, clz;
+        hex_local_pos(*out_gcol, *out_grow, &clx, &clz);
         HMM_Vec3 col_dir = vec3_normalize(vec3_add(ht->tangent_origin,
-            vec3_add(vec3_scale(ht->tangent_east, col_lx),
-                     vec3_scale(ht->tangent_north, col_lz))));
+            vec3_add(vec3_scale(ht->tangent_east, clx),
+                     vec3_scale(ht->tangent_north, clz))));
         HMM_Vec3 surface_pt = vec3_scale(col_dir, col_r);
-        altitude = vec3_dot(vec3_sub(world_pos, surface_pt), ht->tangent_up);
+        HMM_Vec3 col_normal = moon_ellipsoid_normal(&ht->moon_shape, col_dir);
+        float altitude = vec3_dot(vec3_sub(world_pos, surface_pt), col_normal);
+        *out_layer = (int)floorf(altitude / HEX_HEIGHT);
     } else {
         float point_r = sqrtf(vec3_dot(world_pos, world_pos));
-        altitude = point_r - col_r;
+        *out_layer = (int)floorf((point_r - col_r) / HEX_HEIGHT);
     }
-    *out_layer = (int)floorf(altitude / HEX_HEIGHT);
 }
 
 void hex_terrain_hex_to_world(const HexTerrain* ht, int gcol, int grow, int layer,
@@ -3754,9 +3760,14 @@ void hex_terrain_hex_to_world(const HexTerrain* ht, int gcol, int grow, int laye
     HMM_Vec3 pos;
     HMM_Vec3 up;
     if (ht->body_type == LOD_BODY_MOON) {
-        HMM_Vec3 surface_pt = tangent_to_world(ht, lx, lz, col_r);
-        pos = vec3_add(surface_pt, vec3_scale(ht->tangent_up, h));
-        up = ht->tangent_up;
+        // Normal offset: matches mesh vertex placement (surface_pt + normal * h)
+        HMM_Vec3 col_dir = vec3_normalize(vec3_add(ht->tangent_origin,
+            vec3_add(vec3_scale(ht->tangent_east, lx),
+                     vec3_scale(ht->tangent_north, lz))));
+        HMM_Vec3 surface_pt = vec3_scale(col_dir, col_r);
+        HMM_Vec3 col_normal = moon_ellipsoid_normal(&ht->moon_shape, col_dir);
+        pos = vec3_add(surface_pt, vec3_scale(col_normal, h));
+        up = col_normal;
     } else {
         pos = tangent_to_world(ht, lx, lz, col_r + h);
         up = vec3_normalize(pos);

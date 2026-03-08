@@ -798,6 +798,9 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
         { .slot = UB_planet_fs_params, .data = &fs_params, .size = sizeof(fs_params) },
     };
 
+    // Suppress LOD patches within hex terrain range to prevent Z-fighting
+    r->lod_tree.suppress_range = (r->hex_terrain.active_count > 0) ? HEX_RANGE : 0.0f;
+
     if (r->show_lod_debug) {
         LodDebugState debug_state = {
             .fs_params = fs_params,
@@ -946,13 +949,12 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
         }
     }
 
-    // ---- G key: normal debug arrows (red=player up, blue=grid up) ----
+    // ---- G key: debug arrows (red=raycast origin+up, green=camera forward 50m) ----
     if (cam->show_normal_debug && cam->gravity_body >= 0 && r->hex_terrain.frame_valid) {
-        const HexTerrain* ht = &r->hex_terrain;
-        float arrow_len = 100.0f;
-        float head_len = 15.0f;
-        float head_spread = 5.0f;
-        float verts[16 * 3]; // 16 vertices * 3 floats
+        float arrow_len = 50.0f;
+        float head_len = 8.0f;
+        float head_spread = 3.0f;
+        float verts[16 * 3]; // 16 vertices * 3 floats (2 arrows x 6 verts each + spare)
         int vi = 0;
 
         // Helper: write vertex relative to world_origin
@@ -962,23 +964,20 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
             verts[vi++] = (pz) - (float)r->lod_tree.world_origin[2]; \
         } while(0)
 
-        // Build a perpendicular vector to 'up' for arrowhead
-        HMM_Vec3 perp;
+        // RED arrow: raycast origin (cam->position) + local_up direction
         {
+            HMM_Vec3 perp;
             HMM_Vec3 ref = {{1, 0, 0}};
             if (fabsf(HMM_DotV3(cam->local_up, ref)) > 0.9f) ref = (HMM_Vec3){{0, 1, 0}};
             perp = HMM_NormV3(HMM_Cross(cam->local_up, ref));
-        }
 
-        // RED arrow: player position + local_up
-        {
-            float bx = (float)cam->pos_d[0], by = (float)cam->pos_d[1], bz = (float)cam->pos_d[2];
+            float bx = cam->position.X, by = cam->position.Y, bz = cam->position.Z;
             float tx = bx + cam->local_up.X * arrow_len;
             float ty = by + cam->local_up.Y * arrow_len;
             float tz = bz + cam->local_up.Z * arrow_len;
             // Shaft
             ARROW_V(bx, by, bz); ARROW_V(tx, ty, tz);
-            // Arrowhead lines (2 lines from tip pointing back)
+            // Arrowhead
             float hx = tx - cam->local_up.X * head_len;
             float hy = ty - cam->local_up.Y * head_len;
             float hz = tz - cam->local_up.Z * head_len;
@@ -988,23 +987,23 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
             ARROW_V(hx - perp.X * head_spread, hy - perp.Y * head_spread, hz - perp.Z * head_spread);
         }
 
-        // BLUE arrow: grid center + tangent_up
+        // GREEN arrow: camera center + forward direction (50m)
         {
             HMM_Vec3 perp2;
             HMM_Vec3 ref2 = {{1, 0, 0}};
-            if (fabsf(HMM_DotV3(ht->tangent_up, ref2)) > 0.9f) ref2 = (HMM_Vec3){{0, 1, 0}};
-            perp2 = HMM_NormV3(HMM_Cross(ht->tangent_up, ref2));
+            if (fabsf(HMM_DotV3(cam->forward, ref2)) > 0.9f) ref2 = (HMM_Vec3){{0, 1, 0}};
+            perp2 = HMM_NormV3(HMM_Cross(cam->forward, ref2));
 
-            float bx = ht->tangent_origin.X, by = ht->tangent_origin.Y, bz = ht->tangent_origin.Z;
-            float tx = bx + ht->tangent_up.X * arrow_len;
-            float ty = by + ht->tangent_up.Y * arrow_len;
-            float tz = bz + ht->tangent_up.Z * arrow_len;
+            float bx = cam->position.X, by = cam->position.Y, bz = cam->position.Z;
+            float tx = bx + cam->forward.X * arrow_len;
+            float ty = by + cam->forward.Y * arrow_len;
+            float tz = bz + cam->forward.Z * arrow_len;
             // Shaft
             ARROW_V(bx, by, bz); ARROW_V(tx, ty, tz);
             // Arrowhead
-            float hx = tx - ht->tangent_up.X * head_len;
-            float hy = ty - ht->tangent_up.Y * head_len;
-            float hz = tz - ht->tangent_up.Z * head_len;
+            float hx = tx - cam->forward.X * head_len;
+            float hy = ty - cam->forward.Y * head_len;
+            float hz = tz - cam->forward.Z * head_len;
             ARROW_V(tx, ty, tz);
             ARROW_V(hx + perp2.X * head_spread, hy + perp2.Y * head_spread, hz + perp2.Z * head_spread);
             ARROW_V(tx, ty, tz);
@@ -1023,18 +1022,18 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
         sg_bindings dbg_bind = {0};
         dbg_bind.vertex_buffers[0] = r->normal_debug_buf;
 
-        // Draw RED arrow (player local_up)
-        sg_apply_pipeline(r->highlight_face_pip);  // always-on-top depth
+        // Draw RED arrow (raycast origin + up)
+        sg_apply_pipeline(r->highlight_face_pip);
         sg_apply_uniforms(UB_highlight_vs_params, &SG_RANGE(dbg_vs));
         highlight_fs_params_t red_fs = { .color = (HMM_Vec4){{1.0f, 0.0f, 0.0f, 1.0f}} };
         sg_apply_uniforms(UB_highlight_fs_params, &SG_RANGE(red_fs));
         sg_apply_bindings(&dbg_bind);
-        sg_draw(0, 6, 1);  // 3 lines = 6 verts (shaft + 2 arrowhead)
+        sg_draw(0, 6, 1);
 
-        // Draw BLUE arrow (grid tangent_up)
-        highlight_fs_params_t blue_fs = { .color = (HMM_Vec4){{0.0f, 0.4f, 1.0f, 1.0f}} };
-        sg_apply_uniforms(UB_highlight_fs_params, &SG_RANGE(blue_fs));
-        sg_draw(6, 6, 1);  // next 3 lines
+        // Draw GREEN arrow (camera forward)
+        highlight_fs_params_t green_fs = { .color = (HMM_Vec4){{0.0f, 1.0f, 0.0f, 1.0f}} };
+        sg_apply_uniforms(UB_highlight_fs_params, &SG_RANGE(green_fs));
+        sg_draw(6, 6, 1);
     }
 
     // ---- Profiler timing ----

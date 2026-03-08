@@ -19,6 +19,15 @@ typedef enum {
 #define MAX_MOONS 10
 #define MOON_MESH_SUBDIVISIONS 4   /* icosphere subdivision depth (4 = ~2562 verts, ~5120 tris) */
 #define MOON_SOI_RADIUS 50000.0f   /* 50 km sphere of influence */
+#define MOON_MAX_CRATERS 128       /* max craters per moon */
+
+typedef struct MoonCrater {
+    HMM_Vec3 center;    /* unit direction on sphere */
+    float radius;        /* meters (arc distance) */
+    float depth;         /* meters (bowl depth, positive = deeper) */
+    float rim_height;    /* meters */
+    float cos_influence; /* precomputed: cos(influence_angle) for early-out */
+} MoonCrater;
 
 typedef struct MoonShapeParams {
     MoonShapeType shape_type;      /* ELLIPSOID or CAPSULE */
@@ -32,6 +41,9 @@ typedef struct MoonShapeParams {
     float noise_frequency;         /* 0.5-2.0 */
     float noise_amplitude;         /* fraction of radius (0.05-0.2) */
     int noise_octaves;             /* 2-4 */
+    /* Craters (generated at init from noise_seed) */
+    MoonCrater craters[MOON_MAX_CRATERS];
+    int crater_count;
 } MoonShapeParams;
 
 typedef struct MoonColorPalette {
@@ -103,6 +115,9 @@ void solar_system_update(SolarSystem* ss, double dt);
 int solar_system_find_gravity_body(const SolarSystem* ss,
                                    const double pos_d[3],
                                    float planet_radius);
+
+/* Generate craters for a moon (called once at init, deterministic from noise_seed) */
+void moon_generate_craters(MoonShapeParams* shape);
 
 /* Get smooth ellipsoid radius at a given direction (no noise) */
 float moon_ellipsoid_radius(const MoonShapeParams* shape, HMM_Vec3 unit_dir);
