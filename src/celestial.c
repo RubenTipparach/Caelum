@@ -152,6 +152,126 @@ HMM_Vec3 moon_ellipsoid_normal(const MoonShapeParams* shape, HMM_Vec3 unit_dir) 
     return (HMM_Vec3){{n.X / len, n.Y / len, n.Z / len}};
 }
 
+/* ---- Crater generation ---- */
+
+/* Simple seeded PRNG (xorshift32) for deterministic crater placement */
+static uint32_t crater_rng(uint32_t* state) {
+    uint32_t x = *state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *state = x;
+    return x;
+}
+
+static float crater_randf(uint32_t* state) {
+    return (float)(crater_rng(state) & 0xFFFFFF) / (float)0xFFFFFF;
+}
+
+/* Generate random unit vector on sphere */
+static HMM_Vec3 crater_rand_dir(uint32_t* state) {
+    float z = 2.0f * crater_randf(state) - 1.0f;
+    float phi = 2.0f * (float)M_PI * crater_randf(state);
+    float r = sqrtf(1.0f - z * z);
+    return (HMM_Vec3){{r * cosf(phi), r * sinf(phi), z}};
+}
+
+void moon_generate_craters(MoonShapeParams* shape) {
+    uint32_t rng = (uint32_t)(shape->noise_seed * 7919 + 12345);
+    float R = shape->base_radius;
+
+    /* Scale crater count with moon size:
+       Giant (50-80km): ~80-128 craters
+       Large (5-7km):   ~40-60
+       Small (1-4km):   ~20-40 */
+    int target_count = (int)(20.0f + 108.0f * (R / 80000.0f));
+    if (target_count > MOON_MAX_CRATERS) target_count = MOON_MAX_CRATERS;
+    if (target_count < 8) target_count = 8;
+
+    shape->crater_count = 0;
+
+    for (int i = 0; i < target_count; i++) {
+        MoonCrater c;
+        c.center = crater_rand_dir(&rng);
+
+        /* Power-law radius distribution: few large, many small.
+           Range: 1% to 15% of moon radius */
+        float u = crater_randf(&rng);
+        float min_frac = 0.01f;
+        float max_frac = 0.15f;
+        /* Inverse CDF of power law with exponent -2:
+           CDF(x) = 1 - (min/x), so x = min / (1 - u * (1 - min/max)) */
+        float frac = min_frac / (1.0f - u * (1.0f - min_frac / max_frac));
+        c.radius = frac * R;
+
+        /* Depth: ~20% of crater radius (realistic simple crater ratio) */
+        c.depth = c.radius * 0.2f;
+
+        /* Rim height: ~4% of crater diameter */
+        c.rim_height = c.radius * 0.08f;
+
+        /* Precompute cos of influence angle for early-out.
+           Influence extends to ~2.5x crater radius from center.
+           angle = arc_dist / R, cos_influence = cos(2.5 * radius / R) */
+        float influence_angle = 2.5f * c.radius / R;
+        if (influence_angle > (float)M_PI) influence_angle = (float)M_PI;
+        c.cos_influence = cosf(influence_angle);
+
+        shape->craters[shape->crater_count++] = c;
+    }
+
+    printf("[CRATER] Generated %d craters for moon (R=%.0fm)\n",
+           shape->crater_count, R);
+    fflush(stdout);
+}
+
+/* Evaluate crater displacement at a point on the sphere.
+   Returns height offset in meters (negative for bowl, positive for rim). */
+static float evaluate_craters(const MoonShapeParams* shape, HMM_Vec3 unit_dir) {
+    float R = shape->base_radius;
+    float total = 0.0f;
+
+    for (int i = 0; i < shape->crater_count; i++) {
+        const MoonCrater* c = &shape->craters[i];
+
+        /* Early-out: dot product gives cos(angle), skip if beyond influence */
+        float cos_a = HMM_DotV3(unit_dir, c->center);
+        if (cos_a < c->cos_influence) continue;
+
+        /* Arc distance in meters */
+        float angle = acosf(fminf(1.0f, cos_a));
+        float d = angle * R;
+
+        /* Normalized distance: t = d / crater_radius */
+        float t = d / c->radius;
+        if (t > 2.5f) continue;
+
+        /* Bowl: parabolic depression */
+        float bowl = 0.0f;
+        if (t < 1.0f)
+            bowl = -c->depth * (1.0f - t * t);
+
+        /* Rim: Gaussian bump at crater edge */
+        float rim_t = t - 1.0f;
+        float rim = c->rim_height * expf(-rim_t * rim_t * 8.0f);
+
+        /* Ejecta: gradual falloff beyond rim */
+        float ejecta = 0.0f;
+        if (t > 1.0f) {
+            float e = 1.0f - (t - 1.0f) * 0.667f;  /* fade over 1.5x radius */
+            if (e > 0.0f)
+                ejecta = c->rim_height * 0.3f * e * e;
+        }
+
+        /* Combine: bowl uses min (deeper crater wins), rim/ejecta additive */
+        if (bowl < 0.0f)
+            total = fminf(total, total + bowl);  /* first crater sets, overlaps deepen */
+        total += rim + ejecta;
+    }
+
+    return total;
+}
+
 float moon_surface_radius(const MoonShapeParams* shape, HMM_Vec3 unit_dir) {
     float base_r = moon_ellipsoid_radius(shape, unit_dir);
 
@@ -168,7 +288,13 @@ float moon_surface_radius(const MoonShapeParams* shape, HMM_Vec3 unit_dir) {
         unit_dir.Y * 100.0f,
         unit_dir.Z * 100.0f);
 
-    return base_r * (1.0f + n * shape->noise_amplitude);
+    float r = base_r * (1.0f + n * shape->noise_amplitude);
+
+    /* Add crater displacement */
+    if (shape->crater_count > 0)
+        r += evaluate_craters(shape, unit_dir);
+
+    return r;
 }
 
 /* ---- Generate icosphere mesh for a moon ---- */
@@ -502,6 +628,9 @@ void solar_system_init(SolarSystem* ss, const SolarSystemConfig* cfg) {
         if (d->shape_type == MOON_SHAPE_CAPSULE) {
             precompute_capsule(&m->shape);
         }
+
+        /* Generate craters (deterministic from noise_seed) */
+        moon_generate_craters(&m->shape);
 
         m->palette.base_color = d->base_color;
         m->palette.highlight_color = d->highlight_color;
