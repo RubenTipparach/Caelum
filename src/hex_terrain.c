@@ -198,12 +198,18 @@ static float dither_hash(int gcol, int grow, int seed) {
 // Voxel type by height with deterministic dithering at transitions.
 // Each hex column gets a stable random threshold so biome boundaries
 // show a natural mix of block types instead of a hard line.
-static VoxelType ht_voxel_type(float height_m, int gcol, int grow, int seed) {
+// slope: 0=flat, 1=vertical cliff. Steep slopes override to STONE/DIRT.
+static VoxelType ht_voxel_type(float height_m, int gcol, int grow, int seed, float slope) {
     float rel = height_m - TERRAIN_SEA_LEVEL_M;
     if (height_m < TERRAIN_SEA_LEVEL_M) return VOXEL_WATER;
 
     float d = dither_hash(gcol, grow, seed);
     float dz = 100.0f;  // dither zone half-width in meters
+
+    // Slope override: steep cliffs → exposed rock, moderate slopes → dirt
+    // Dithered threshold so cliff/grass boundaries look natural
+    if (slope > 0.55f + d * 0.15f) return VOXEL_STONE;
+    if (slope > 0.35f + d * 0.10f && rel < 4500.0f) return VOXEL_DIRT;
 
     // Sand -> Grass at 200m
     if (rel < 200.0f - dz) return VOXEL_SAND;
@@ -235,15 +241,19 @@ static VoxelType ht_voxel_type_at_depth(VoxelType surface_type, int depth_layers
 }
 
 // ---- Terrain color (matches lod.c terrain_color_m for seamless LOD transition) ----
-static HMM_Vec3 ht_terrain_color(float height_m) {
+// slope: 0=flat, 1=cliff. Used to darken steep terrain.
+static HMM_Vec3 ht_terrain_color(float height_m, float slope) {
     float rel = height_m - TERRAIN_SEA_LEVEL_M;
 
+    // Per-biome dark/light variants for height-based gradient
     const HMM_Vec3 water_deep    = {{0.06f, 0.10f, 0.25f}};
     const HMM_Vec3 water_shallow = {{0.12f, 0.21f, 0.39f}};
-    const HMM_Vec3 sand          = {{0.94f, 0.84f, 0.77f}};
-    const HMM_Vec3 grass         = {{0.07f, 0.58f, 0.35f}};
-    const HMM_Vec3 rock          = {{0.46f, 0.45f, 0.45f}};
-    const HMM_Vec3 high_stone    = {{0.50f, 0.50f, 0.50f}};
+    const HMM_Vec3 sand_dark     = {{0.78f, 0.68f, 0.58f}};
+    const HMM_Vec3 sand_light    = {{0.96f, 0.88f, 0.80f}};
+    const HMM_Vec3 grass_dark    = {{0.04f, 0.38f, 0.22f}};
+    const HMM_Vec3 grass_light   = {{0.12f, 0.68f, 0.40f}};
+    const HMM_Vec3 rock_dark     = {{0.32f, 0.31f, 0.30f}};
+    const HMM_Vec3 rock_light    = {{0.55f, 0.54f, 0.53f}};
     const HMM_Vec3 ice           = {{0.44f, 0.77f, 0.97f}};
 
     if (height_m < TERRAIN_SEA_LEVEL_M) {
@@ -251,17 +261,39 @@ static HMM_Vec3 ht_terrain_color(float height_m) {
         return vec3_lerp(water_shallow, water_deep, depth_t);
     }
 
+    // Local height within each biome band drives dark→light gradient.
+    // This creates visual depth: dark valleys, light hilltops.
     float blend = 100.0f;
     float t1 = ht_smoothstepf(200.0f  - blend, 200.0f  + blend, rel);
     float t2 = ht_smoothstepf(1500.0f - blend, 1500.0f + blend, rel);
     float t3 = ht_smoothstepf(3000.0f - blend, 3000.0f + blend, rel);
     float t4 = ht_smoothstepf(4500.0f - blend, 4500.0f + blend, rel);
 
+    // Height within current biome band [0..1] for gradient
+    float local_h;
+    if (rel < 200.0f)       local_h = rel / 200.0f;
+    else if (rel < 1500.0f) local_h = (rel - 200.0f) / 1300.0f;
+    else if (rel < 4500.0f) local_h = (rel - 1500.0f) / 3000.0f;
+    else                    local_h = fminf((rel - 4500.0f) / 1000.0f, 1.0f);
+
+    // Per-biome gradient: lerp between dark and light variants
+    HMM_Vec3 sand  = vec3_lerp(sand_dark,  sand_light,  local_h);
+    HMM_Vec3 grass = vec3_lerp(grass_dark, grass_light, local_h);
+    HMM_Vec3 rock  = vec3_lerp(rock_dark,  rock_light,  local_h);
+
     HMM_Vec3 c = sand;
-    c = vec3_lerp(c, grass,      t1);
-    c = vec3_lerp(c, rock,       t2);
-    c = vec3_lerp(c, high_stone, t3);
-    c = vec3_lerp(c, ice,        t4);
+    c = vec3_lerp(c, grass, t1);
+    c = vec3_lerp(c, rock,  t2);
+    c = vec3_lerp(c, rock,  t3);  // high stone uses same rock gradient
+    c = vec3_lerp(c, ice,   t4);
+
+    // Darken steep slopes slightly (exposed rock look)
+    if (slope > 0.2f) {
+        float darken = 1.0f - (slope - 0.2f) * 0.4f;
+        if (darken < 0.6f) darken = 0.6f;
+        c.X *= darken; c.Y *= darken; c.Z *= darken;
+    }
+
     return c;
 }
 
@@ -476,6 +508,10 @@ typedef struct HexMeshJob {
     int16_t col_max_solid[HEX_CHUNK_SIZE][HEX_CHUNK_SIZE];
     float   ground_r;  // reference radius at tangent center
     float   col_ellip_r[HEX_CHUNK_SIZE][HEX_CHUNK_SIZE];  // per-column ellipsoid radius (moons)
+    float   col_height_m[HEX_CHUNK_SIZE][HEX_CHUNK_SIZE]; // per-column terrain height (meters)
+    float   col_slope[HEX_CHUNK_SIZE][HEX_CHUNK_SIZE];    // per-column slope magnitude (0-1)
+    float   col_grad_e[HEX_CHUNK_SIZE][HEX_CHUNK_SIZE];   // per-column east height gradient
+    float   col_grad_n[HEX_CHUNK_SIZE][HEX_CHUNK_SIZE];   // per-column north height gradient
 
     // Cached arch data (computed once per job)
     HtArchFrame arch_frame;
@@ -1607,12 +1643,39 @@ static void generate_chunk_mesh(HexMeshJob* job) {
                     effective_h = h_m;  /* allow negative for crater bowls */
                     surface_layer = (int)ceilf(effective_h / HEX_HEIGHT);
                     surface_type = VOXEL_MOON_ROCK;
+                    job->col_slope[col][row] = 0.0f;
+                    job->col_grad_e[col][row] = 0.0f;
+                    job->col_grad_n[col][row] = 0.0f;
                 } else {
                     h_m = ht_sample_height_m(&continental, &mountain, &warp, &detail, unit);
                     effective_h = fmaxf(h_m, TERRAIN_SEA_LEVEL_M);
                     surface_layer = (int)ceilf(effective_h / HEX_HEIGHT);
-                    surface_type = ht_voxel_type(h_m, gcol, grow, job->seed);
+
+                    // Compute slope from neighbor height gradient (for cliff detection)
+                    float slope = 0.0f;
+                    {
+                        const float sd = 2.0f;  // sample offset ~hex spacing
+                        HMM_Vec3 de = vec3_normalize(vec3_add(job->tangent_origin,
+                            vec3_add(vec3_scale(job->tangent_east, lx + sd),
+                                     vec3_scale(job->tangent_north, lz))));
+                        HMM_Vec3 dn = vec3_normalize(vec3_add(job->tangent_origin,
+                            vec3_add(vec3_scale(job->tangent_east, lx),
+                                     vec3_scale(job->tangent_north, lz + sd))));
+                        float he = ht_sample_height_m(&continental, &mountain, &warp, &detail, de);
+                        float hn = ht_sample_height_m(&continental, &mountain, &warp, &detail, dn);
+                        float ge = (he - h_m) / sd;
+                        float gn = (hn - h_m) / sd;
+                        slope = sqrtf(ge * ge + gn * gn);
+                        if (slope > 1.0f) slope = 1.0f;
+                        job->col_grad_e[col][row] = ge;
+                        job->col_grad_n[col][row] = gn;
+                    }
+                    surface_type = ht_voxel_type(h_m, gcol, grow, job->seed, slope);
+                    job->col_slope[col][row] = slope;
                 }
+
+                // Cache per-column height for Phase 3 mesh gen (avoid recomputing noise)
+                job->col_height_m[col][row] = h_m;
 
                 int min_solid = HEX_CHUNK_LAYERS;
                 int max_solid = -1;
@@ -1849,14 +1912,22 @@ static void generate_chunk_mesh(HexMeshJob* job) {
                 ? moon_ellipsoid_normal(&job->moon_shape, center_dir) : center_dir;
             HMM_Vec3 local_down = vec3_scale(local_up, -1.0f);
 
-            // Compute per-column terrain color (no brightness bake — shader handles lighting)
-            float col_h_m;
+            // Use cached per-column values from Phase 2 (avoid recomputing noise)
+            float col_h_m = job->col_height_m[col][row];
+            float col_slope = job->col_slope[col][row];
+            float grad_e = job->col_grad_e[col][row];
+            float grad_n = job->col_grad_n[col][row];
+
+            HMM_Vec3 slope_normal = vec3_normalize(vec3_sub(local_up,
+                vec3_add(vec3_scale(job->tangent_east, grad_e),
+                         vec3_scale(job->tangent_north, grad_n))));
+            if (vec3_dot(slope_normal, local_up) < 0.1f) slope_normal = local_up;
+
+            // Terrain color: height-based gradient with slope darkening
             HMM_Vec3 col_color;
             if (job->body_type == LOD_BODY_MOON) {
-                float surface_r = moon_surface_radius(&job->moon_shape, center_dir);
                 float ellip_r = moon_ellipsoid_radius(&job->moon_shape, center_dir);
-                col_h_m = surface_r - ellip_r;
-                float height_t = (surface_r - ellip_r * 0.9f) / (ellip_r * 0.2f);
+                float height_t = (col_h_m + ellip_r * 0.1f) / (ellip_r * 0.2f);
                 if (height_t < 0.0f) height_t = 0.0f;
                 if (height_t > 1.0f) height_t = 1.0f;
                 col_color = vec3_lerp(job->moon_palette.shadow_color,
@@ -1865,37 +1936,7 @@ static void generate_chunk_mesh(HexMeshJob* job) {
                                       job->moon_palette.highlight_color,
                                       height_t * height_t * 0.5f);
             } else {
-                col_h_m = ht_sample_height_m(&continental, &mountain, &warp, &detail, center_dir);
-                col_color = ht_terrain_color(col_h_m);
-            }
-
-            // Compute terrain slope normal from noise at LOD-triangle-scale offsets (~10m).
-            // Used as shading normal so the fragment shader's NdotL + AO match the LOD mesh.
-            HMM_Vec3 slope_normal = local_up;
-            {
-                const float d = 10.0f;  // ~LOD depth-12 vertex spacing
-                HMM_Vec3 dir_e = vec3_normalize(vec3_add(job->tangent_origin,
-                    vec3_add(vec3_scale(job->tangent_east, lx + d),
-                             vec3_scale(job->tangent_north, lz))));
-                HMM_Vec3 dir_n = vec3_normalize(vec3_add(job->tangent_origin,
-                    vec3_add(vec3_scale(job->tangent_east, lx),
-                             vec3_scale(job->tangent_north, lz + d))));
-                float h_e, h_n;
-                if (job->body_type == LOD_BODY_MOON) {
-                    h_e = moon_surface_radius(&job->moon_shape, dir_e) - moon_ellipsoid_radius(&job->moon_shape, dir_e);
-                    h_n = moon_surface_radius(&job->moon_shape, dir_n) - moon_ellipsoid_radius(&job->moon_shape, dir_n);
-                } else {
-                    h_e = ht_sample_height_m(&continental, &mountain, &warp, &detail, dir_e);
-                    h_n = ht_sample_height_m(&continental, &mountain, &warp, &detail, dir_n);
-                }
-
-                float grad_e = (h_e - col_h_m) / d;
-                float grad_n = (h_n - col_h_m) / d;
-
-                slope_normal = vec3_normalize(vec3_sub(local_up,
-                    vec3_add(vec3_scale(job->tangent_east, grad_e),
-                             vec3_scale(job->tangent_north, grad_n))));
-                if (vec3_dot(slope_normal, local_up) < 0.1f) slope_normal = local_up;
+                col_color = ht_terrain_color(col_h_m, col_slope);
             }
 
             if (job->is_transition) {
@@ -2113,11 +2154,15 @@ static void generate_chunk_mesh(HexMeshJob* job) {
                     HexUV wuv01 = { ((float)wall_atlas + 0.0f) / (float)HEX_ATLAS_TILES, 0.0f };
                     HexUV wuv11 = { ((float)wall_atlas + 1.0f) / (float)HEX_ATLAS_TILES, 0.0f };
 
+                    // Planet side faces inherit top-face shading normal so sun angle
+                    // lighting matches the top surface (avoids dark cliff walls).
+                    HMM_Vec3 side_shade = (job->body_type == LOD_BODY_MOON)
+                        ? wall_outs[dir] : slope_normal;
                     hex_emit_tri(&job->vertices, &job->vertex_count, &cap,
-                        p0b, p1b, p1t, wall_outs[dir], wall_outs[dir], wuv00, wuv10, wuv11,
+                        p0b, p1b, p1t, wall_outs[dir], side_shade, wuv00, wuv10, wuv11,
                         col_color, face_sky, face_torch);
                     hex_emit_tri(&job->vertices, &job->vertex_count, &cap,
-                        p0b, p1t, p0t, wall_outs[dir], wall_outs[dir], wuv00, wuv11, wuv01,
+                        p0b, p1t, p0t, wall_outs[dir], side_shade, wuv00, wuv11, wuv01,
                         col_color, face_sky, face_torch);
                 }
             }
@@ -2706,6 +2751,10 @@ void hex_terrain_update(HexTerrain* ht, HMM_Vec3 camera_pos,
             memcpy(chunk->col_max_solid, job->col_max_solid, sizeof(chunk->col_max_solid));
             chunk->ground_r = job->ground_r;
             memcpy(chunk->col_ellip_r, job->col_ellip_r, sizeof(chunk->col_ellip_r));
+            memcpy(chunk->col_height_m, job->col_height_m, sizeof(chunk->col_height_m));
+            memcpy(chunk->col_slope, job->col_slope, sizeof(chunk->col_slope));
+            memcpy(chunk->col_grad_e, job->col_grad_e, sizeof(chunk->col_grad_e));
+            memcpy(chunk->col_grad_n, job->col_grad_n, sizeof(chunk->col_grad_n));
             chunk->torch_scanned = false;  // Re-scan for torch instances
         }
 
@@ -2858,6 +2907,10 @@ void hex_terrain_update(HexTerrain* ht, HMM_Vec3 camera_pos,
                         memcpy(job->col_max_solid, chunk->col_max_solid, sizeof(job->col_max_solid));
                         job->ground_r = chunk->ground_r;
                         memcpy(job->col_ellip_r, chunk->col_ellip_r, sizeof(job->col_ellip_r));
+                        memcpy(job->col_height_m, chunk->col_height_m, sizeof(job->col_height_m));
+                        memcpy(job->col_slope, chunk->col_slope, sizeof(job->col_slope));
+                        memcpy(job->col_grad_e, chunk->col_grad_e, sizeof(job->col_grad_e));
+                        memcpy(job->col_grad_n, chunk->col_grad_n, sizeof(job->col_grad_n));
                     } else {
                         job->voxels = (uint8_t*)malloc(voxel_size);
                         job->has_voxels = false;
@@ -2934,6 +2987,10 @@ void hex_terrain_update(HexTerrain* ht, HMM_Vec3 camera_pos,
                 memcpy(job->col_max_solid, chunk->col_max_solid, sizeof(job->col_max_solid));
                 job->ground_r = chunk->ground_r;
                 memcpy(job->col_ellip_r, chunk->col_ellip_r, sizeof(job->col_ellip_r));
+                memcpy(job->col_height_m, chunk->col_height_m, sizeof(job->col_height_m));
+                memcpy(job->col_slope, chunk->col_slope, sizeof(job->col_slope));
+                memcpy(job->col_grad_e, chunk->col_grad_e, sizeof(job->col_grad_e));
+                memcpy(job->col_grad_n, chunk->col_grad_n, sizeof(job->col_grad_n));
             } else {
                 job->voxels = (uint8_t*)malloc(voxel_size);
                 job->has_voxels = false;
@@ -3101,9 +3158,9 @@ float hex_terrain_effective_range(const HexTerrain* ht) {
     // All chunks meshed: suppress the full inner range
     if (meshed == total) return HEX_INNER_RANGE;
 
-    // Suppress up to the nearest unmeshed chunk minus a safety margin
-    float safe_range = min_unmeshed_dist - HEX_CHUNK_WIDTH * 2.0f;
-    if (safe_range < 100.0f) return 0.0f;  // Too close, don't suppress at all
+    // Suppress up to the nearest unmeshed chunk minus a generous safety margin
+    float safe_range = min_unmeshed_dist - HEX_CHUNK_WIDTH * 3.0f;
+    if (safe_range < HEX_INNER_RANGE * 0.5f) return 0.0f;  // Not enough coverage, don't suppress
     return fminf(safe_range, HEX_INNER_RANGE);
 }
 

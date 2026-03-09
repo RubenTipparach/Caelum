@@ -135,8 +135,9 @@ void main() {
     terrain_color += sunColor * spec * ocean_mask * 0.4 * sun_brightness;
 
     // Rim lighting (matches planet.glsl for seamless LOD boundary)
+    // Gated by sky_light so it doesn't bleed into cave interiors
     float rim_dot = 1.0 - max(0.0, dot(V, N));
-    float rim = pow(rim_dot, 3.0) * 0.12 * sun_brightness;
+    float rim = pow(rim_dot, 3.0) * 0.12 * sun_brightness * fs_sky_light;
     terrain_color += vec3(0.35, 0.45, 0.6) * rim;
 
     // Torch light: warm orange glow, additive on un-darkened base color
@@ -179,7 +180,9 @@ void main() {
     vec3 fogEquilibrium = sunColor * sInt * phaseR * sun_brightness;
     fogEquilibrium = vec3(1.0) - exp(-fogEquilibrium);
 
-    terrain_color = terrain_color * transmittance + fogEquilibrium * (vec3(1.0) - transmittance);
+    // Gate fog by sky_light so cave interiors stay dark
+    vec3 fog_contrib = fogEquilibrium * (vec3(1.0) - transmittance) * fs_sky_light;
+    terrain_color = terrain_color * transmittance + fog_contrib;
 
     frag_color = vec4(terrain_color, 1.0);
 }

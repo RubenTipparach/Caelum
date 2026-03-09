@@ -798,8 +798,8 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
         { .slot = UB_planet_fs_params, .data = &fs_params, .size = sizeof(fs_params) },
     };
 
-    // Suppress LOD patches within hex terrain range to prevent Z-fighting
-    r->lod_tree.suppress_range = (r->hex_terrain.active_count > 0) ? HEX_RANGE : 0.0f;
+    // suppress_range was already computed in render_update via hex_terrain_effective_range.
+    // Only suppress where hex terrain has actually meshed chunks (not the full HEX_RANGE).
 
     if (r->show_lod_debug) {
         LodDebugState debug_state = {
