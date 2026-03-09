@@ -954,6 +954,8 @@ static void frame(void) {
             app.solar_cfg = solar_system_default_config();
             solar_system_init(&app.renderer.solar_system, &app.solar_cfg);
             app.camera.tenebris_gravity = app.solar_cfg.tenebris.surface_gravity;
+            app.renderer.lod_fade_start = app.solar_cfg.tenebris.lod_fade_start;
+            app.renderer.lod_fade_end   = app.solar_cfg.tenebris.lod_fade_end;
             {
                 float surface_r = app.planet.radius + app.planet.sea_level * app.planet.layer_thickness;
                 solar_system_generate_planet_mesh(&app.renderer.solar_system, surface_r,
@@ -1008,6 +1010,8 @@ static void frame(void) {
                 ss->pinned_center_d[2] = moon->pos_d[2];
 
                 app.renderer.lod_current_body = mi;
+                app.renderer.lod_fade_start = app.solar_cfg.moons[mi].lod_fade_start;
+                app.renderer.lod_fade_end   = app.solar_cfg.moons[mi].lod_fade_end;
                 app.restore_moon_local = false;
 
                 // Moon-local: world_origin stays at {0,0,0}
@@ -1153,6 +1157,13 @@ static void frame(void) {
                 ss->pinned_center_d[2] = moon->pos_d[2];
             }
             app.renderer.lod_current_body = app.camera.gravity_body;
+            if (app.camera.gravity_body >= 0) {
+                app.renderer.lod_fade_start = app.solar_cfg.moons[app.camera.gravity_body].lod_fade_start;
+                app.renderer.lod_fade_end   = app.solar_cfg.moons[app.camera.gravity_body].lod_fade_end;
+            } else {
+                app.renderer.lod_fade_start = app.solar_cfg.tenebris.lod_fade_start;
+                app.renderer.lod_fade_end   = app.solar_cfg.tenebris.lod_fade_end;
+            }
         }
 
         // Moon reference frame: track Kepler position for world-space reconstruction.

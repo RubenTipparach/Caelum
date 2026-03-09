@@ -125,7 +125,9 @@ typedef struct {
 
 static void lod_debug_pre_draw(int depth, void* user_data) {
     LodDebugState* state = (LodDebugState*)user_data;
-    state->fs_params.lod_debug = (HMM_Vec4){{(float)depth, state->max_depth, 0.0f, 0.0f}};
+    state->fs_params.lod_debug.X = (float)depth;
+    state->fs_params.lod_debug.Y = state->max_depth;
+    // .Z and .W preserved (hex_fade_start/end)
     sg_apply_uniforms(UB_planet_fs_params, &SG_RANGE(state->fs_params));
 }
 
@@ -594,8 +596,9 @@ void render_update_mesh(Renderer* r, Planet* planet, const Camera* cam) {
         hex_terrain_ctrl_placement(&r->hex_terrain, &r->hex_placement, cam->position);
     }
 
-    // Suppress LOD close-range patches where hex terrain has meshed chunks
-    r->lod_tree.suppress_range = hex_terrain_effective_range(&r->hex_terrain);
+    // No LOD suppression — both LOD and hex terrain render, hex wins via
+    // HEX_SURFACE_BIAS (0.5m) in the log depth buffer. Zero flickering/gaps.
+    // suppress_range stays 0.0 (set in render_init)
 
     // Accumulate profiler timings
     r->profile.accum_lod_update_ms += (float)stm_ms(stm_diff(t1, t0));
@@ -722,7 +725,7 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
             r->atmosphere.config.rayleigh_scale * r->visual_config.terrain_fog_density,
             r->atmosphere.config.sun_intensity,
         }},
-        .lod_debug = (HMM_Vec4){{0.0f, 0.0f, 0.0f, 0.0f}},
+        .lod_debug = (HMM_Vec4){{0.0f, 0.0f, r->lod_fade_start, r->lod_fade_end}},
         .dusk_sun_color = (HMM_Vec4){{
             r->visual_config.dusk_sun_color.X,
             r->visual_config.dusk_sun_color.Y,

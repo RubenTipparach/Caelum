@@ -16,6 +16,8 @@ typedef struct TenebrisConfig {
     int   noise_seed;          /* 42 */
     int   sea_level;           /* 24 (layers) */
     float layer_thickness;     /* 1.0 m */
+    float lod_fade_start;      /* LOD dither fade start distance (m), 0 = no fade */
+    float lod_fade_end;        /* LOD dither fade end distance (m) */
 } TenebrisConfig;
 
 typedef struct MoonConfig {
@@ -40,6 +42,9 @@ typedef struct MoonConfig {
     HMM_Vec3 base_color;
     HMM_Vec3 highlight_color;
     HMM_Vec3 shadow_color;
+    /* LOD fade */
+    float lod_fade_start;      /* LOD dither fade start distance (m), 0 = no fade */
+    float lod_fade_end;        /* LOD dither fade end distance (m) */
 } MoonConfig;
 
 typedef struct SolarSystemConfig {

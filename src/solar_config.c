@@ -9,6 +9,8 @@ SolarSystemConfig solar_system_default_config(void) {
     cfg.tenebris.noise_seed      = 42;
     cfg.tenebris.sea_level       = 24;
     cfg.tenebris.layer_thickness = 1.0f;
+    cfg.tenebris.lod_fade_start  = 250.0f;
+    cfg.tenebris.lod_fade_end    = 400.0f;
 
     /* ---- 10 Moons ---- */
     /*
@@ -30,6 +32,7 @@ SolarSystemConfig solar_system_default_config(void) {
         .base_color = {{0.38f, 0.38f, 0.42f}},
         .highlight_color = {{0.52f, 0.52f, 0.57f}},
         .shadow_color = {{0.18f, 0.18f, 0.22f}},
+        .lod_fade_start = 250.0f, .lod_fade_end = 400.0f,
     };
 
     cfg.moons[1] = (MoonConfig){
@@ -42,6 +45,7 @@ SolarSystemConfig solar_system_default_config(void) {
         .base_color = {{0.40f, 0.40f, 0.44f}},
         .highlight_color = {{0.55f, 0.55f, 0.60f}},
         .shadow_color = {{0.20f, 0.20f, 0.24f}},
+        .lod_fade_start = 250.0f, .lod_fade_end = 400.0f,
     };
 
     /* --- 3 large moons (5-7km radius) --- */
@@ -55,6 +59,7 @@ SolarSystemConfig solar_system_default_config(void) {
         .base_color = {{0.36f, 0.37f, 0.40f}},
         .highlight_color = {{0.50f, 0.51f, 0.55f}},
         .shadow_color = {{0.17f, 0.17f, 0.20f}},
+        .lod_fade_start = 250.0f, .lod_fade_end = 400.0f,
     };
 
     cfg.moons[3] = (MoonConfig){
@@ -67,6 +72,7 @@ SolarSystemConfig solar_system_default_config(void) {
         .base_color = {{0.34f, 0.34f, 0.38f}},
         .highlight_color = {{0.48f, 0.48f, 0.53f}},
         .shadow_color = {{0.16f, 0.16f, 0.19f}},
+        .lod_fade_start = 250.0f, .lod_fade_end = 400.0f,
     };
 
     cfg.moons[4] = (MoonConfig){
@@ -79,6 +85,7 @@ SolarSystemConfig solar_system_default_config(void) {
         .base_color = {{0.42f, 0.42f, 0.46f}},
         .highlight_color = {{0.57f, 0.57f, 0.62f}},
         .shadow_color = {{0.22f, 0.22f, 0.25f}},
+        .lod_fade_start = 250.0f, .lod_fade_end = 400.0f,
     };
 
     /* --- 5 small moons (1-4km radius) --- */
@@ -92,6 +99,7 @@ SolarSystemConfig solar_system_default_config(void) {
         .base_color = {{0.32f, 0.32f, 0.36f}},
         .highlight_color = {{0.46f, 0.46f, 0.51f}},
         .shadow_color = {{0.15f, 0.15f, 0.18f}},
+        .lod_fade_start = 250.0f, .lod_fade_end = 400.0f,
     };
 
     cfg.moons[6] = (MoonConfig){
@@ -104,6 +112,7 @@ SolarSystemConfig solar_system_default_config(void) {
         .base_color = {{0.37f, 0.38f, 0.42f}},
         .highlight_color = {{0.52f, 0.53f, 0.58f}},
         .shadow_color = {{0.18f, 0.18f, 0.22f}},
+        .lod_fade_start = 250.0f, .lod_fade_end = 400.0f,
     };
 
     cfg.moons[7] = (MoonConfig){
@@ -116,6 +125,7 @@ SolarSystemConfig solar_system_default_config(void) {
         .base_color = {{0.35f, 0.35f, 0.40f}},
         .highlight_color = {{0.50f, 0.50f, 0.56f}},
         .shadow_color = {{0.17f, 0.17f, 0.21f}},
+        .lod_fade_start = 250.0f, .lod_fade_end = 400.0f,
     };
 
     cfg.moons[8] = (MoonConfig){
@@ -128,6 +138,7 @@ SolarSystemConfig solar_system_default_config(void) {
         .base_color = {{0.33f, 0.33f, 0.38f}},
         .highlight_color = {{0.47f, 0.47f, 0.53f}},
         .shadow_color = {{0.15f, 0.15f, 0.19f}},
+        .lod_fade_start = 250.0f, .lod_fade_end = 400.0f,
     };
 
     cfg.moons[9] = (MoonConfig){
@@ -140,6 +151,7 @@ SolarSystemConfig solar_system_default_config(void) {
         .base_color = {{0.39f, 0.40f, 0.44f}},
         .highlight_color = {{0.54f, 0.55f, 0.60f}},
         .shadow_color = {{0.19f, 0.20f, 0.23f}},
+        .lod_fade_start = 250.0f, .lod_fade_end = 400.0f,
     };
 
     return cfg;
