@@ -46,7 +46,7 @@ layout(binding=1) uniform planet_fs_params {
     vec4 sun_direction;     // xyz = normalized sun dir, w = fog_scale_height
     vec4 camera_pos;        // xyz = camera world position, w = hex_suppress_range (0 = disabled)
     vec4 atmos_params;      // x = planet_radius, y = atmos_radius, z = rayleigh_scale, w = sun_intensity
-    vec4 lod_debug;         // x = LOD depth (0 = off/normal), y = max_depth for color mapping
+    vec4 lod_debug;         // x = LOD depth (0 = off/normal), y = max_depth, z = hex_fade_start, w = hex_fade_end
     vec4 dusk_sun_color;    // xyz = warm sunset color (from config.yaml)
     vec4 day_sun_color;     // xyz = neutral daylight color (from config.yaml)
     vec4 planet_tex_params; // x = enabled (>0), y = blend_start, z = blend_end, w = unused
@@ -73,10 +73,39 @@ float atmosEntryDist(vec3 ro, vec3 rd, float r) {
 }
 
 void main() {
-    // Discard LOD fragments inside hex terrain range (hex terrain renders its own voxels there)
-    float hex_suppress = camera_pos.w;
-    if (hex_suppress > 0.0 && length(fs_cam_rel_pos) < hex_suppress) {
-        discard;
+    // Distance-based LOD fade: dither-discard close fragments where hex terrain covers.
+    // lod_debug.z = fade_start (fully discarded below), lod_debug.w = fade_end (fully visible above)
+    // When both are 0, no fading (e.g. no hex terrain active).
+    float hex_fade_start = lod_debug.z;
+    float hex_fade_end = lod_debug.w;
+    if (hex_fade_end > 0.0) {
+        float frag_dist = length(fs_cam_rel_pos);
+        if (frag_dist < hex_fade_start) discard;
+        if (frag_dist < hex_fade_end) {
+            float opacity = smoothstep(hex_fade_start, hex_fade_end, frag_dist);
+            // 4x4 Bayer ordered dither
+            int px = int(gl_FragCoord.x) % 4;
+            int py = int(gl_FragCoord.y) % 4;
+            int idx = px + py * 4;
+            float threshold;
+            if      (idx ==  0) threshold = 0.0 / 16.0;
+            else if (idx ==  1) threshold = 8.0 / 16.0;
+            else if (idx ==  2) threshold = 2.0 / 16.0;
+            else if (idx ==  3) threshold = 10.0 / 16.0;
+            else if (idx ==  4) threshold = 12.0 / 16.0;
+            else if (idx ==  5) threshold = 4.0 / 16.0;
+            else if (idx ==  6) threshold = 14.0 / 16.0;
+            else if (idx ==  7) threshold = 6.0 / 16.0;
+            else if (idx ==  8) threshold = 3.0 / 16.0;
+            else if (idx ==  9) threshold = 11.0 / 16.0;
+            else if (idx == 10) threshold = 1.0 / 16.0;
+            else if (idx == 11) threshold = 9.0 / 16.0;
+            else if (idx == 12) threshold = 15.0 / 16.0;
+            else if (idx == 13) threshold = 7.0 / 16.0;
+            else if (idx == 14) threshold = 13.0 / 16.0;
+            else                threshold = 5.0 / 16.0;
+            if (opacity < threshold) discard;
+        }
     }
 
     vec3 N = normalize(fs_normal);

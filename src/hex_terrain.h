@@ -26,7 +26,7 @@
 #define HEX_MAX_UPLOADS      32         // GPU uploads per frame
 #define HEX_MAX_ACTIVATIONS  16         // Max new chunks activated per frame (spread load)
 #define HEX_MAX_DRAW_ALT    2000.0f     // Hex terrain disabled above this altitude (m above ground)
-#define HEX_SURFACE_BIAS     0.05f      // Radial offset (m) to prevent Z-fighting with smooth LOD
+#define HEX_SURFACE_BIAS     0.5f       // Radial offset (m) so hex wins depth test over LOD (log depth = no Z-fight)
 #define HEX_COL_SPACING     (1.5f * HEX_RADIUS)               // Horizontal center-to-center
 #define HEX_ROW_SPACING     (1.7320508f * HEX_RADIUS)         // sqrt(3) * HEX_RADIUS
 

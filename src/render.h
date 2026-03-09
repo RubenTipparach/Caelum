@@ -71,6 +71,10 @@ typedef struct Renderer {
     // Hex terrain (close-range voxel grid)
     HexTerrain hex_terrain;
 
+    // LOD fade (from solar config)
+    float lod_fade_start;   // LOD dither fade start distance (m)
+    float lod_fade_end;     // LOD dither fade end distance (m)
+
     // Common
     sg_pass_action pass_action;
     HMM_Vec3 sun_direction;
