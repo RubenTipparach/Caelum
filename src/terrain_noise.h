@@ -90,6 +90,13 @@ static inline float ht_sample_terrain_noise(fnl_state* continental, fnl_state* m
     height += mountain_height * 0.45f;
     height += detail * detail_weight;
 
+    // Power redistribution: steepen mountains, flatten plains/ocean floors.
+    if (height > 0.0f) {
+        height = powf(height, 1.35f);
+    } else {
+        height = -powf(-height, 0.8f);
+    }
+
     if (height > 1.0f) height = 1.0f;
     if (height < -1.0f) height = -1.0f;
     return height;

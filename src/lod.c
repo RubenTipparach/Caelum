@@ -168,6 +168,13 @@ static float sample_terrain_noise(fnl_state* continental, fnl_state* mountain,
     height += mountain_height * 0.45f;         // Mountain chains on land
     height += detail * detail_weight;           // Local variation
 
+    // Power redistribution: steepen mountains, flatten plains/ocean floors.
+    if (height > 0.0f) {
+        height = powf(height, 1.35f);
+    } else {
+        height = -powf(-height, 0.8f);
+    }
+
     // Clamp to [-1, 1]
     if (height > 1.0f) height = 1.0f;
     if (height < -1.0f) height = -1.0f;
@@ -213,18 +220,20 @@ static HMM_Vec3 perturb_color(HMM_Vec3 base, fnl_state* color_noise, HMM_Vec3 un
 }
 
 // Get terrain color based on height in meters above planet_radius.
-// Colors matched to hex terrain texture atlas average colors for seamless LOD transitions.
+// Colors matched to hex terrain biome gradients for seamless LOD transitions.
 // Uses smooth blending across biome boundaries (±100m blend zones).
 static HMM_Vec3 terrain_color_m(float height_m) {
     float rel = height_m - TERRAIN_SEA_LEVEL_M;
 
-    // Biome reference colors (matched to texture atlas averages)
+    // Per-biome dark/light variants for height-based gradient
     const HMM_Vec3 water_deep    = {{0.06f, 0.10f, 0.25f}};
     const HMM_Vec3 water_shallow = {{0.12f, 0.21f, 0.39f}};
-    const HMM_Vec3 sand          = {{0.94f, 0.84f, 0.77f}};
-    const HMM_Vec3 grass         = {{0.07f, 0.58f, 0.35f}};
-    const HMM_Vec3 rock          = {{0.46f, 0.45f, 0.45f}};
-    const HMM_Vec3 high_stone    = {{0.50f, 0.50f, 0.50f}};
+    const HMM_Vec3 sand_dark     = {{0.78f, 0.68f, 0.58f}};
+    const HMM_Vec3 sand_light    = {{0.96f, 0.88f, 0.80f}};
+    const HMM_Vec3 grass_dark    = {{0.04f, 0.38f, 0.22f}};
+    const HMM_Vec3 grass_light   = {{0.12f, 0.68f, 0.40f}};
+    const HMM_Vec3 rock_dark     = {{0.32f, 0.31f, 0.30f}};
+    const HMM_Vec3 rock_light    = {{0.55f, 0.54f, 0.53f}};
     const HMM_Vec3 ice           = {{0.44f, 0.77f, 0.97f}};
 
     // Ocean: smooth deep→shallow gradient
@@ -235,16 +244,27 @@ static HMM_Vec3 terrain_color_m(float height_m) {
 
     // Land biome transitions — smooth blend across ±100m zones
     float blend = 100.0f;
-    float t1 = smoothstepf(200.0f  - blend, 200.0f  + blend, rel);  // Sand → Grass
-    float t2 = smoothstepf(1500.0f - blend, 1500.0f + blend, rel);  // Grass → Rock
-    float t3 = smoothstepf(3000.0f - blend, 3000.0f + blend, rel);  // Rock → High Stone
-    float t4 = smoothstepf(4500.0f - blend, 4500.0f + blend, rel);  // High Stone → Ice
+    float t1 = smoothstepf(200.0f  - blend, 200.0f  + blend, rel);
+    float t2 = smoothstepf(1500.0f - blend, 1500.0f + blend, rel);
+    float t3 = smoothstepf(3000.0f - blend, 3000.0f + blend, rel);
+    float t4 = smoothstepf(4500.0f - blend, 4500.0f + blend, rel);
+
+    // Height within current biome band [0..1] for gradient
+    float local_h;
+    if (rel < 200.0f)       local_h = rel / 200.0f;
+    else if (rel < 1500.0f) local_h = (rel - 200.0f) / 1300.0f;
+    else if (rel < 4500.0f) local_h = (rel - 1500.0f) / 3000.0f;
+    else                    local_h = fminf((rel - 4500.0f) / 1000.0f, 1.0f);
+
+    HMM_Vec3 sand  = vec3_lerp(sand_dark,  sand_light,  local_h);
+    HMM_Vec3 grass = vec3_lerp(grass_dark, grass_light, local_h);
+    HMM_Vec3 rock  = vec3_lerp(rock_dark,  rock_light,  local_h);
 
     HMM_Vec3 color = sand;
-    color = vec3_lerp(color, grass,      t1);
-    color = vec3_lerp(color, rock,       t2);
-    color = vec3_lerp(color, high_stone, t3);
-    color = vec3_lerp(color, ice,        t4);
+    color = vec3_lerp(color, grass, t1);
+    color = vec3_lerp(color, rock,  t2);
+    color = vec3_lerp(color, rock,  t3);
+    color = vec3_lerp(color, ice,   t4);
     return color;
 }
 

@@ -14,7 +14,7 @@
 #define HEX_RADIUS          1.0f        // Circumradius of each hex (center to vertex) in meters
 #define HEX_HEIGHT          1.0f        // Height of one voxel layer in meters
 #define HEX_RANGE           500.0f      // Activation range from camera in meters
-#define HEX_INNER_RANGE     350.0f      // Full voxel prisms inside this range
+#define HEX_INNER_RANGE     150.0f      // LOD suppression range (conservative to avoid gaps)
 #define HEX_TRANSITION_ON   375.0f      // Switch chunk TO transition mode (hysteresis high)
 #define HEX_TRANSITION_OFF  325.0f      // Revert chunk FROM transition mode (hysteresis low)
 #define HEX_CHUNK_SIZE      32          // Hex columns per chunk side (32x32 grid)
@@ -54,6 +54,10 @@ typedef struct HexChunk {
     int16_t col_max_solid[HEX_CHUNK_SIZE][HEX_CHUNK_SIZE];
     float   ground_r;  // reference radius at tangent center (used for planet path)
     float   col_ellip_r[HEX_CHUNK_SIZE][HEX_CHUNK_SIZE];  // per-column ellipsoid radius (moons only)
+    float   col_height_m[HEX_CHUNK_SIZE][HEX_CHUNK_SIZE]; // per-column terrain height (cached)
+    float   col_slope[HEX_CHUNK_SIZE][HEX_CHUNK_SIZE];    // per-column slope magnitude (cached)
+    float   col_grad_e[HEX_CHUNK_SIZE][HEX_CHUNK_SIZE];   // per-column east gradient (cached)
+    float   col_grad_n[HEX_CHUNK_SIZE][HEX_CHUNK_SIZE];   // per-column north gradient (cached)
 
     // GPU mesh
     sg_buffer gpu_buffer;
