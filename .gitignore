@@ -30,6 +30,9 @@ node_modules/
 *.dylib
 *.dll
 
+# API keys
+config/ai_config.yaml
+
 # Tools (downloaded binaries, not committed)
 tools/sokol-shdc*
 tools/ai/
@@ -47,3 +50,4 @@ screenshots/
 cache/
 hex-planets-web.zip
 .history/
+config/ai_config.yaml
