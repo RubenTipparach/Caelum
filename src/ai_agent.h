@@ -9,6 +9,10 @@
 #include "ai_npc.h"
 #include "ai_actions.h"
 #include "ai_pathfind.h"
+#include "ai_sensors.h"
+#include "ai_script.h"
+#include "ai_memory.h"
+#include "ai_emotions.h"
 
 // --- AI Agent ---
 // A physical NPC entity that exists in the game world.
@@ -23,6 +27,11 @@ typedef enum {
     AGENT_STATE_WORKING,
     AGENT_STATE_TALKING,
     AGENT_STATE_SLEEPING,
+    AGENT_STATE_JUMPING,
+    AGENT_STATE_PICKUP,
+    AGENT_STATE_PLACING,
+    AGENT_STATE_WAVING,
+    AGENT_STATE_CELEBRATING,
 } AgentState;
 
 typedef struct {
@@ -58,11 +67,25 @@ typedef struct {
     AgentState state;
     float state_timer;         // time in current state
 
+    // Current hex position (updated each frame)
+    int hex_q, hex_r;          // global hex grid coords
+    int hex_layer;             // current ground layer
+    int hex_ground_layer;      // topmost solid layer at this column
+
     // Navigation
     AiPath path;
     int target_q, target_r;    // hex grid target for pathfinding
     bool has_target;
     float move_speed;          // meters per second
+    float stuck_timer;         // time spent not making progress
+    float last_dist_to_step;   // previous frame distance to next path step
+    float last_ground_r;       // previous frame ground height (for bob detection)
+    int   bob_count;           // consecutive frames where ground_r flipped
+    float bob_locked_r;        // locked ground height when bobbing detected
+
+    // Conversation
+    float convo_timer;         // time since last player interaction (0 = not in convo)
+    bool in_conversation;      // player is actively chatting
 
     // Rendering — CPU-side model-space verts (9 floats each: pos, normal, color)
     float* mesh_verts;
@@ -88,6 +111,13 @@ typedef struct {
     // AI connection
     AiNpc ai;
     AiActionExecutor executor;
+
+    // Scripting, sensors & memory
+    AiScriptRunner script_runner;
+    AiScanResult last_scan;
+    char sensor_report[AI_SENSOR_REPORT_MAX];
+    AiMemory memory;
+    AiEmotions emotions;
 
     // Sleep range
     float sleep_range;         // distance from player to sleep (default 200m)

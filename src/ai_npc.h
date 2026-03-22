@@ -38,6 +38,7 @@ typedef struct {
 
 #define AI_MAX_ACTIONS 32
 #define AI_MAX_DIALOGUE 512
+#define AI_MAX_SCRIPT_BUF 8192
 #define AI_MAX_HISTORY 16
 
 typedef struct {
@@ -52,6 +53,7 @@ typedef struct {
 
     // Parsed response
     char      dialogue[AI_MAX_DIALOGUE];
+    char      script_buf[AI_MAX_SCRIPT_BUF]; // extracted [SCRIPT]...[/SCRIPT] content
     AiAction  actions[AI_MAX_ACTIONS];
     int       action_count;
 
@@ -69,10 +71,22 @@ typedef struct {
     char      claude_api_key[128];
     char      claude_model[64];
 
+    // Transient context — prepended to the last user message in the request body only
+    // Not saved to history. Set before ai_npc_send(), cleared after.
+    char      context_prefix[2048];
+
+    // Script generation mode — when true, response is parsed as a JSON script
+    bool      script_mode;
+
     // Per-instance async HTTP (not shared global)
     void*     _http_thread;   // HANDLE, managed internally
     void*     _http_data;     // AiHttpThread*, managed internally
+
+    bool      send_blocked;   // set when user tried to send while AI_PENDING
 } AiNpc;
+
+// Load provider config from config/ai_config.yaml into an AiNpc struct.
+void ai_load_config(AiNpc* ai);
 
 // Initialize AI system. Call once at startup.
 // model_path: path to GGUF model file (e.g. "tools/ai/Qwen3-4B-Q4_K_M.gguf")

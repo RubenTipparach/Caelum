@@ -65,6 +65,11 @@ add_executable(hex-planets
     src/ai_actions.c
     src/ai_agent.c
     src/ai_pathfind.c
+    src/ai_sensors.c
+    src/ai_script.c
+    src/ai_memory.c
+    src/ai_orders.c
+    src/ai_emotions.c
 )
 if(APPLE)
     target_sources(hex-planets PRIVATE src/screenshot_metal.m src/platform_macos.m)

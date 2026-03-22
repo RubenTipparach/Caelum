@@ -311,37 +311,36 @@ int ai_agent_load(AiAgentSystem* sys, const char* json_path) {
 
     // Initialize AI subsystems — agent shares the already-running llama-server
     ai_actions_init(&a->executor);
+    ai_script_runner_init(&a->script_runner);
+    ai_emotions_init(&a->emotions);
 
-    // Set up agent's AI with server connection (port 8080, no need to launch — already running)
+    // Set up agent's AI — load provider config (local or Claude)
     memset(&a->ai, 0, sizeof(AiNpc));
     a->ai.server_port = 8080;
-    a->ai.server_running = true; // assume server launched by main ai_npc_init
-    a->ai.provider = AI_PROVIDER_LOCAL;
-
-    // Load config to check if we're using Claude
-    {
-        FILE* cf = fopen("config/ai_config.yaml", "r");
-        if (cf) {
-            char line[256];
-            while (fgets(line, sizeof(line), cf)) {
-                if (strstr(line, "provider:") && strstr(line, "claude")) {
-                    a->ai.provider = AI_PROVIDER_CLAUDE;
-                }
-                char* api = strstr(line, "api_key:");
-                if (api) {
-                    api += 8;
-                    while (*api == ' ' || *api == '"') api++;
-                    int k = 0;
-                    while (*api && *api != '"' && *api != '\n' && k < 127)
-                        a->ai.claude_api_key[k++] = *api++;
-                    a->ai.claude_api_key[k] = '\0';
-                }
-            }
-            fclose(cf);
-        }
+    ai_load_config(&a->ai);
+    if (a->ai.provider == AI_PROVIDER_LOCAL) {
+        a->ai.server_running = true; // assume server launched by main ai_npc_init
+    } else {
+        a->ai.server_running = true; // Claude is always "running"
     }
 
-    // Build system prompt from directives + personality
+    // Initialize persistent memory
+    {
+        char safe_name[64];
+        snprintf(safe_name, sizeof(safe_name), "%s", a->name);
+        // Lowercase for filesystem
+        for (int ci = 0; safe_name[ci]; ci++)
+            if (safe_name[ci] >= 'A' && safe_name[ci] <= 'Z')
+                safe_name[ci] += 32;
+
+        char agent_dir[256];
+        snprintf(agent_dir, sizeof(agent_dir), "cache/agents/%s", safe_name);
+        ai_memory_init(&a->memory, agent_dir);
+        ai_memory_load(&a->memory);
+        ai_memory_load_chat_history(&a->memory, &a->ai);
+    }
+
+    // Build system prompt from directives + personality + memory
     {
         char directives[512] = "";
         FILE* df = fopen("config/ai_directives.txt", "r");
@@ -350,10 +349,21 @@ int ai_agent_load(AiAgentSystem* sys, const char* json_path) {
             directives[dlen] = '\0';
             fclose(df);
         }
-        snprintf(a->ai.system_prompt, sizeof(a->ai.system_prompt),
-            "%s\n\nYour name is %s. %s\n"
-            "Respond with dialogue and a list of actions in JSON format.",
-            directives, a->name, a->directive);
+
+        // Build memory context
+        char memory_ctx[AI_MEMORY_MAX + AI_JOURNAL_MAX + 256];
+        ai_memory_build_context(&a->memory, memory_ctx, sizeof(memory_ctx));
+
+        if (a->ai.provider == AI_PROVIDER_CLAUDE) {
+            snprintf(a->ai.system_prompt, sizeof(a->ai.system_prompt),
+                "%s\n\nYour name is %s. %s\n%s",
+                directives, a->name, a->directive, memory_ctx);
+        } else {
+            snprintf(a->ai.system_prompt, sizeof(a->ai.system_prompt),
+                "%s\n\nYour name is %s. %s\n%s\n"
+                "Respond with dialogue and a list of actions in JSON format.",
+                directives, a->name, a->directive, memory_ctx);
+        }
     }
 
     printf("[AGENT] Loaded '%s' (id=%s) from %s\n", a->name, a->id, json_path);
@@ -441,10 +451,13 @@ void ai_agent_system_update(AiAgentSystem* sys, HexTerrain* ht,
 
         a->state_timer += dt;
         a->anim_time += dt;
+        ai_emotions_update(&a->emotions, dt, a->state);
 
         // Gravity: pull toward planet center
         a->position = HMM_V3((float)a->pos_d[0], (float)a->pos_d[1], (float)a->pos_d[2]);
-        float r = HMM_LenV3(a->position);
+        // Use double for radius to avoid float precision bobbing at large distances
+        double r_d = sqrt(a->pos_d[0]*a->pos_d[0] + a->pos_d[1]*a->pos_d[1] + a->pos_d[2]*a->pos_d[2]);
+        float r = (float)r_d;
         if (r > 0.001f) {
             a->local_up = HMM_MulV3F(a->position, 1.0f / r);
         }
@@ -452,62 +465,181 @@ void ai_agent_system_update(AiAgentSystem* sys, HexTerrain* ht,
         // Ground detection via hex terrain
         int gcol, grow, layer;
         hex_terrain_world_to_hex(ht, a->position, &gcol, &grow, &layer);
-        float ground_r = hex_terrain_ground_height(ht, gcol, grow);
+        // Compute ground_r in double to match r_d precision
+        double ground_r_d = (double)hex_terrain_ground_height(ht, gcol, grow);
+        float ground_r = (float)ground_r_d;
 
-        if (ground_r > 0.0f && r <= ground_r + 0.1f) {
-            // On ground — snap feet to surface (agent pos = feet + height offset)
-            a->on_ground = true;
-            float feet_r = ground_r + 0.05f; // tiny offset above ground
-            a->pos_d[0] = a->local_up.X * feet_r;
-            a->pos_d[1] = a->local_up.Y * feet_r;
-            a->pos_d[2] = a->local_up.Z * feet_r;
-            a->velocity = HMM_V3(0, 0, 0);
-        } else if (ground_r > 0.0f) {
-            // In air — apply gravity
-            a->on_ground = false;
-            float grav = 10.0f * dt;
-            a->velocity = HMM_SubV3(a->velocity, HMM_MulV3F(a->local_up, grav));
-            a->pos_d[0] += a->velocity.X * dt;
-            a->pos_d[1] += a->velocity.Y * dt;
-            a->pos_d[2] += a->velocity.Z * dt;
+        // Store current hex position for other systems
+        a->hex_q = gcol;
+        a->hex_r = grow;
+        a->hex_layer = layer;
+        if (ground_r > 0.0f) {
+            float base = hex_terrain_col_base_r(ht, gcol, grow);
+            a->hex_ground_layer = (base > 0.0f) ? (int)((ground_r - base) / HEX_HEIGHT) : 0;
         }
 
-        // ---- Pathfinding-based walking ----
-        if (a->state == AGENT_STATE_WALKING && a->path.valid) {
+        if (ground_r_d > 0.0) {
+            // Ground comparison in double precision to avoid float bobbing
+            double height_above_d = r_d - ground_r_d;
+            float height_above = (float)height_above_d;
+            bool jumping_up = (a->state == AGENT_STATE_JUMPING &&
+                              HMM_DotV3(a->velocity, a->local_up) > 0);
+            // Allow falling from any height up to 20m (comfortable cliff jump)
+            bool falling = (height_above > 0.5f && a->state != AGENT_STATE_SLEEPING);
+
+            if (jumping_up || falling) {
+                // In a jump arc — apply gravity, don't snap
+                a->on_ground = false;
+                float grav = 10.0f * dt;
+                a->velocity = HMM_SubV3(a->velocity, HMM_MulV3F(a->local_up, grav));
+                a->pos_d[0] += a->velocity.X * dt;
+                a->pos_d[1] += a->velocity.Y * dt;
+                a->pos_d[2] += a->velocity.Z * dt;
+            } else {
+                // Not jumping — snap to ground (in double precision)
+                a->on_ground = true;
+                double feet_r = ground_r_d + 0.05;
+                double norm = 1.0 / r_d;
+                a->pos_d[0] = a->pos_d[0] * norm * feet_r;
+                a->pos_d[1] = a->pos_d[1] * norm * feet_r;
+                a->pos_d[2] = a->pos_d[2] * norm * feet_r;
+                a->velocity = HMM_V3(0, 0, 0);
+            }
+        }
+
+        // ---- Pathfinding-based walking (+ jumping + stuck detection) ----
+        // Timeout or invalid path: give up
+        if ((a->state == AGENT_STATE_WALKING || a->state == AGENT_STATE_JUMPING)
+            && (!a->path.valid || a->state_timer > 30.0f)) {
+            a->state = AGENT_STATE_IDLE;
+            a->has_target = false;
+            a->path.valid = false;
+            a->stuck_timer = 0.0f;
+        }
+        if ((a->state == AGENT_STATE_WALKING || a->state == AGENT_STATE_JUMPING)
+            && a->path.valid) {
             int next_q, next_r;
             if (ai_path_next(&a->path, &next_q, &next_r)) {
-                // Get world position of next step
+                // Get world position & ground height of next step
                 float wx, wy, wz, ux, uy, uz;
+                float next_ground = hex_terrain_ground_height(ht, next_q, next_r);
                 hex_terrain_hex_to_world(ht, next_q, next_r,
-                    (int)((hex_terrain_ground_height(ht, next_q, next_r)
+                    (int)((next_ground
                            - hex_terrain_col_base_r(ht, next_q, next_r)) / HEX_HEIGHT),
                     &wx, &wy, &wz, &ux, &uy, &uz);
 
-                // Move toward target
+                // Distance to next step (tangent plane)
                 HMM_Vec3 target = HMM_V3(wx, wy, wz);
                 HMM_Vec3 to_target = HMM_SubV3(target, a->position);
-                // Project onto tangent plane
-                float dot = HMM_DotV3(to_target, a->local_up);
-                to_target = HMM_SubV3(to_target, HMM_MulV3F(a->local_up, dot));
+                float dot_up = HMM_DotV3(to_target, a->local_up);
+                to_target = HMM_SubV3(to_target, HMM_MulV3F(a->local_up, dot_up));
                 float dist_to_step = HMM_LenV3(to_target);
+
+                float height_diff = next_ground - ground_r;
+
+                // ---- Stuck detection ----
+                // If not making progress toward next step, we're stuck
+                if (a->on_ground && a->state == AGENT_STATE_WALKING) {
+                    if (a->last_dist_to_step > 0.0f &&
+                        dist_to_step >= a->last_dist_to_step - 0.01f) {
+                        a->stuck_timer += dt;
+                    } else {
+                        a->stuck_timer = 0.0f;
+                    }
+                    a->last_dist_to_step = dist_to_step;
+
+                    if (a->stuck_timer > 0.5f) {
+                        // Stuck! Decide what to do based on height difference
+                        if (height_diff > 0.3f && height_diff <= HEX_HEIGHT) {
+                            // 1-block wall: jump over it
+                            float jump_v = sqrtf(2.0f * 10.0f * (height_diff + 0.5f));
+                            a->velocity = HMM_MulV3F(a->local_up, jump_v);
+                            a->on_ground = false;
+                            a->state = AGENT_STATE_JUMPING;
+                            a->state_timer = 0.0f;
+                            a->anim_time = 0.0f;
+                            a->stuck_timer = 0.0f;
+                        } else if (height_diff > HEX_HEIGHT) {
+                            // Too high to jump — place a step block and climb
+                            HexHitResult hit;
+                            memset(&hit, 0, sizeof(hit));
+                            hit.valid = true;
+                            hit.place_gcol = gcol;
+                            hit.place_grow = grow;
+                            // Place at current ground + 1 layer (create a step)
+                            float base_r = hex_terrain_col_base_r(ht, gcol, grow);
+                            hit.place_layer = (int)((ground_r - base_r) / HEX_HEIGHT) + 1;
+                            if (hex_terrain_place(ht, &hit, VOXEL_STONE)) {
+                                printf("[AGENT] '%s' placed step block at q=%d r=%d layer=%d\n",
+                                       a->name, gcol, grow, hit.place_layer);
+                                fflush(stdout);
+                            }
+                            a->stuck_timer = 0.0f;
+                        } else {
+                            // Same height but stuck (collision with something)
+                            // Skip this path step or abandon path
+                            a->stuck_timer = 0.0f;
+                            ai_path_advance(&a->path);
+                            if (ai_path_done(&a->path)) {
+                                a->state = AGENT_STATE_IDLE;
+                                a->has_target = false;
+                            }
+                        }
+                    }
+                }
+
+                // ---- Proactive jump (before getting stuck) ----
+                if (height_diff > 0.3f && height_diff <= HEX_HEIGHT
+                    && a->on_ground && a->state == AGENT_STATE_WALKING
+                    && dist_to_step < 2.0f) {
+                    float jump_v = sqrtf(2.0f * 10.0f * (height_diff + 0.5f));
+                    a->velocity = HMM_MulV3F(a->local_up, jump_v);
+                    a->on_ground = false;
+                    a->state = AGENT_STATE_JUMPING;
+                    a->state_timer = 0.0f;
+                    a->anim_time = 0.0f;
+                    a->stuck_timer = 0.0f;
+                }
+
+                // Return to walking after landing from jump
+                if (a->state == AGENT_STATE_JUMPING && a->on_ground
+                    && a->state_timer > 0.1f) {
+                    a->state = AGENT_STATE_WALKING;
+                    a->stuck_timer = 0.0f;
+                    a->last_dist_to_step = 0.0f;
+                }
 
                 if (dist_to_step < 0.5f) {
                     // Reached this step, advance
                     ai_path_advance(&a->path);
+                    a->stuck_timer = 0.0f;
+                    a->last_dist_to_step = 0.0f;
                     if (ai_path_done(&a->path)) {
                         a->state = AGENT_STATE_IDLE;
                         a->has_target = false;
                     }
                 } else {
-                    // Walk toward step
+                    // Walk/move toward step
                     HMM_Vec3 move_dir = HMM_MulV3F(to_target, 1.0f / dist_to_step);
-                    float step = a->move_speed * dt;
+                    // Speed tiers: normal 2m/s, sprint 4m/s at >50m, run 8m/s if following at >30m
+                    float speed = a->move_speed;
+                    bool following = (a->has_target && a->target_q == -9999);
+                    if (following && dist > 30.0f) speed = 8.0f;
+                    else if (dist > 50.0f) speed = 4.0f;
+                    float step = speed * dt;
                     if (step > dist_to_step) step = dist_to_step;
                     a->pos_d[0] += move_dir.X * step;
                     a->pos_d[1] += move_dir.Y * step;
                     a->pos_d[2] += move_dir.Z * step;
-                    // Update facing
-                    a->forward = move_dir;
+
+                    // Tiny hop every ~8 steps to break out of ground-snap oscillation
+                    if (a->on_ground && fmodf(a->anim_time, 2.5f) < dt) {
+                        a->velocity = HMM_MulV3F(a->local_up, 1.5f);
+                        a->on_ground = false;
+                    }
+
+                    // Smooth turn toward movement direction
+                    a->forward = HMM_NormV3(HMM_LerpV3(a->forward, 8.0f * dt, move_dir));
                 }
             } else {
                 a->state = AGENT_STATE_IDLE;
@@ -517,11 +649,22 @@ void ai_agent_system_update(AiAgentSystem* sys, HexTerrain* ht,
         // ---- AI action execution ----
         ai_npc_poll(&a->ai);
         if (a->ai.state == AI_SUCCESS) {
+            printf("[AGENT] '%s' got AI_SUCCESS (dialogue=%s, %d actions)\n",
+                   a->name, a->ai.dialogue[0] ? "yes" : "EMPTY", a->ai.action_count);
+            fflush(stdout);
             // Enqueue actions from LLM response
             ai_actions_enqueue(&a->executor, a->ai.actions, a->ai.action_count);
-            a->ai.state = AI_IDLE;
+            // Play talking animation when agent responds with dialogue
+            if (a->ai.dialogue[0]) {
+                a->state = AGENT_STATE_TALKING;
+                a->state_timer = 0.0f;
+                a->anim_time = 0.0f;
+            }
+            // Don't reset ai.state here — let main.c read it for chat log first
         } else if (a->ai.state == AI_ERROR) {
-            a->ai.state = AI_IDLE;
+            printf("[AGENT] '%s' got AI_ERROR: %s\n", a->name, a->ai.error);
+            fflush(stdout);
+            // Don't reset — let main.c read the error first
         }
 
         // Process action queue — walk to target before executing place/break
@@ -570,6 +713,348 @@ void ai_agent_system_update(AiAgentSystem* sys, HexTerrain* ht,
             }
         } else if (a->state == AGENT_STATE_WORKING && !ai_actions_busy(&a->executor)) {
             a->state = AGENT_STATE_IDLE;
+        } else if (a->state == AGENT_STATE_TALKING && a->state_timer > 4.0f) {
+            // Return to idle after talking animation plays
+            a->state = AGENT_STATE_IDLE;
+        } else if (a->state == AGENT_STATE_WAVING && a->state_timer > 3.0f) {
+            a->state = AGENT_STATE_IDLE;
+        }
+
+        // ---- Conversation timeout ----
+        // Stay put while in conversation; expire after 15s idle or 60s typing
+        if (a->in_conversation) {
+            a->convo_timer += dt;
+            // If AI is pending (waiting for response), don't time out
+            if (a->ai.state == AI_PENDING) {
+                a->convo_timer = 0.0f;
+            }
+            // 60s if chat window is open (player typing), 15s otherwise
+            float timeout = 15.0f; // will be overridden by main.c if chat is open
+            if (a->convo_timer > timeout) {
+                a->in_conversation = false;
+                a->convo_timer = 0.0f;
+            }
+
+            // Smoothly face the player while in conversation
+            if (a->state == AGENT_STATE_IDLE || a->state == AGENT_STATE_TALKING ||
+                a->state == AGENT_STATE_WAVING) {
+                HMM_Vec3 ppos = HMM_V3((float)player_pos[0], (float)player_pos[1], (float)player_pos[2]);
+                HMM_Vec3 to_p = HMM_SubV3(ppos, a->position);
+                float dp = HMM_DotV3(to_p, a->local_up);
+                to_p = HMM_SubV3(to_p, HMM_MulV3F(a->local_up, dp));
+                float pl = HMM_LenV3(to_p);
+                if (pl > 0.001f) {
+                    HMM_Vec3 target_fwd = HMM_MulV3F(to_p, 1.0f / pl);
+                    a->forward = HMM_NormV3(HMM_LerpV3(a->forward, 5.0f * dt, target_fwd));
+                }
+            }
+        }
+
+        // ---- Script execution ----
+        if (!ai_script_idle(&a->script_runner)) {
+            // Auto-set anchor to agent's current hex pos if not set yet
+            if (!a->script_runner.anchor_set) {
+                a->script_runner.anchor_q = gcol;
+                a->script_runner.anchor_r = grow;
+                a->script_runner.anchor_layer = a->hex_ground_layer;
+                a->script_runner.anchor_set = true;
+            }
+
+            ScriptActionType sact = ai_script_update(&a->script_runner, dt);
+            if (sact != SCRIPT_ACT_NONE) {
+                const AiScriptStep* step = ai_script_current_step(&a->script_runner);
+                if (step) {
+                    // Resolve relative coords to absolute
+                    int abs_q = step->q, abs_r = step->r, abs_layer = step->layer;
+                    if (sact == SCRIPT_ACT_MOVE_REL || sact == SCRIPT_ACT_PLACE_REL ||
+                        sact == SCRIPT_ACT_BREAK_REL) {
+                        abs_q = a->script_runner.anchor_q + step->dq;
+                        abs_r = a->script_runner.anchor_r + step->dr;
+                        abs_layer = a->script_runner.anchor_layer + step->dlayer;
+                    }
+
+                    switch (sact) {
+                        case SCRIPT_ACT_MOVE_REL:
+                        case SCRIPT_ACT_MOVE_TO:
+                            if (ai_pathfind(&a->path, ht, gcol, grow, abs_q, abs_r)) {
+                                a->state = AGENT_STATE_WALKING;
+                                a->state_timer = 0.0f;
+                                a->script_runner.state = SCRIPT_MOVING;
+                            } else {
+                                ai_script_advance(&a->script_runner);
+                            }
+                            break;
+                        case SCRIPT_ACT_PLACE_REL:
+                        case SCRIPT_ACT_PLACE:
+                        case SCRIPT_ACT_BREAK_REL:
+                        case SCRIPT_ACT_BREAK: {
+                            // Phase 1: face the target block, enter BUILDING state
+                            float bx, by, bz, bux, buy, buz;
+                            hex_terrain_hex_to_world(ht, abs_q, abs_r, abs_layer,
+                                &bx, &by, &bz, &bux, &buy, &buz);
+                            HMM_Vec3 block_pos = HMM_V3(bx, by, bz);
+                            HMM_Vec3 to_block = HMM_SubV3(block_pos, a->position);
+                            float db = HMM_DotV3(to_block, a->local_up);
+                            to_block = HMM_SubV3(to_block, HMM_MulV3F(a->local_up, db));
+                            float bl = HMM_LenV3(to_block);
+                            if (bl > 0.001f) {
+                                HMM_Vec3 target_fwd = HMM_MulV3F(to_block, 1.0f / bl);
+                                a->forward = HMM_NormV3(HMM_LerpV3(a->forward, 0.5f, target_fwd));
+                            }
+                            a->script_runner.state = SCRIPT_BUILDING;
+                            a->script_runner.wait_timer = 0.5f; // cooldown
+                            if (sact == SCRIPT_ACT_PLACE || sact == SCRIPT_ACT_PLACE_REL) {
+                                a->state = AGENT_STATE_PLACING;
+                            } else {
+                                a->state = AGENT_STATE_WORKING;
+                            }
+                            a->state_timer = 0.0f;
+                        } break;
+                        case SCRIPT_ACT_SCAN:
+                            ai_sensors_scan(ht, gcol, grow,
+                                step->radius > 0 ? step->radius : 5, &a->last_scan);
+                            ai_script_advance(&a->script_runner);
+                            break;
+                        case SCRIPT_ACT_SCAN_REPORT:
+                            ai_sensors_scan(ht, gcol, grow, 5, &a->last_scan);
+                            ai_sensors_report(&a->last_scan, a->sensor_report,
+                                             sizeof(a->sensor_report));
+                            ai_script_advance(&a->script_runner);
+                            break;
+                        case SCRIPT_ACT_JUMP: {
+                            float jump_v = sqrtf(2.0f * 10.0f * 1.5f);
+                            a->velocity = HMM_MulV3F(a->local_up, jump_v);
+                            a->on_ground = false;
+                            a->state = AGENT_STATE_JUMPING;
+                            a->state_timer = 0.0f;
+                            ai_script_advance(&a->script_runner);
+                        } break;
+                        case SCRIPT_ACT_SAY:
+                            // Say is handled by main.c reading the step text
+                            ai_script_advance(&a->script_runner);
+                            break;
+                        default:
+                            ai_script_advance(&a->script_runner);
+                            break;
+                    }
+                }
+            }
+            // If script was MOVING and we've arrived (path done), advance
+            if (a->script_runner.state == SCRIPT_MOVING &&
+                a->state == AGENT_STATE_IDLE) {
+                a->script_runner.state = SCRIPT_RUNNING;
+                ai_script_advance(&a->script_runner);
+            }
+
+            // BUILDING state: cooldown timer, then execute place/break
+            if (a->script_runner.state == SCRIPT_BUILDING) {
+                a->script_runner.wait_timer -= dt;
+
+                // Keep facing the target during cooldown
+                const AiScriptStep* bstep = ai_script_current_step(&a->script_runner);
+                if (bstep) {
+                    int bq = bstep->q, br = bstep->r, bl = bstep->layer;
+                    if (bstep->action == SCRIPT_ACT_PLACE_REL || bstep->action == SCRIPT_ACT_BREAK_REL) {
+                        bq = a->script_runner.anchor_q + bstep->dq;
+                        br = a->script_runner.anchor_r + bstep->dr;
+                        bl = a->script_runner.anchor_layer + bstep->dlayer;
+                    }
+                    float bwx, bwy, bwz, bux, buy, buz;
+                    hex_terrain_hex_to_world(ht, bq, br, bl, &bwx, &bwy, &bwz, &bux, &buy, &buz);
+                    HMM_Vec3 to_b = HMM_SubV3(HMM_V3(bwx, bwy, bwz), a->position);
+                    float dp = HMM_DotV3(to_b, a->local_up);
+                    to_b = HMM_SubV3(to_b, HMM_MulV3F(a->local_up, dp));
+                    float tl = HMM_LenV3(to_b);
+                    if (tl > 0.001f)
+                        a->forward = HMM_NormV3(HMM_LerpV3(a->forward, 8.0f * dt, HMM_MulV3F(to_b, 1.0f / tl)));
+                }
+
+                if (a->script_runner.wait_timer <= 0.0f && bstep) {
+                    int bq = bstep->q, br = bstep->r, bl = bstep->layer;
+                    if (bstep->action == SCRIPT_ACT_PLACE_REL || bstep->action == SCRIPT_ACT_BREAK_REL) {
+                        bq = a->script_runner.anchor_q + bstep->dq;
+                        br = a->script_runner.anchor_r + bstep->dr;
+                        bl = a->script_runner.anchor_layer + bstep->dlayer;
+                    }
+
+                    if (bstep->action == SCRIPT_ACT_PLACE || bstep->action == SCRIPT_ACT_PLACE_REL) {
+                        // Remap layer relative to actual ground at anchor
+                        // LLM gives absolute layers based on what it was told;
+                        // correct by the delta between told vs actual ground
+                        int layer_offset = bl - a->script_runner.anchor_layer;
+                        int target_layer = a->hex_ground_layer + layer_offset;
+
+                        HexHitResult hit = {0};
+                        hit.valid = true;
+                        hit.place_gcol = bq;
+                        hit.place_grow = br;
+                        hit.place_layer = target_layer;
+                        uint8_t vtype = VOXEL_STONE;
+                        if (strcmp(bstep->block, "dirt") == 0)  vtype = VOXEL_DIRT;
+                        else if (strcmp(bstep->block, "grass") == 0) vtype = VOXEL_GRASS;
+                        else if (strcmp(bstep->block, "sand") == 0)  vtype = VOXEL_SAND;
+                        else if (strcmp(bstep->block, "ice") == 0)   vtype = VOXEL_ICE;
+                        else if (strcmp(bstep->block, "torch") == 0) vtype = VOXEL_TORCH;
+                        bool ok = hex_terrain_place(ht, &hit, vtype);
+                        printf("[BUILD] %s place %s q=%d r=%d layer=%d (offset=%d): %s\n",
+                               a->name, bstep->block[0] ? bstep->block : "stone",
+                               bq, br, target_layer, layer_offset,
+                               ok ? "OK" : "FAILED");
+                        fflush(stdout);
+                    } else {
+                        int layer_offset = bl - a->script_runner.anchor_layer;
+                        int target_layer = a->hex_ground_layer + layer_offset;
+
+                        HexHitResult hit = {0};
+                        hit.valid = true;
+                        hit.gcol = bq;
+                        hit.grow = br;
+                        hit.layer = target_layer;
+                        bool ok = hex_terrain_break(ht, &hit);
+                        printf("[BUILD] %s break q=%d r=%d layer=%d (offset=%d): %s\n",
+                               a->name, bq, br, target_layer, layer_offset,
+                               ok ? "OK" : "FAILED");
+                        fflush(stdout);
+                    }
+
+                    a->script_runner.state = SCRIPT_RUNNING;
+                    ai_script_advance(&a->script_runner);
+                }
+            }
+        }
+
+        // ---- Follow player mode (target_q == -9999) ----
+        if (a->has_target && a->target_q == -9999) {
+            // Keep conversation alive while following (don't timeout)
+            a->in_conversation = true;
+            a->convo_timer = 0.0f;
+
+            HMM_Vec3 ppos = HMM_V3((float)player_pos[0], (float)player_pos[1], (float)player_pos[2]);
+            float pdist = HMM_LenV3(HMM_SubV3(ppos, a->position));
+
+            // Re-pathfind when idle or when current path is outdated
+            if (pdist > 5.0f && (a->state == AGENT_STATE_IDLE ||
+                (a->state == AGENT_STATE_WALKING && a->state_timer > 2.0f))) {
+                int pq, pr, pl;
+                hex_terrain_world_to_hex(ht, ppos, &pq, &pr, &pl);
+                if (ai_pathfind(&a->path, ht, gcol, grow, pq, pr)) {
+                    a->state = AGENT_STATE_WALKING;
+                    a->state_timer = 0.0f;
+                    a->anim_time = 0.0f;
+                }
+            }
+            // If close enough, idle and face player
+            if (pdist <= 5.0f && a->state == AGENT_STATE_WALKING) {
+                a->state = AGENT_STATE_IDLE;
+                a->path.valid = false;
+                HMM_Vec3 to_player = HMM_SubV3(ppos, a->position);
+                float dot_p = HMM_DotV3(to_player, a->local_up);
+                to_player = HMM_SubV3(to_player, HMM_MulV3F(a->local_up, dot_p));
+                float plen = HMM_LenV3(to_player);
+                if (plen > 0.001f) {
+                    HMM_Vec3 target_fwd = HMM_MulV3F(to_player, 1.0f / plen);
+                    a->forward = HMM_NormV3(HMM_LerpV3(a->forward, 5.0f * dt, target_fwd));
+                }
+            }
+        }
+
+        // ---- Boredom-driven building ----
+        // When bored enough, self-prompt to build something creative
+        if (ai_emotions_wants_to_build(&a->emotions)
+            && a->state == AGENT_STATE_IDLE
+            && a->ai.state == AI_IDLE
+            && !a->in_conversation
+            && ai_script_idle(&a->script_runner)) {
+
+            // Pick a random creative prompt
+            static const char* build_ideas[] = {
+                "I'm bored. Build something cool nearby - a small sculpture or landmark.",
+                "Nothing to do. Build a tiny watchtower or decorative pillar.",
+                "I should practice my craft. Build a small stone arch.",
+                "This spot needs something. Build a little stone bench or marker.",
+                "Time to create! Build a small decorative hex column with torches.",
+                "I'll build a cairn - a stack of stones as a trail marker.",
+            };
+            int pick = rand() % 6;
+
+            // Scan surroundings for context
+            ai_sensors_scan(ht, gcol, grow, 4, &a->last_scan);
+            ai_sensors_report(&a->last_scan, a->sensor_report, sizeof(a->sensor_report));
+
+            // Set up as a build request
+            a->ai.script_mode = true;
+            a->state = AGENT_STATE_WORKING;
+            a->state_timer = 0.0f;
+
+            char mood[256];
+            ai_emotions_describe(&a->emotions, mood, sizeof(mood));
+            snprintf(a->ai.context_prefix, sizeof(a->ai.context_prefix),
+                "%s\n[SURROUNDINGS]\n%s\n"
+                "[BUILD INSTRUCTIONS]\n"
+                "You are at hex grid position q=%d, r=%d, ground_layer=%d.\n"
+                "Output a JSON build script. Start with a SHORT 1-sentence comment, then the script.\n"
+                "Format between [SCRIPT] and [/SCRIPT] tags.\n"
+                "Keep it small - 5 to 15 steps max. You're building for fun, not a mega project.\n"
+                "Available actions: place, break, move_to, say, wait, jump, scan\n"
+                "Available blocks: stone, dirt, grass, sand, ice, torch\n"
+                "Your position: q=%d r=%d. Ground layer is %d.\n"
+                "Start blocks AT layer %d.\n",
+                mood, a->sensor_report,
+                gcol, grow, a->hex_ground_layer,
+                gcol, grow, a->hex_ground_layer,
+                a->hex_ground_layer);
+
+            ai_npc_send(&a->ai, build_ideas[pick]);
+            a->emotions.boredom = 0.0f;
+            a->emotions.idle_time = 0.0f;
+
+            printf("[AGENT] '%s' got bored, self-prompting: \"%s\"\n",
+                   a->name, build_ideas[pick]);
+            fflush(stdout);
+        }
+
+        // ---- Idle wandering ----
+        // When idle with no pending actions or AI requests, wander randomly
+        // Don't wander during conversation, or while running a script
+        if (a->state == AGENT_STATE_IDLE && !ai_actions_busy(&a->executor)
+            && a->ai.state == AI_IDLE && !a->in_conversation
+            && ai_script_idle(&a->script_runner)
+            && a->state_timer > 3.0f + (float)(i % 5)) {
+            // Pick a random nearby walkable hex (offset by 3-8 cells)
+            int wander_q = gcol, wander_r = grow;
+            int steps = 3 + (rand() % 6);
+            for (int s = 0; s < steps; s++) {
+                int dir = rand() % 6;
+                int nq, nr;
+                // Offset-coordinate hex neighbors
+                int parity = wander_r & 1;
+                static const int even_dq[6] = {+1, 0,-1,-1, 0,+1};
+                static const int even_dr[6] = { 0,-1,-1, 0,+1,+1};
+                static const int odd_dq[6]  = {+1,+1, 0,-1,+1, 0};
+                static const int odd_dr[6]  = { 0,-1,-1, 0,+1,+1};
+                // Fix: use proper offset coords
+                if (parity == 0) {
+                    nq = wander_q + even_dq[dir];
+                    nr = wander_r + even_dr[dir];
+                } else {
+                    nq = wander_q + odd_dq[dir];
+                    nr = wander_r + odd_dr[dir];
+                }
+                // Check walkability (has ground)
+                float gr = hex_terrain_ground_height(ht, nq, nr);
+                if (gr > 0.0f) {
+                    wander_q = nq;
+                    wander_r = nr;
+                }
+            }
+            // Only pathfind if we actually moved from current cell
+            if (wander_q != gcol || wander_r != grow) {
+                if (ai_pathfind(&a->path, ht, gcol, grow, wander_q, wander_r)) {
+                    a->state = AGENT_STATE_WALKING;
+                    a->state_timer = 0.0f;
+                    a->anim_time = 0.0f;
+                }
+            }
         }
     }
 }
@@ -718,7 +1203,7 @@ void ai_agent_save_positions(const AiAgentSystem* sys, const char* path) {
     }
 
     fclose(f);
-    printf("[AGENT] Saved %d agent positions to %s\n", count, path);
+    // printf("[AGENT] Saved %d agent positions to %s\n", count, path);
     fflush(stdout);
 }
 

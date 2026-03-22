@@ -85,10 +85,10 @@ static void ai_log_message(const char* agent_name, const char* type, const char*
 
 // ---- Config parser for ai_config.yaml ----
 
-static void ai_load_config(AiNpc* ai) {
+void ai_load_config(AiNpc* ai) {
     ai->provider = AI_PROVIDER_LOCAL;
     ai->claude_api_key[0] = '\0';
-    snprintf(ai->claude_model, sizeof(ai->claude_model), "claude-sonnet-4-20250514");
+    snprintf(ai->claude_model, sizeof(ai->claude_model), "claude-sonnet-4-6");
 
     FILE* f = fopen("config/ai_config.yaml", "r");
     if (!f) {
@@ -139,14 +139,24 @@ static int build_claude_request_body(const AiNpc* ai, char* buf, int buf_size) {
     char escaped_system[2048];
     json_escape(ai->system_prompt, escaped_system, sizeof(escaped_system));
 
+    int max_tok = ai->script_mode ? 4096 : 100;
     pos += snprintf(buf + pos, buf_size - pos,
-        "{\"model\":\"%s\",\"max_tokens\":300,\"temperature\":1.0,"
+        "{\"model\":\"%s\",\"max_tokens\":%d,\"temperature\":1.0,"
         "\"system\":\"%s\",\"messages\":[",
-        ai->claude_model, escaped_system);
+        ai->claude_model, max_tok, escaped_system);
 
     for (int i = 0; i < ai->history_count; i++) {
-        char escaped[1024];
-        json_escape(ai->history[i].content, escaped, sizeof(escaped));
+        bool is_last_user = (strcmp(ai->history[i].role, "user") == 0 &&
+                            i == ai->history_count - 1);
+        char content_buf[3072];
+        if (is_last_user && ai->context_prefix[0]) {
+            snprintf(content_buf, sizeof(content_buf), "%s\n%s",
+                     ai->context_prefix, ai->history[i].content);
+        } else {
+            snprintf(content_buf, sizeof(content_buf), "%s", ai->history[i].content);
+        }
+        char escaped[3072];
+        json_escape(content_buf, escaped, sizeof(escaped));
         pos += snprintf(buf + pos, buf_size - pos,
             "{\"role\":\"%s\",\"content\":\"%s\"}%s",
             ai->history[i].role, escaped,
@@ -176,16 +186,30 @@ static int build_request_body(const AiNpc* ai, char* buf, int buf_size) {
 
     // Conversation history
     for (int i = 0; i < ai->history_count; i++) {
-        char escaped[1024];
-        json_escape(ai->history[i].content, escaped, sizeof(escaped));
+        bool is_last_user = (strcmp(ai->history[i].role, "user") == 0 &&
+                            i == ai->history_count - 1);
+        // For last user message: prepend context_prefix (mood, surroundings)
+        char content_buf[3072];
+        if (is_last_user && ai->context_prefix[0]) {
+            snprintf(content_buf, sizeof(content_buf), "%s\n%s",
+                     ai->context_prefix, ai->history[i].content);
+        } else {
+            snprintf(content_buf, sizeof(content_buf), "%s", ai->history[i].content);
+        }
+        char escaped[3072];
+        json_escape(content_buf, escaped, sizeof(escaped));
+        const char* suffix = is_last_user ? " /no_think" : "";
         pos += snprintf(buf + pos, buf_size - pos,
-            "{\"role\":\"%s\",\"content\":\"%s\"}%s",
-            ai->history[i].role, escaped,
+            "{\"role\":\"%s\",\"content\":\"%s%s\"}%s",
+            ai->history[i].role, escaped, suffix,
             (i < ai->history_count - 1) ? "," : "");
     }
 
+    int max_tok = ai->script_mode ? 4096 : 100;
     pos += snprintf(buf + pos, buf_size - pos,
-        "],\"temperature\":0.7,\"max_tokens\":1024,\"stream\":false}");
+        "],\"temperature\":1.05,\"max_tokens\":%d,\"stream\":false,"
+        "\"cache_prompt\":false,\"seed\":-1,"
+        "\"repeat_penalty\":1.3,\"repeat_last_n\":128}", max_tok);
 
     return pos;
 }
@@ -195,6 +219,11 @@ static int build_request_body(const AiNpc* ai, char* buf, int buf_size) {
 // Extract the "content" field from the chat completions response,
 // then parse the inner JSON (dialogue + actions).
 static void parse_response(AiNpc* ai, const char* body) {
+    // Clear all output buffers first
+    ai->dialogue[0] = '\0';
+    ai->script_buf[0] = '\0';
+    ai->action_count = 0;
+
     // Find "content" in the response (nested in choices[0].message.content)
     const char* content_key = "\"content\"";
     const char* p = strstr(body, content_key);
@@ -234,18 +263,42 @@ static void parse_response(AiNpc* ai, const char* body) {
     }
     content[ci] = '\0';
 
+    // Strip Qwen3 <think>...</think> blocks if present
+    {
+        char* ts = strstr(content, "<think>");
+        while (ts) {
+            char* te = strstr(ts, "</think>");
+            if (te) {
+                memmove(ts, te + 8, strlen(te + 8) + 1);
+            } else {
+                *ts = '\0'; // unclosed think tag, just truncate
+            }
+            ts = strstr(content, "<think>");
+        }
+        // Trim leading whitespace after stripping
+        char* trimmed = content;
+        while (*trimmed == ' ' || *trimmed == '\n' || *trimmed == '\r' || *trimmed == '\t') trimmed++;
+        if (trimmed != content) memmove(content, trimmed, strlen(trimmed) + 1);
+    }
+
     // Now parse the inner JSON (our grammar-constrained output)
+    printf("[AI] Raw content (%.300s%s)\n", content, strlen(content) > 300 ? "..." : "");
+    fflush(stdout);
     // Extract dialogue
     json_find_string(content, "dialogue", ai->dialogue, sizeof(ai->dialogue));
 
     // Extract actions array
     ai->action_count = 0;
     const char* actions_start = strstr(content, "\"actions\"");
-    if (!actions_start) return;
-
-    // Find the opening bracket
-    const char* bracket = strchr(actions_start, '[');
-    if (!bracket) return;
+    const char* bracket = actions_start ? strchr(actions_start, '[') : NULL;
+    if (!bracket) {
+        // No actions array — still a valid response (dialogue only)
+        // If no dialogue either, treat the whole content as dialogue
+        if (!ai->dialogue[0] && content[0]) {
+            snprintf(ai->dialogue, sizeof(ai->dialogue), "%s", content);
+        }
+        goto finish_parse;
+    }
 
     // Parse each action object
     const char* cursor = bracket + 1;
@@ -299,6 +352,7 @@ static void parse_response(AiNpc* ai, const char* body) {
         cursor = obj_end + 1;
     }
 
+finish_parse:
     // Add assistant response to history
     if (ai->history_count < AI_MAX_HISTORY) {
         AiMessage* msg = &ai->history[ai->history_count++];
@@ -443,8 +497,8 @@ static DWORD WINAPI ai_http_thread_func(LPVOID param) {
         L"Content-Type: application/json", -1,
         WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
 
-    // Set longer timeout for LLM inference (60 seconds)
-    WinHttpSetTimeouts(hRequest, 60000, 60000, 60000, 60000);
+    // Set longer timeout for LLM inference (120 seconds)
+    WinHttpSetTimeouts(hRequest, 60000, 60000, 120000, 120000);
 
     DWORD body_len = (DWORD)strlen(data->post_body);
     BOOL ok = WinHttpSendRequest(hRequest,
@@ -480,7 +534,7 @@ static DWORD WINAPI ai_http_thread_func(LPVOID param) {
         WINHTTP_HEADER_NAME_BY_INDEX, &status_code, &size, WINHTTP_NO_HEADER_INDEX);
 
     // Read response body
-    char body[8192];
+    char body[16384];
     int body_pos = 0;
     DWORD bytes_read = 0;
     while (body_pos < (int)sizeof(body) - 1) {
@@ -500,7 +554,8 @@ static DWORD WINAPI ai_http_thread_func(LPVOID param) {
 
     if (status_code >= 200 && status_code < 300) {
         parse_response(ai, body);
-        printf("[AI] Response received (%d actions)\n", ai->action_count);
+        printf("[AI] Response (HTTP %d, %d actions): \"%s\"\n",
+               (int)status_code, ai->action_count, ai->dialogue);
     } else {
         ai->state = AI_ERROR;
         snprintf(ai->error, sizeof(ai->error), "HTTP %d from llama-server", (int)status_code);
@@ -513,38 +568,109 @@ static DWORD WINAPI ai_http_thread_func(LPVOID param) {
 // ---- Claude API HTTP thread ----
 
 static void parse_claude_response(AiNpc* ai, const char* body) {
+    // Clear all output buffers first
+    ai->dialogue[0] = '\0';
+    ai->script_buf[0] = '\0';
+    ai->action_count = 0;
+
     // Claude returns {"content":[{"type":"text","text":"..."}], ...}
-    // Extract the text field
-    const char* text_key = "\"text\"";
-    const char* p = strstr(body, text_key);
+    int blen = (int)strlen(body);
+    printf("[AI] Claude raw (first 500): %.500s\n", body);
+    if (blen > 500)
+        printf("[AI] Claude raw (last 300): %s\n", body + blen - 300);
+    fflush(stdout);
+
+    // Find "text" key that's followed by ":" (skip "type":"text" which has "," after)
+    const char* p = body;
+    while ((p = strstr(p, "\"text\"")) != NULL) {
+        p += 6; // skip "text"
+        // Skip whitespace
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+        if (*p == ':') { p++; break; } // found "text": — this is the content field
+    }
     if (!p) {
-        snprintf(ai->error, sizeof(ai->error), "No 'text' in Claude response");
+        snprintf(ai->error, sizeof(ai->error), "No 'text' field in Claude response");
         ai->state = AI_ERROR;
         return;
     }
-    p += strlen(text_key);
-    while (*p == ' ' || *p == ':' || *p == '\t' || *p == '\n' || *p == '\r') p++;
-    if (*p != '"') { ai->state = AI_ERROR; return; }
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    if (*p != '"') {
+        snprintf(ai->error, sizeof(ai->error), "Claude 'text' not a string");
+        ai->state = AI_ERROR;
+        return;
+    }
     p++;
 
+    // Unescape full text into a large temp buffer first
+    char full_text[AI_MAX_SCRIPT_BUF];
     int ci = 0;
-    while (*p && ci < AI_MAX_DIALOGUE - 1) {
-        if (*p == '"' && *(p-1) != '\\') break;
+    while (*p && ci < (int)sizeof(full_text) - 1) {
         if (*p == '\\' && *(p+1)) {
             p++;
-            if (*p == 'n') ai->dialogue[ci++] = '\n';
-            else if (*p == '"') ai->dialogue[ci++] = '"';
-            else if (*p == '\\') ai->dialogue[ci++] = '\\';
-            else ai->dialogue[ci++] = *p;
+            if (*p == 'n') full_text[ci++] = '\n';
+            else if (*p == '"') full_text[ci++] = '"';
+            else if (*p == '\\') full_text[ci++] = '\\';
+            else if (*p == 't') full_text[ci++] = '\t';
+            else full_text[ci++] = *p;
+        } else if (*p == '"') {
+            break;
         } else {
-            ai->dialogue[ci++] = *p;
+            full_text[ci++] = *p;
         }
         p++;
     }
-    ai->dialogue[ci] = '\0';
-    ai->action_count = 0; // Claude doesn't return actions in chat mode
+    full_text[ci] = '\0';
 
-    // Add to history
+    // Log full response
+    ai_log_message("agent", "agent_msg", full_text);
+
+    // Extract [SCRIPT]...[/SCRIPT] into script_buf, remove from dialogue
+    ai->script_buf[0] = '\0';
+    char* script_start = strstr(full_text, "[SCRIPT]");
+    char* script_end = script_start ? strstr(script_start, "[/SCRIPT]") : NULL;
+    if (script_start) {
+        const char* content_start = script_start + 8;
+        int slen;
+        if (script_end) {
+            slen = (int)(script_end - content_start);
+        } else {
+            // Truncated — take everything after [SCRIPT] and try to close the JSON
+            slen = (int)strlen(content_start);
+            printf("[AI] Script truncated (max_tokens hit), salvaging %d bytes\n", slen);
+            fflush(stdout);
+        }
+        if (slen > 0 && slen < AI_MAX_SCRIPT_BUF - 4) {
+            memcpy(ai->script_buf, content_start, slen);
+            ai->script_buf[slen] = '\0';
+            // If truncated, try to close the JSON by finding last complete step
+            if (!script_end) {
+                // Find last complete '}' in a step
+                char* last_brace = strrchr(ai->script_buf, '}');
+                if (last_brace) {
+                    // Close the steps array and object
+                    snprintf(last_brace + 1, AI_MAX_SCRIPT_BUF - (int)(last_brace - ai->script_buf) - 1, "]}");
+                }
+            }
+        }
+        // Remove script block from text for dialogue
+        if (script_end) {
+            memmove(script_start, script_end + 9, strlen(script_end + 9) + 1);
+        } else {
+            *script_start = '\0'; // truncated — just cut it
+        }
+    }
+
+    // What remains is the dialogue (trim whitespace)
+    char* trimmed = full_text;
+    while (*trimmed == ' ' || *trimmed == '\n' || *trimmed == '\r') trimmed++;
+    int tlen = (int)strlen(trimmed);
+    while (tlen > 0 && (trimmed[tlen-1] == ' ' || trimmed[tlen-1] == '\n' || trimmed[tlen-1] == '\r'))
+        trimmed[--tlen] = '\0';
+    snprintf(ai->dialogue, AI_MAX_DIALOGUE, "%s", trimmed);
+
+    ai->action_count = 0;
+
+    // Add cleaned dialogue to history (not the script)
     if (ai->history_count < AI_MAX_HISTORY) {
         AiMessage* msg = &ai->history[ai->history_count++];
         snprintf(msg->role, sizeof(msg->role), "assistant");
@@ -552,7 +678,6 @@ static void parse_claude_response(AiNpc* ai, const char* body) {
     }
 
     ai->state = AI_SUCCESS;
-    ai_log_message("agent", "agent_msg", ai->dialogue);
 }
 
 static DWORD WINAPI ai_claude_thread_func(LPVOID param) {
@@ -636,7 +761,7 @@ static DWORD WINAPI ai_claude_thread_func(LPVOID param) {
         WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
         WINHTTP_HEADER_NAME_BY_INDEX, &status_code, &sz, WINHTTP_NO_HEADER_INDEX);
 
-    char body[8192];
+    char body[16384];
     int body_pos = 0;
     DWORD bytes_read = 0;
     while (body_pos < (int)sizeof(body) - 1) {
@@ -654,13 +779,37 @@ static DWORD WINAPI ai_claude_thread_func(LPVOID param) {
     WinHttpCloseHandle(hConnect);
     WinHttpCloseHandle(hSession);
 
+    printf("[AI] Claude HTTP %d (model=%s, body_len=%d)\n",
+           (int)status_code, ai->claude_model, body_pos);
     if (status_code >= 200 && status_code < 300) {
         parse_claude_response(ai, body);
-        printf("[AI] Claude response received\n");
+        if (ai->state == AI_ERROR) {
+            printf("[AI] Claude parse FAILED: %s\n", ai->error);
+            printf("[AI] Claude full body: %.*s\n", body_pos < 1000 ? body_pos : 1000, body);
+        } else {
+            printf("[AI] Claude response: \"%.200s\"\n", ai->dialogue);
+        }
     } else {
         ai->state = AI_ERROR;
-        snprintf(ai->error, sizeof(ai->error), "Claude HTTP %d", (int)status_code);
-        printf("[AI] Claude error: HTTP %d: %.200s\n", (int)status_code, body);
+        // Try to extract error message from response
+        const char* emsg = strstr(body, "\"message\"");
+        if (emsg) {
+            emsg = strchr(emsg + 9, '"');
+            if (emsg) {
+                emsg++; // skip opening quote
+                char errbuf[120];
+                int ei = 0;
+                while (*emsg && *emsg != '"' && ei < 119) errbuf[ei++] = *emsg++;
+                errbuf[ei] = '\0';
+                snprintf(ai->error, sizeof(ai->error), "Claude: %s", errbuf);
+            } else {
+                snprintf(ai->error, sizeof(ai->error), "Claude HTTP %d", (int)status_code);
+            }
+        } else {
+            snprintf(ai->error, sizeof(ai->error), "Claude HTTP %d", (int)status_code);
+        }
+        printf("[AI] Claude error: HTTP %d\n[AI] Response: %.*s\n",
+               (int)status_code, body_pos < 1000 ? body_pos : 1000, body);
     }
     fflush(stdout);
     return 0;
@@ -741,15 +890,22 @@ void ai_npc_set_system_prompt(AiNpc* ai, const char* prompt) {
 }
 
 void ai_npc_send(AiNpc* ai, const char* player_message) {
-    if (ai->state == AI_PENDING) return; // already in flight
+    if (ai->state == AI_PENDING) {
+        printf("[AI] BLOCKED: ai_npc_send called while state=AI_PENDING (still waiting for response)\n");
+        fflush(stdout);
+        ai->send_blocked = true;
+        return;
+    }
 
     if (!ai->server_running) {
+        printf("[AI] BLOCKED: server_running=false\n");
+        fflush(stdout);
         ai->state = AI_ERROR;
         snprintf(ai->error, sizeof(ai->error), "llama-server not running");
         return;
     }
 
-    // Add player message to history
+    // Add player message to history (strip context injection — save only the human text)
     if (ai->history_count >= AI_MAX_HISTORY) {
         memmove(&ai->history[0], &ai->history[2],
                 (AI_MAX_HISTORY - 2) * sizeof(AiMessage));
@@ -757,7 +913,14 @@ void ai_npc_send(AiNpc* ai, const char* player_message) {
     }
     AiMessage* msg = &ai->history[ai->history_count++];
     snprintf(msg->role, sizeof(msg->role), "user");
-    snprintf(msg->content, sizeof(msg->content), "%s", player_message);
+    // Strip [PLAYER SAYS] prefix if present — only save the actual player text
+    const char* clean_msg = strstr(player_message, "[PLAYER SAYS]\n");
+    if (clean_msg) {
+        clean_msg += 14; // skip "[PLAYER SAYS]\n"
+    } else {
+        clean_msg = player_message;
+    }
+    snprintf(msg->content, sizeof(msg->content), "%s", clean_msg);
 
     // Clean up previous per-instance HTTP thread (non-blocking)
     if (ai->_http_data) {
@@ -786,6 +949,16 @@ void ai_npc_send(AiNpc* ai, const char* player_message) {
         build_claude_request_body(ai, http->post_body, sizeof(http->post_body));
     } else {
         build_request_body(ai, http->post_body, sizeof(http->post_body));
+    }
+    // Log what we're sending
+    {
+        // Find max_tokens in the request body
+        const char* mt = strstr(http->post_body, "max_tokens");
+        char mt_val[16] = "?";
+        if (mt) { mt += 12; int mi = 0; while (mt[mi] >= '0' && mt[mi] <= '9' && mi < 15) { mt_val[mi] = mt[mi]; mi++; } mt_val[mi] = '\0'; }
+        printf("[AI] Request: script_mode=%d, max_tokens=%s, body_len=%d\n",
+               ai->script_mode, mt_val, (int)strlen(http->post_body));
+        fflush(stdout);
     }
 
     ai->state = AI_PENDING;

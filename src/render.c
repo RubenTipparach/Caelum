@@ -1096,14 +1096,12 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
                 agent->state == AGENT_STATE_SLEEPING) continue;
 
             // Offset agent mesh 0.5m above ground along local up
+            // Subtract world_origin in double precision FIRST to avoid float cancellation
             HMM_Vec3 aup = agent->local_up;
             float lift = 0.5f;
-            float px = (float)agent->pos_d[0] + aup.X * lift;
-            float py = (float)agent->pos_d[1] + aup.Y * lift;
-            float pz = (float)agent->pos_d[2] + aup.Z * lift;
-            float wo0 = (float)r->lod_tree.world_origin[0];
-            float wo1 = (float)r->lod_tree.world_origin[1];
-            float wo2 = (float)r->lod_tree.world_origin[2];
+            float px = (float)(agent->pos_d[0] - r->lod_tree.world_origin[0]) + aup.X * lift;
+            float py = (float)(agent->pos_d[1] - r->lod_tree.world_origin[1]) + aup.Y * lift;
+            float pz = (float)(agent->pos_d[2] - r->lod_tree.world_origin[2]) + aup.Z * lift;
             HMM_Vec3 afwd = agent->forward;
             HMM_Vec3 art = HMM_NormV3(HMM_Cross(afwd, aup));
             afwd = HMM_NormV3(HMM_Cross(aup, art));
@@ -1117,6 +1115,7 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
             // Angles in radians for sinf/cosf
             float body_bob = 0, head_pitch = 0, head_yaw = 0;
             float l_arm_pitch = 0, r_arm_pitch = 0;
+            float l_arm_raise = 0, r_arm_raise = 0; // sideways raise (roll around Z)
             float l_leg_pitch = 0, r_leg_pitch = 0;
             float deg2rad = 3.14159265f / 180.0f;
 
@@ -1128,7 +1127,10 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
                     break;
                 case AGENT_STATE_WALKING: {
                     float stride = sinf(t * 6.0f);
-                    body_bob = fabsf(sinf(t * 6.0f)) * 0.015f;
+                    // Small hop every ~4 steps to mask ground-height jitter
+                    float hop = fabsf(sinf(t * 3.0f));
+                    hop = hop * hop * hop * 0.08f; // sharp peaks, flat valleys
+                    body_bob = hop + fabsf(sinf(t * 6.0f)) * 0.01f;
                     l_leg_pitch = stride * 30.0f * deg2rad;
                     r_leg_pitch = -stride * 30.0f * deg2rad;
                     l_arm_pitch = -stride * 25.0f * deg2rad;
@@ -1147,6 +1149,60 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
                     l_arm_pitch = -30.0f * reach * deg2rad;
                     r_arm_pitch = -30.0f * reach * deg2rad;
                     head_pitch = -10.0f * reach * deg2rad;
+                } break;
+                case AGENT_STATE_JUMPING: {
+                    float phase = fmodf(t * 1.5f, 2.0f);
+                    if (phase < 0.5f) {
+                        body_bob = -(phase / 0.5f) * 0.04f;
+                    } else if (phase < 1.0f) {
+                        float p = (phase - 0.5f) / 0.5f;
+                        body_bob = sinf(p * 3.14159f) * 0.12f;
+                        l_arm_pitch = -sinf(p * 3.14159f) * 40.0f * deg2rad;
+                        r_arm_pitch = -sinf(p * 3.14159f) * 40.0f * deg2rad;
+                    } else if (phase < 1.5f) {
+                        float p = (phase - 1.0f) / 0.5f;
+                        body_bob = -sinf(p * 3.14159f * 0.5f) * 0.02f;
+                    }
+                    l_leg_pitch = body_bob * 100.0f * deg2rad;
+                    r_leg_pitch = l_leg_pitch;
+                } break;
+                case AGENT_STATE_PICKUP: {
+                    float phase = fmodf(t * 0.8f, 3.0f);
+                    float amount = 0;
+                    if (phase < 1.0f) amount = sinf(phase * 3.14159f * 0.5f);
+                    else if (phase < 1.5f) amount = 1.0f;
+                    else if (phase < 2.5f) amount = 1.0f - (phase - 1.5f);
+                    body_bob = -amount * 0.04f;
+                    l_arm_pitch = -amount * 40.0f * deg2rad;
+                    r_arm_pitch = -amount * 40.0f * deg2rad;
+                    l_leg_pitch = -amount * 10.0f * deg2rad;
+                    r_leg_pitch = l_leg_pitch;
+                    head_pitch = amount * 10.0f * deg2rad;
+                } break;
+                case AGENT_STATE_PLACING: {
+                    float phase = fmodf(t * 1.5f, 2.0f);
+                    float reach = (phase < 1.0f) ? sinf(phase * 3.14159f) : 0;
+                    l_arm_pitch = -30.0f * reach * deg2rad;
+                    r_arm_pitch = -30.0f * reach * deg2rad;
+                    head_pitch = -10.0f * reach * deg2rad;
+                } break;
+                case AGENT_STATE_WAVING: {
+                    // Right arm raised sideways with wave oscillation (matches WPF RightArmRaise=140)
+                    float wave = sinf(t * 6.0f) * 25.0f * deg2rad;
+                    r_arm_raise = 140.0f * deg2rad + wave;
+                    head_yaw = 10.0f * deg2rad;
+                    head_pitch = sinf(t * 3.0f) * 5.0f * deg2rad;
+                    body_bob = sinf(t * 3.0f) * 0.005f;
+                } break;
+                case AGENT_STATE_CELEBRATING: {
+                    body_bob = fabsf(sinf(t * 5.0f)) * 0.03f;
+                    float wiggle = sinf(t * 8.0f) * 10.0f * deg2rad;
+                    l_arm_pitch = -75.0f * deg2rad + wiggle;
+                    r_arm_pitch = -75.0f * deg2rad - wiggle;
+                    head_pitch = sinf(t * 6.0f) * 8.0f * deg2rad;
+                    head_yaw = sinf(t * 4.0f) * 12.0f * deg2rad;
+                    l_leg_pitch = sinf(t * 5.0f) * 10.0f * deg2rad;
+                    r_leg_pitch = -sinf(t * 5.0f) * 10.0f * deg2rad;
                 } break;
                 default: break;
             }
@@ -1168,6 +1224,15 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
                 (mx) = _tx; \
             } while(0)
 
+            // Rotate around Z axis (roll — raises arm sideways)
+            #define PIVOT_ROLL(mx, my, mz, pivot_y, angle) do { \
+                float _dy = (my) - (pivot_y); \
+                float _c = cosf(angle), _s = sinf(angle); \
+                float _tx = (mx) * _c - _dy * _s; \
+                (my) = (pivot_y) + (mx) * _s + _dy * _c; \
+                (mx) = _tx; \
+            } while(0)
+
             for (int v = 0; v < nv; v++) {
                 float mx = src[v*9], my = src[v*9+1], mz = src[v*9+2];
                 float mnx = src[v*9+3], mny = src[v*9+4], mnz = src[v*9+5];
@@ -1185,9 +1250,17 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
                 } else if (v >= agent->vr_left_arm_start && v < agent->vr_left_arm_start + agent->vr_left_arm_count) {
                     PIVOT_PITCH(mx, my, mz, agent->pivot_shoulder_y, l_arm_pitch);
                     PIVOT_PITCH(mnx, mny, mnz, 0, l_arm_pitch);
+                    if (l_arm_raise != 0.0f) {
+                        PIVOT_ROLL(mx, my, mz, agent->pivot_shoulder_y, l_arm_raise);
+                        PIVOT_ROLL(mnx, mny, mnz, 0, l_arm_raise);
+                    }
                 } else if (v >= agent->vr_right_arm_start && v < agent->vr_right_arm_start + agent->vr_right_arm_count) {
                     PIVOT_PITCH(mx, my, mz, agent->pivot_shoulder_y, r_arm_pitch);
                     PIVOT_PITCH(mnx, mny, mnz, 0, r_arm_pitch);
+                    if (r_arm_raise != 0.0f) {
+                        PIVOT_ROLL(mx, my, mz, agent->pivot_shoulder_y, r_arm_raise);
+                        PIVOT_ROLL(mnx, mny, mnz, 0, r_arm_raise);
+                    }
                 } else if (v >= agent->vr_head_start && v < agent->vr_head_start + agent->vr_head_count) {
                     PIVOT_PITCH(mx, my, mz, agent->pivot_neck_y, head_pitch);
                     PIVOT_PITCH(mnx, mny, mnz, 0, head_pitch);
@@ -1195,10 +1268,10 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
                     PIVOT_YAW(mnx, mny, mnz, 0, head_yaw);
                 }
 
-                // World transform: rotate by orientation + translate
-                xf[v*9+0] = px + art.X*mx + aup.X*my + afwd.X*mz - wo0;
-                xf[v*9+1] = py + art.Y*mx + aup.Y*my + afwd.Y*mz - wo1;
-                xf[v*9+2] = pz + art.Z*mx + aup.Z*my + afwd.Z*mz - wo2;
+                // World transform: rotate by orientation + translate (already in floating-origin space)
+                xf[v*9+0] = px + art.X*mx + aup.X*my + afwd.X*mz;
+                xf[v*9+1] = py + art.Y*mx + aup.Y*my + afwd.Y*mz;
+                xf[v*9+2] = pz + art.Z*mx + aup.Z*my + afwd.Z*mz;
                 xf[v*9+3] = art.X*mnx + aup.X*mny + afwd.X*mnz;
                 xf[v*9+4] = art.Y*mnx + aup.Y*mny + afwd.Y*mnz;
                 xf[v*9+5] = art.Z*mnx + aup.Z*mny + afwd.Z*mnz;
@@ -1209,6 +1282,7 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
 
             #undef PIVOT_PITCH
             #undef PIVOT_YAW
+            #undef PIVOT_ROLL
 
             int off = sg_append_buffer(s_mesh_buf, &(sg_range){xf, nv * 36});
             if (!sg_query_buffer_overflow(s_mesh_buf)) {
@@ -1448,18 +1522,17 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
         sdtx_puts("JETPACK OFF\n");
     }
 
-    // Selected block type
-    {
-        static const char* block_names[] = {
-            "AIR", "WATER", "SAND", "DIRT", "GRASS", "STONE", "ICE", "BEDROCK", "TORCH"
-        };
-        // Hotbar types: STONE, DIRT, GRASS, SAND, WATER, ICE, TORCH
-        static const int hotbar_voxel[] = { 5, 3, 4, 2, 1, 6, 8 };
-        int vtype = hotbar_voxel[r->hotbar_selected_slot % 7];
-        const char* name = (vtype < 9) ? block_names[vtype] : "???";
-        sdtx_color3f(1.0f, 0.8f, 0.4f);
-        sdtx_printf("[%d] %s\n", r->hotbar_selected_slot + 1, name);
-    }
+    // Selected block type (commented out — hotbar icons are sufficient)
+    // {
+    //     static const char* block_names[] = {
+    //         "AIR", "WATER", "SAND", "DIRT", "GRASS", "STONE", "ICE", "BEDROCK", "TORCH"
+    //     };
+    //     static const int hotbar_voxel[] = { 5, 3, 4, 2, 1, 6, 8 };
+    //     int vtype = hotbar_voxel[r->hotbar_selected_slot % 7];
+    //     const char* name = (vtype < 9) ? block_names[vtype] : "???";
+    //     sdtx_color3f(1.0f, 0.8f, 0.4f);
+    //     sdtx_printf("[%d] %s\n", r->hotbar_selected_slot + 1, name);
+    // }
 
     // Reference frame indicator (top-right corner)
     {
