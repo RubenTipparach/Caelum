@@ -128,6 +128,9 @@ typedef struct Renderer {
     SolarSystem solar_system;
     int lod_current_body;       // Which body LOD tree targets: -1 = Tenebris, 0-9 = moon
 
+    // AI Agents (set by main.c, cast to AiAgentSystem* in render.c)
+    void* agent_system;
+
     // Debug modes
     bool show_profiler;     // F3: performance overlay
     bool show_wireframe;    // P: wireframe overlay for physics debug

@@ -10,8 +10,8 @@ REM ============================================================
 set AI_DIR=%~dp0ai
 set LLAMA_VERSION=b8468
 set MODEL_REPO=Qwen
-set MODEL_NAME=Qwen3-4B-GGUF
-set MODEL_FILE=Qwen3-4B-Q4_K_M.gguf
+set MODEL_NAME=Qwen3-8B-GGUF
+set MODEL_FILE=Qwen3-8B-Q4_K_M.gguf
 
 REM llama.cpp release binary (Windows CUDA x64 — requires NVIDIA GPU)
 set LLAMA_ZIP=llama-%LLAMA_VERSION%-bin-win-cuda-12.4-x64.zip

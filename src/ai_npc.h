@@ -5,8 +5,13 @@
 #include <stdint.h>
 
 // --- AI NPC System ---
-// Manages a local llama-server sidecar process and communicates via HTTP.
+// Supports local llama-server or Claude API (configured via config/ai_config.yaml).
 // Non-blocking: call ai_npc_poll() each frame while a request is pending.
+
+typedef enum {
+    AI_PROVIDER_LOCAL,
+    AI_PROVIDER_CLAUDE,
+} AiProvider;
 
 typedef enum {
     AI_IDLE,        // No request in flight
@@ -57,9 +62,12 @@ typedef struct {
     // System prompt (personality/directives)
     char      system_prompt[1024];
 
-    // Server process state
+    // Provider config
+    AiProvider provider;
     bool      server_running;
     int       server_port;
+    char      claude_api_key[128];
+    char      claude_model[64];
 } AiNpc;
 
 // Initialize AI system. Call once at startup.

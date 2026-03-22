@@ -18,6 +18,7 @@
 #include "stb_image.h"
 
 #include "terrain_noise.h"
+#include "ai_agent.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -1037,6 +1038,219 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
         highlight_fs_params_t green_fs = { .color = (HMM_Vec4){{0.0f, 1.0f, 0.0f, 1.0f}} };
         sg_apply_uniforms(UB_highlight_fs_params, &SG_RANGE(green_fs));
         sg_draw(6, 6, 1);
+    }
+
+    // ---- Draw AI agent solid mesh (planet pipeline, TRIANGLES) ----
+    if (r->agent_system) {
+        AiAgentSystem* asys = (AiAgentSystem*)r->agent_system;
+
+        static sg_buffer s_mesh_buf = {0};
+        if (s_mesh_buf.id == SG_INVALID_ID) {
+            s_mesh_buf = sg_make_buffer(&(sg_buffer_desc){
+                .size = AI_AGENT_MAX * AI_AGENT_MESH_MAX_VERTS * 36,
+                .usage.vertex_buffer = true,
+                .usage.stream_update = true,
+                .label = "agent-mesh",
+            });
+        }
+
+        sg_apply_pipeline(r->pip);
+        sg_apply_uniforms(UB_planet_vs_params, &SG_RANGE(vs_params));
+        sg_apply_uniforms(UB_planet_fs_params, &SG_RANGE(fs_params));
+
+        for (int ai = 0; ai < asys->count; ai++) {
+            AiAgent* agent = &asys->agents[ai];
+            if (!agent->active || !agent->mesh_valid || !agent->mesh_verts ||
+                agent->state == AGENT_STATE_SLEEPING) continue;
+
+            float px = (float)agent->pos_d[0];
+            float py = (float)agent->pos_d[1];
+            float pz = (float)agent->pos_d[2];
+            float wo0 = (float)r->lod_tree.world_origin[0];
+            float wo1 = (float)r->lod_tree.world_origin[1];
+            float wo2 = (float)r->lod_tree.world_origin[2];
+
+            HMM_Vec3 aup = agent->local_up;
+            HMM_Vec3 afwd = agent->forward;
+            HMM_Vec3 art = HMM_NormV3(HMM_Cross(afwd, aup));
+            afwd = HMM_NormV3(HMM_Cross(aup, art));
+
+            // Transform model-space verts to floating-origin space
+            // Same coordinate space as terrain: (world_pos - world_origin)
+            int nv = agent->vert_count_total;
+            static float xf[AI_AGENT_MESH_MAX_VERTS * 9];
+            float* src = agent->mesh_verts;
+            for (int v = 0; v < nv; v++) {
+                float mx = src[v*9], my = src[v*9+1], mz = src[v*9+2];
+                float mnx = src[v*9+3], mny = src[v*9+4], mnz = src[v*9+5];
+                // Rotate + translate to world, subtract world_origin
+                xf[v*9+0] = px + art.X*mx + aup.X*my + afwd.X*mz - wo0;
+                xf[v*9+1] = py + art.Y*mx + aup.Y*my + afwd.Y*mz - wo1;
+                xf[v*9+2] = pz + art.Z*mx + aup.Z*my + afwd.Z*mz - wo2;
+                xf[v*9+3] = art.X*mnx + aup.X*mny + afwd.X*mnz;
+                xf[v*9+4] = art.Y*mnx + aup.Y*mny + afwd.Y*mnz;
+                xf[v*9+5] = art.Z*mnx + aup.Z*mny + afwd.Z*mnz;
+                xf[v*9+6] = src[v*9+6];
+                xf[v*9+7] = src[v*9+7];
+                xf[v*9+8] = src[v*9+8];
+            }
+
+            int off = sg_append_buffer(s_mesh_buf, &(sg_range){xf, nv * 36});
+            if (!sg_query_buffer_overflow(s_mesh_buf)) {
+                sg_bindings mb = {0};
+                mb.vertex_buffers[0] = s_mesh_buf;
+                mb.vertex_buffer_offsets[0] = off;
+                sg_apply_bindings(&mb);
+                sg_draw(0, nv, 1);
+            }
+        }
+    }
+
+    // ---- Draw AI agents wireframe ----
+    // 3 parts per agent: (1) magenta up-arrow, (2) bounding box, (3) wireframe body
+    // All use highlight_face_pip (LINES with depth test + log depth).
+    // Verts in floating-origin space (world_pos - world_origin), same as debug arrows.
+    if (r->agent_system) {
+        AiAgentSystem* asys = (AiAgentSystem*)r->agent_system;
+
+        // Dedicated agent line buffer — 256 verts max (created once)
+        static sg_buffer s_abuf = {0};
+        if (s_abuf.id == SG_INVALID_ID) {
+            s_abuf = sg_make_buffer(&(sg_buffer_desc){
+                .size = 256 * 3 * sizeof(float),
+                .usage.vertex_buffer = true,
+                .usage.stream_update = true,
+                .label = "agent-lines",
+            });
+        }
+
+        highlight_vs_params_t avs = {
+            .mvp = vp_terrain,
+            .camera_offset = vs_params.camera_offset,
+            .camera_offset_low = vs_params.camera_offset_low,
+            .log_depth = vs_params.log_depth,
+        };
+
+        for (int ai = 0; ai < asys->count; ai++) {
+            AiAgent* agent = &asys->agents[ai];
+            if (!agent->active || agent->state == AGENT_STATE_SLEEPING) continue;
+
+            float px = (float)agent->pos_d[0];
+            float py = (float)agent->pos_d[1];
+            float pz = (float)agent->pos_d[2];
+            float wo0 = (float)r->lod_tree.world_origin[0];
+            float wo1 = (float)r->lod_tree.world_origin[1];
+            float wo2 = (float)r->lod_tree.world_origin[2];
+
+            HMM_Vec3 up = agent->local_up;
+            HMM_Vec3 fwd = agent->forward;
+            HMM_Vec3 rt = HMM_NormV3(HMM_Cross(fwd, up));
+            fwd = HMM_NormV3(HMM_Cross(up, rt));
+
+            // Vertex helper: local (sx,sy,sz) -> floating-origin space
+            #define V(buf,i, sx,sy,sz) do { \
+                (buf)[(i)*3  ] = px+rt.X*(sx)+up.X*(sy)+fwd.X*(sz)-wo0; \
+                (buf)[(i)*3+1] = py+rt.Y*(sx)+up.Y*(sy)+fwd.Y*(sz)-wo1; \
+                (buf)[(i)*3+2] = pz+rt.Z*(sx)+up.Z*(sy)+fwd.Z*(sz)-wo2; \
+            } while(0)
+
+            float verts[256*3];
+            int n = 0;
+            float h = 1.5f;
+
+            // ---- (1) Magenta up-arrow (20m tall) ----
+            V(verts,n, 0,0,0); n++; V(verts,n, 0,20,0); n++; // shaft
+            V(verts,n, 0,20,0); n++; V(verts,n, 2,15,0); n++; // head right
+            V(verts,n, 0,20,0); n++; V(verts,n, -2,15,0); n++; // head left
+            int arrow_count = n;
+
+            // ---- (2) Bounding box (orange) ----
+            float bw=0.3f, bd=0.3f;
+            #define BOX_EDGE(x1,y1,z1,x2,y2,z2) V(verts,n,x1,y1,z1);n++;V(verts,n,x2,y2,z2);n++
+            // bottom
+            BOX_EDGE(-bw,0,-bd, bw,0,-bd); BOX_EDGE(-bw,0,bd, bw,0,bd);
+            BOX_EDGE(-bw,0,-bd, -bw,0,bd); BOX_EDGE(bw,0,-bd, bw,0,bd);
+            // top
+            BOX_EDGE(-bw,h,-bd, bw,h,-bd); BOX_EDGE(-bw,h,bd, bw,h,bd);
+            BOX_EDGE(-bw,h,-bd, -bw,h,bd); BOX_EDGE(bw,h,-bd, bw,h,bd);
+            // verticals
+            BOX_EDGE(-bw,0,-bd, -bw,h,-bd); BOX_EDGE(bw,0,-bd, bw,h,-bd);
+            BOX_EDGE(-bw,0,bd, -bw,h,bd); BOX_EDGE(bw,0,bd, bw,h,bd);
+            #undef BOX_EDGE
+            int box_count = n - arrow_count;
+
+            // ---- (3) Wireframe body ----
+            float tw=0.18f, td2=0.12f;
+            float tb=h*0.3f, tt=h*0.7f;
+            float hb=h*0.78f;
+            float hdw=0.13f, hdd=0.1f;
+            float ls=0.07f, as=tw+0.04f;
+            int body_start = n;
+            // torso verticals
+            V(verts,n,-tw,tb,-td2);n++;V(verts,n,-tw,tt,-td2);n++;
+            V(verts,n, tw,tb,-td2);n++;V(verts,n, tw,tt,-td2);n++;
+            V(verts,n,-tw,tb, td2);n++;V(verts,n,-tw,tt, td2);n++;
+            V(verts,n, tw,tb, td2);n++;V(verts,n, tw,tt, td2);n++;
+            // torso top ring
+            V(verts,n,-tw,tt,-td2);n++;V(verts,n, tw,tt,-td2);n++;
+            V(verts,n,-tw,tt, td2);n++;V(verts,n, tw,tt, td2);n++;
+            V(verts,n,-tw,tt,-td2);n++;V(verts,n,-tw,tt, td2);n++;
+            V(verts,n, tw,tt,-td2);n++;V(verts,n, tw,tt, td2);n++;
+            // torso bottom ring
+            V(verts,n,-tw,tb,-td2);n++;V(verts,n, tw,tb,-td2);n++;
+            V(verts,n,-tw,tb, td2);n++;V(verts,n, tw,tb, td2);n++;
+            V(verts,n,-tw,tb,-td2);n++;V(verts,n,-tw,tb, td2);n++;
+            V(verts,n, tw,tb,-td2);n++;V(verts,n, tw,tb, td2);n++;
+            // head box
+            V(verts,n,-hdw,hb,-hdd);n++;V(verts,n, hdw,hb,-hdd);n++;
+            V(verts,n,-hdw,hb, hdd);n++;V(verts,n, hdw,hb, hdd);n++;
+            V(verts,n,-hdw,hb,-hdd);n++;V(verts,n,-hdw,hb, hdd);n++;
+            V(verts,n, hdw,hb,-hdd);n++;V(verts,n, hdw,hb, hdd);n++;
+            V(verts,n,-hdw,h,-hdd);n++;V(verts,n, hdw,h,-hdd);n++;
+            V(verts,n,-hdw,h, hdd);n++;V(verts,n, hdw,h, hdd);n++;
+            V(verts,n,-hdw,h,-hdd);n++;V(verts,n,-hdw,h, hdd);n++;
+            V(verts,n, hdw,h,-hdd);n++;V(verts,n, hdw,h, hdd);n++;
+            V(verts,n,-hdw,hb,-hdd);n++;V(verts,n,-hdw,h,-hdd);n++;
+            V(verts,n, hdw,hb,-hdd);n++;V(verts,n, hdw,h,-hdd);n++;
+            V(verts,n,-hdw,hb, hdd);n++;V(verts,n,-hdw,h, hdd);n++;
+            V(verts,n, hdw,hb, hdd);n++;V(verts,n, hdw,h, hdd);n++;
+            // legs
+            V(verts,n,-ls,0,0);n++;V(verts,n,-ls,tb,0);n++;
+            V(verts,n, ls,0,0);n++;V(verts,n, ls,tb,0);n++;
+            // arms
+            V(verts,n,-as,h*0.5f,0);n++;V(verts,n,-as,tt,0);n++;
+            V(verts,n, as,h*0.5f,0);n++;V(verts,n, as,tt,0);n++;
+            int body_count = n - body_start;
+
+            #undef V
+
+            // Upload all verts at once
+            sg_update_buffer(s_abuf, &(sg_range){ verts, n*3*sizeof(float) });
+
+            sg_apply_pipeline(r->highlight_face_pip);
+            sg_apply_uniforms(UB_highlight_vs_params, &SG_RANGE(avs));
+
+            sg_bindings ab = {0};
+            ab.vertex_buffers[0] = s_abuf;
+            sg_apply_bindings(&ab);
+
+            // Draw (1) arrow in magenta
+            highlight_fs_params_t c1 = {.color=(HMM_Vec4){{1,0,1,1}}};
+            sg_apply_uniforms(UB_highlight_fs_params, &SG_RANGE(c1));
+            sg_draw(0, arrow_count, 1);
+
+            // Draw (2) bounding box in orange
+            highlight_fs_params_t c2 = {.color=(HMM_Vec4){{1,0.5f,0,0.8f}}};
+            sg_apply_uniforms(UB_highlight_fs_params, &SG_RANGE(c2));
+            sg_draw(arrow_count, box_count, 1);
+
+            // Draw (3) body in white (or green if talking)
+            HMM_Vec4 bc = (agent->state==AGENT_STATE_TALKING)
+                ? (HMM_Vec4){{0,1,0,1}} : (HMM_Vec4){{1,1,1,1}};
+            highlight_fs_params_t c3 = {.color=bc};
+            sg_apply_uniforms(UB_highlight_fs_params, &SG_RANGE(c3));
+            sg_draw(body_start, body_count, 1);
+        }
     }
 
     // ---- Profiler timing ----

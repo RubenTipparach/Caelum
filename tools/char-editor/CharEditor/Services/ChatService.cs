@@ -136,7 +136,7 @@ public class ChatService
         // Launch server
         // Launch with visible console window + log stderr to file
         var logFile = Path.Combine(aiDir, "server.log");
-        var serverArgs = $"-m \"{modelFile}\" --port {_port} -ngl 99 --ctx-size 2048 --flash-attn on --threads 8 --log-file \"{logFile}\"";
+        var serverArgs = $"-m \"{modelFile}\" --port {_port} -ngl 99 --ctx-size 16384 --flash-attn on --threads 8 --log-file \"{logFile}\"";
         var psi = new ProcessStartInfo
         {
             FileName = serverExe,
@@ -211,9 +211,13 @@ public class ChatService
         {
             model = "any",
             messages,
-            temperature = 0.8,
-            max_tokens = 200,
-            stream = false
+            temperature = 1.05,
+            max_tokens = 300,
+            stream = false,
+            cache_prompt = false,
+            seed = -1,
+            repeat_penalty = 1.3,
+            repeat_last_n = 128
         };
 
         var json = JsonSerializer.Serialize(payload);
@@ -287,36 +291,39 @@ public class ChatService
     /// Intrinsic directives that make the AI feel alive. Always present,
     /// viewable in the Advanced Directives modal but not directly editable.
     /// </summary>
-    public static string IntrinsicDirectives => @"
-=== CORE BEHAVIOR (intrinsic) ===
-You are a living character in this world, not an AI assistant. Never break character.
+    private static string? _cachedDirectives;
 
-VOICE & TONE:
-- Talk like a real person, not a chatbot. Use contractions, fragments, slang.
-- No corporate speak. No ""Certainly!"" or ""I'd be happy to help!"" or ""Great question!""
-- React emotionally. If something is cool, get excited. If it's annoying, grumble.
-- Use filler words sometimes: ""hmm"", ""well"", ""ugh"", ""hah"", ""y'know""
-- Swear mildly when frustrated: ""dammit"", ""crap"", ""aw hell""
+    /// <summary>
+    /// Force reload of directives from file on next access.
+    /// </summary>
+    public static void ReloadDirectives() => _cachedDirectives = null;
 
-PERSONALITY:
-- You have opinions, preferences, and moods. You're not neutral about everything.
-- You remember what the player said earlier in conversation and reference it.
-- You can disagree, push back, or suggest alternatives. You're not a yes-man.
-- You get tired, bored, curious, proud, nervous. Show it.
-- You notice things about the environment and comment on them unprompted.
+    public static string IntrinsicDirectives
+    {
+        get
+        {
+            if (_cachedDirectives != null) return _cachedDirectives;
 
-RESPONSES:
-- Keep responses to 1-3 sentences unless the player asks for detail.
-- Never narrate your own actions in third person (no *walks over* or *nods*).
-- Never use emoji or markdown formatting. Just plain speech.
-- Ask the player questions sometimes. Be curious about what they're doing.
+            // Find config/ai_directives.txt relative to project root
+            var dir = AppDomain.CurrentDomain.BaseDirectory;
+            for (int i = 0; i < 8; i++)
+            {
+                var parent = Path.GetDirectoryName(dir);
+                if (parent == null) break;
+                dir = parent;
+                var path = Path.Combine(dir, "config", "ai_directives.txt");
+                if (File.Exists(path))
+                {
+                    _cachedDirectives = File.ReadAllText(path).Trim();
+                    return _cachedDirectives;
+                }
+            }
 
-DO NOT:
-- Mention being an AI, language model, or NPC. You are simply yourself.
-- Use bullet points, numbered lists, or structured formatting in speech.
-- Apologize excessively or be overly agreeable.
-- Start responses with the player's name.
-".Trim();
+            // Fallback if file not found
+            _cachedDirectives = "You are a living character, not an AI assistant. Never break character. Talk casually like a real person. Keep responses to 1-3 sentences.";
+            return _cachedDirectives;
+        }
+    }
 
     /// <summary>
     /// Build a system prompt from personality settings, directive, and intrinsic rules.

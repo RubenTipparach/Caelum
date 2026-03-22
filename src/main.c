@@ -35,6 +35,7 @@
 #include "solar_config.h"
 #include "ai_npc.h"
 #include "ai_actions.h"
+#include "ai_agent.h"
 
 typedef enum {
     STATE_MENU,
@@ -102,12 +103,26 @@ static struct {
     // Solar system config (centralized, used at init and SOI transitions)
     SolarSystemConfig solar_cfg;
 
-    // AI NPC
+    // AI NPC (legacy direct chat — being replaced by agent system)
     AiNpc ai;
     AiActionExecutor ai_exec;
     bool ai_chat_open;          // Chat UI visible
     char ai_input[256];         // Player text input buffer
     int  ai_input_len;
+
+    // Chat message log (scrolls up and fades)
+    #define CHAT_LOG_MAX 16
+    #define CHAT_MSG_MAX 128
+    struct {
+        char text[CHAT_MSG_MAX];
+        float r, g, b;          // color
+        float age;              // seconds since posted
+    } chat_log[CHAT_LOG_MAX];
+    int chat_log_count;
+
+    // AI Agent system
+    AiAgentSystem agent_system;
+    bool agents_spawned;
 
     // Save restore state
     bool restore_moon_local;    // Skip world→moon transform on next SOI transition (loading from save)
@@ -152,6 +167,21 @@ static int room_code_len = 0;
 static int room_code_cursor_blink = 0;
 
 // Block interaction: use hex terrain selection from renderer
+static void chat_log_push(const char* text, float r, float g, float b) {
+    // Shift old messages up
+    if (app.chat_log_count >= CHAT_LOG_MAX) {
+        memmove(&app.chat_log[0], &app.chat_log[1],
+                (CHAT_LOG_MAX - 1) * sizeof(app.chat_log[0]));
+        app.chat_log_count = CHAT_LOG_MAX - 1;
+    }
+    int idx = app.chat_log_count++;
+    snprintf(app.chat_log[idx].text, CHAT_MSG_MAX, "%s", text);
+    app.chat_log[idx].r = r;
+    app.chat_log[idx].g = g;
+    app.chat_log[idx].b = b;
+    app.chat_log[idx].age = 0.0f;
+}
+
 static void interact_break(void) {
     if (!app.renderer.hex_placement.valid) return;
     HexHitResult* hit = &app.renderer.hex_placement;
@@ -256,7 +286,7 @@ static void init(void) {
     lobby_init("https://hex-planets.vercel.app");
 
     // AI NPC system
-    ai_npc_init(&app.ai, "tools/ai/Qwen3-4B-Q4_K_M.gguf",
+    ai_npc_init(&app.ai, "tools/ai/Qwen3-8B-Q4_K_M.gguf",
                 "tools/ai/grammar.gbnf", 8080);
     ai_actions_init(&app.ai_exec);
 
@@ -490,6 +520,40 @@ static void frame(void) {
         sdtx_puts("L = toggle LOD debug colors\n");
         sdtx_puts("V = toggle verbose logs\n");
         sdtx_puts("R = reload config.yaml\n");
+        sdtx_puts("E = talk to nearby AI agent\n");
+
+        // AI status
+        sdtx_puts("\n");
+        if (app.ai.server_running) {
+            sdtx_color3f(0.4f, 1.0f, 0.4f);
+            sdtx_puts("AI: llama-server running\n");
+        } else if (app.ai.provider == AI_PROVIDER_CLAUDE && app.ai.claude_api_key[0]) {
+            sdtx_color3f(0.4f, 0.8f, 1.0f);
+            sdtx_puts("AI: Claude API configured\n");
+        } else {
+            sdtx_color3f(0.6f, 0.4f, 0.4f);
+            sdtx_puts("AI: offline (run ai-install.bat)\n");
+        }
+
+        // Agent count
+        {
+            int agent_count = 0;
+            #ifdef _WIN32
+            WIN32_FIND_DATAA fd;
+            HANDLE hf = FindFirstFileA("cache/agents/*.json", &fd);
+            if (hf != INVALID_HANDLE_VALUE) {
+                do { agent_count++; } while (FindNextFileA(hf, &fd));
+                FindClose(hf);
+            }
+            #endif
+            if (agent_count > 0) {
+                sdtx_color3f(0.5f, 0.7f, 0.5f);
+                sdtx_printf("Agents: %d loaded\n", agent_count);
+            } else {
+                sdtx_color3f(0.5f, 0.5f, 0.5f);
+                sdtx_puts("Agents: none (use char editor)\n");
+            }
+        }
 
         sdtx_draw();
         sg_end_pass();
@@ -1095,6 +1159,45 @@ static void frame(void) {
                     active, total_verts, elapsed_ms, app.load_frame_count);
                 fflush(stdout);
                 app.state = STATE_PLAYING;
+
+                // Spawn AI agents near player
+                if (!app.agents_spawned) {
+                    ai_agent_system_init(&app.agent_system, app.planet.radius);
+
+                    // Try to load first agent from cache/agents/
+                    // Scan for any .json file
+                    #ifdef _WIN32
+                    {
+                        WIN32_FIND_DATAA fd;
+                        HANDLE hFind = FindFirstFileA("cache/agents/*.json", &fd);
+                        if (hFind != INVALID_HANDLE_VALUE) {
+                            do {
+                                char path[512];
+                                snprintf(path, sizeof(path), "cache/agents/%s", fd.cFileName);
+                                int idx = ai_agent_load(&app.agent_system, path);
+                                if (idx >= 0) {
+                                    // Spawn 5m to the right of player
+                                    HMM_Vec3 right = app.camera.right;
+                                    double sx = app.camera.pos_d[0] + right.X * 5.0;
+                                    double sy = app.camera.pos_d[1] + right.Y * 5.0;
+                                    double sz = app.camera.pos_d[2] + right.Z * 5.0;
+                                    ai_agent_spawn(&app.agent_system, idx,
+                                                   &app.renderer.hex_terrain, sx, sy, sz);
+                                }
+                            } while (FindNextFileA(hFind, &fd));
+                            FindClose(hFind);
+                        }
+                    }
+                    #endif
+                    // Try to restore saved positions
+                    {
+                        char agent_save[256];
+                        snprintf(agent_save, sizeof(agent_save), "%s/agents.dat", app.active_edits_dir);
+                        ai_agent_load_positions(&app.agent_system, agent_save);
+                    }
+                    app.agents_spawned = true;
+                    app.renderer.agent_system = &app.agent_system;
+                }
             }
             return;
         }
@@ -1115,21 +1218,40 @@ static void frame(void) {
         if (++autosave_counter >= 300) {
             autosave_counter = 0;
             player_save();
+            // Autosave agent positions
+            if (app.agents_spawned) {
+                char agent_save[256];
+                snprintf(agent_save, sizeof(agent_save), "%s/agents.dat", app.active_edits_dir);
+                ai_agent_save_positions(&app.agent_system, agent_save);
+            }
         }
 
         // AI NPC: poll for LLM response, execute queued actions
         ai_npc_poll(&app.ai);
         if (app.ai.state == AI_SUCCESS) {
-            printf("[AI] NPC says: \"%s\"\n", app.ai.dialogue);
-            fflush(stdout);
+            chat_log_push(app.ai.dialogue, 0.3f, 0.8f, 1.0f);
             ai_actions_enqueue(&app.ai_exec, app.ai.actions, app.ai.action_count);
             app.ai.state = AI_IDLE;
         } else if (app.ai.state == AI_ERROR) {
-            printf("[AI] Error: %s\n", app.ai.error);
-            fflush(stdout);
+            chat_log_push(app.ai.error, 1.0f, 0.3f, 0.3f);
             app.ai.state = AI_IDLE;
         }
         ai_actions_update(&app.ai_exec, &app.renderer.hex_terrain, dt);
+
+        // Poll agent AIs and push responses to chat log
+        for (int agi = 0; agi < app.agent_system.count; agi++) {
+            AiAgent* agent = &app.agent_system.agents[agi];
+            if (!agent->active) continue;
+            if (agent->ai.state == AI_SUCCESS && agent->ai.dialogue[0]) {
+                char msg[CHAT_MSG_MAX];
+                snprintf(msg, sizeof(msg), "%s: %s", agent->name, agent->ai.dialogue);
+                chat_log_push(msg, 0.3f, 0.8f, 1.0f);
+            }
+        }
+
+        // Update AI agents (physics, state, AI polling)
+        ai_agent_system_update(&app.agent_system, &app.renderer.hex_terrain,
+                               app.camera.pos_d, dt);
 
         // ---- LOD retarget: switch body when gravity changes ----
         if (app.camera.gravity_body != app.renderer.lod_current_body) {
@@ -1245,46 +1367,85 @@ static void frame(void) {
 
         app.renderer.hotbar_selected_slot = app.hotbar_slot;
 
-        // AI Chat overlay: write to sdtx before render_frame (sdtx_draw happens inside)
-        if (app.ai_chat_open) {
+        // "Press E to talk" prompt when near an agent
+        if (!app.ai_chat_open && app.camera.mouse_locked) {
+            int nearest = ai_agent_nearest(&app.agent_system, app.camera.pos_d, 10.0f);
+            if (nearest >= 0) {
+                AiAgent* agent = &app.agent_system.agents[nearest];
+                float cw = sapp_widthf() * 0.5f;
+                float ch = sapp_heightf() * 0.5f;
+                float cpx = sapp_widthf() / (cw / 8.0f);
+                sdtx_canvas(cw, ch);
+                sdtx_font(0);
+                // Center of screen, slightly below crosshair
+                float tx = cw / 2.0f / cpx - 10.0f;
+                float ty = ch / 2.0f / cpx + 2.0f;
+                sdtx_pos(tx, ty);
+                sdtx_color3f(1.0f, 1.0f, 0.6f);
+                sdtx_printf("Press E to talk to %s", agent->name);
+            }
+        }
+
+        // ---- Chat log: age messages, remove old ones ----
+        {
+            float max_age = 30.0f; // messages visible for 30 seconds
+            int write = 0;
+            for (int i = 0; i < app.chat_log_count; i++) {
+                app.chat_log[i].age += dt;
+                if (app.chat_log[i].age < max_age) {
+                    if (write != i) app.chat_log[write] = app.chat_log[i];
+                    write++;
+                }
+            }
+            app.chat_log_count = write;
+        }
+
+        // ---- Chat overlay ----
+        {
             float cw = sapp_widthf() * 0.5f;
             float ch = sapp_heightf() * 0.5f;
             float cpx = sapp_widthf() / (cw / 8.0f);
-            float chat_y = ch - 3.0f * cpx;
             sdtx_canvas(cw, ch);
             sdtx_font(0);
-            sdtx_pos(1.0f, chat_y / cpx);
-            sdtx_color3f(0.3f, 1.0f, 0.3f);
-            sdtx_puts("[AI Chat] ");
-            sdtx_color3f(1.0f, 1.0f, 1.0f);
-            sdtx_puts(app.ai_input);
-            sdtx_puts("_");
-        } else if (app.ai.state == AI_PENDING) {
-            float cw = sapp_widthf() * 0.5f;
-            float ch = sapp_heightf() * 0.5f;
-            float cpx = sapp_widthf() / (cw / 8.0f);
-            float chat_y = ch - 3.0f * cpx;
-            sdtx_canvas(cw, ch);
-            sdtx_font(0);
-            sdtx_pos(1.0f, chat_y / cpx);
-            sdtx_color3f(1.0f, 1.0f, 0.3f);
-            sdtx_puts("[AI] Thinking...");
-        } else if (app.ai.dialogue[0] && !ai_actions_busy(&app.ai_exec)) {
-            // Show last response briefly
-            float cw = sapp_widthf() * 0.5f;
-            float ch = sapp_heightf() * 0.5f;
-            float cpx = sapp_widthf() / (cw / 8.0f);
-            float chat_y = ch - 3.0f * cpx;
-            sdtx_canvas(cw, ch);
-            sdtx_font(0);
-            sdtx_pos(1.0f, chat_y / cpx);
-            sdtx_color3f(0.3f, 0.8f, 1.0f);
-            sdtx_puts("[NPC] ");
-            sdtx_color3f(1.0f, 1.0f, 1.0f);
-            // Truncate long messages for display
-            char display[80];
-            snprintf(display, sizeof(display), "%.76s", app.ai.dialogue);
-            sdtx_puts(display);
+
+            // "Thinking..." indicator
+            int nearest = ai_agent_nearest(&app.agent_system, app.camera.pos_d, 20.0f);
+            if (nearest >= 0 && app.agent_system.agents[nearest].ai.state == AI_PENDING) {
+                float ty = ch - 4.0f * cpx;
+                sdtx_pos(1.0f, ty / cpx);
+                sdtx_color3f(1.0f, 1.0f, 0.3f);
+                sdtx_printf("%s is thinking...", app.agent_system.agents[nearest].name);
+            }
+
+            // Chat input line (when open)
+            if (app.ai_chat_open) {
+                float ty = ch - 3.0f * cpx;
+                sdtx_pos(1.0f, ty / cpx);
+                sdtx_color3f(0.3f, 1.0f, 0.3f);
+                sdtx_puts("> ");
+                sdtx_color3f(1.0f, 1.0f, 1.0f);
+                sdtx_puts(app.ai_input);
+                sdtx_puts("_");
+            }
+
+            // Message log — render bottom-up from above the input line
+            float log_bottom = ch - 5.0f * cpx; // start above thinking/input
+            for (int i = app.chat_log_count - 1; i >= 0; i--) {
+                int lines_from_bottom = app.chat_log_count - 1 - i;
+                float ty = log_bottom - (float)lines_from_bottom * cpx;
+                if (ty < 0) break; // off screen
+
+                // Fade out in last 5 seconds
+                float alpha = 1.0f;
+                if (app.chat_log[i].age > 25.0f)
+                    alpha = 1.0f - (app.chat_log[i].age - 25.0f) / 5.0f;
+
+                sdtx_pos(1.0f, ty / cpx);
+                sdtx_color3f(app.chat_log[i].r * alpha,
+                             app.chat_log[i].g * alpha,
+                             app.chat_log[i].b * alpha);
+                sdtx_puts(app.chat_log[i].text);
+            }
         }
 
         render_frame(&app.renderer, &app.camera, dt);
@@ -1712,17 +1873,27 @@ static void event(const sapp_event* ev) {
         return;
     }
 
-    // AI Chat: toggle with T key (when mouse is locked = playing)
-    if (ev->type == SAPP_EVENTTYPE_KEY_DOWN && ev->key_code == SAPP_KEYCODE_T
+    // AI Chat: press E to talk to nearest agent within 10m (on key UP to avoid 'e' in input)
+    if (ev->type == SAPP_EVENTTYPE_KEY_UP && ev->key_code == SAPP_KEYCODE_E
         && !app.ai_chat_open && app.camera.mouse_locked) {
-        app.ai_chat_open = true;
-        app.ai_input[0] = '\0';
-        app.ai_input_len = 0;
-        sapp_lock_mouse(false);
-        sapp_show_mouse(true);
-        app.camera.mouse_locked = false;
-        printf("[AI] Chat opened. Type message and press Enter.\n");
-        fflush(stdout);
+        int nearest = ai_agent_nearest(&app.agent_system, app.camera.pos_d, 10.0f);
+        if (nearest >= 0) {
+            app.ai_chat_open = true;
+            app.ai_input[0] = '\0';
+            app.ai_input_len = 0;
+            sapp_lock_mouse(false);
+            sapp_show_mouse(true);
+            app.camera.mouse_locked = false;
+            AiAgent* agent = &app.agent_system.agents[nearest];
+            agent->state = AGENT_STATE_TALKING;
+            // Face the agent toward the player
+            HMM_Vec3 to_player = HMM_NormV3(HMM_SubV3(app.camera.position, agent->position));
+            HMM_Vec3 proj = HMM_SubV3(to_player, HMM_MulV3F(agent->local_up, HMM_DotV3(to_player, agent->local_up)));
+            float plen = HMM_LenV3(proj);
+            if (plen > 0.001f) agent->forward = HMM_MulV3F(proj, 1.0f / plen);
+            printf("[AI] Chatting with '%s'\n", agent->name);
+            fflush(stdout);
+        }
         return;
     }
 
@@ -1737,8 +1908,19 @@ static void event(const sapp_event* ev) {
                 return;
             }
             if (ev->key_code == SAPP_KEYCODE_ENTER && app.ai_input_len > 0) {
-                // Send message to AI
-                ai_npc_send(&app.ai, app.ai_input);
+                // Send message to nearest agent
+                {
+                    char msg[CHAT_MSG_MAX];
+                    snprintf(msg, sizeof(msg), "You: %s", app.ai_input);
+                    chat_log_push(msg, 0.5f, 1.0f, 0.5f);
+                }
+                int nearest = ai_agent_nearest(&app.agent_system, app.camera.pos_d, 20.0f);
+                if (nearest >= 0) {
+                    AiAgent* agent = &app.agent_system.agents[nearest];
+                    ai_npc_send(&agent->ai, app.ai_input);
+                } else {
+                    ai_npc_send(&app.ai, app.ai_input);
+                }
                 app.ai_input[0] = '\0';
                 app.ai_input_len = 0;
                 app.ai_chat_open = false;
@@ -2061,6 +2243,12 @@ static void cleanup(void) {
         render_shutdown(&app.renderer);
         planet_destroy(&app.planet);
     }
+    if (app.agents_spawned) {
+        char agent_save[256];
+        snprintf(agent_save, sizeof(agent_save), "%s/agents.dat", app.active_edits_dir);
+        ai_agent_save_positions(&app.agent_system, agent_save);
+    }
+    ai_agent_system_shutdown(&app.agent_system);
     ai_npc_shutdown(&app.ai);
     lobby_shutdown();
     sgl_shutdown();

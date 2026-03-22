@@ -16,6 +16,7 @@ public partial class MainWindow : Window
 {
     private readonly AgentCharacter _character = new();
     private readonly ChatService _chat = new();
+    private readonly ClaudeProvider _claude = new();
     private bool _suppressEvents;
     private bool _initialized;
 
@@ -69,12 +70,28 @@ public partial class MainWindow : Window
         _animTimer.Start();
         _animStart = DateTime.Now;
 
-        // Chat: check if llama-server is available
+        // Load AI config and start appropriate provider
+        AiConfig.Load();
         _ = CheckChatServerAsync();
     }
 
     private async Task CheckChatServerAsync()
     {
+        if (AiConfig.Provider == AiProviderType.Claude)
+        {
+            if (string.IsNullOrEmpty(AiConfig.ClaudeApiKey))
+            {
+                ChatStatus.Text = "Claude API key not set in config/ai_config.yaml";
+                ChatStatus.Foreground = new SolidColorBrush(Color.FromRgb(0xff, 0x66, 0x66));
+            }
+            else
+            {
+                ChatStatus.Text = $"Claude API ({AiConfig.ClaudeModel})";
+                ChatStatus.Foreground = new SolidColorBrush(Color.FromRgb(0x66, 0xff, 0x66));
+            }
+            return;
+        }
+
         ChatStatus.Text = "Starting llama-server...";
         ChatStatus.Foreground = new SolidColorBrush(Color.FromRgb(0xff, 0xff, 0x66));
 
@@ -475,6 +492,7 @@ public partial class MainWindow : Window
 
     private void UpdateChatSystemPrompt()
     {
+        ChatService.ReloadDirectives();
         var prompt = ChatService.BuildSystemPrompt(
             _character.Name,
             _character.Class.ToString().ToLowerInvariant(),
@@ -483,6 +501,7 @@ public partial class MainWindow : Window
             _character.Personality.Diligence,
             _character.Directive);
         _chat.SetSystemPrompt(prompt);
+        _claude.SetSystemPrompt(prompt);
     }
 
     private async void OnChatSend(object sender, RoutedEventArgs e)
@@ -507,7 +526,9 @@ public partial class MainWindow : Window
         ChatInput.Text = "";
         AppendChat($"You: {text}\n", "#88ff88");
 
-        if (!_chat.IsAvailable)
+        var isLocal = AiConfig.Provider == AiProviderType.Local;
+
+        if (isLocal && !_chat.IsAvailable)
         {
             await CheckChatServerAsync();
             if (!_chat.IsAvailable)
@@ -530,14 +551,20 @@ public partial class MainWindow : Window
         ChatParagraph.Inlines.Add(thinkingRun);
         ChatHistory.ScrollToEnd();
 
-        // Animate the dots while waiting
         var cts = new CancellationTokenSource();
         _ = AnimateDotsAsync(thinkingRun, _character.Name, cts.Token);
 
-        _chat.SetAgentName(_character.Name);
-        var reply = await _chat.SendAsync(text, _character.Name);
+        string reply;
+        if (isLocal)
+        {
+            _chat.SetAgentName(_character.Name);
+            reply = await _chat.SendAsync(text, _character.Name);
+        }
+        else
+        {
+            reply = await _claude.SendAsync(text);
+        }
 
-        // Stop dots, remove thinking indicator
         cts.Cancel();
         ChatParagraph.Inlines.Remove(thinkingRun);
         _isThinking = false;
@@ -636,6 +663,7 @@ public partial class MainWindow : Window
     private void OnChatClear(object sender, RoutedEventArgs e)
     {
         _chat.ClearHistory();
+        _claude.ClearHistory();
         ChatParagraph.Inlines.Clear();
     }
 
