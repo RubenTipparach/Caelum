@@ -32,6 +32,7 @@ node_modules/
 
 # API keys
 config/ai_config.yaml
+tools/api-key.txt
 
 # Tools (downloaded binaries, not committed)
 tools/sokol-shdc*
