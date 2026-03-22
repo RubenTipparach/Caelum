@@ -63,6 +63,26 @@ static int json_escape(const char* src, char* dst, int dst_size) {
     return j;
 }
 
+// ---- Chat logging (JSONL) ----
+
+static void ai_log_message(const char* agent_name, const char* type, const char* text) {
+    // Write to cache/agents/{name}/chat_log.jsonl
+    char dir[256], path[512];
+    snprintf(dir, sizeof(dir), "cache/agents/%s", agent_name);
+    snprintf(path, sizeof(path), "%s/chat_log.jsonl", dir);
+
+    FILE* f = fopen(path, "a");
+    if (!f) return;
+
+    // Escape text for JSON
+    char escaped[1024];
+    json_escape(text, escaped, sizeof(escaped));
+
+    fprintf(f, "{\"type\":\"%s\",\"agent\":\"%s\",\"text\":\"%s\"}\n",
+            type, agent_name, escaped);
+    fclose(f);
+}
+
 // ---- Config parser for ai_config.yaml ----
 
 static void ai_load_config(AiNpc* ai) {
@@ -287,6 +307,7 @@ static void parse_response(AiNpc* ai, const char* body) {
     }
 
     ai->state = AI_SUCCESS;
+    ai_log_message("agent", "agent_msg", ai->dialogue);
 }
 
 // ---- Platform-specific implementation ----
@@ -329,7 +350,7 @@ static void launch_server(AiNpc* ai) {
         "tools\\ai\\llama-server.exe"
         " -m \"%s\""
         " --port %d"
-        " -ngl 99"
+        " -ngl 20"
         " --grammar-file \"%s\""
         " --ctx-size 4096"
         " --log-disable",
@@ -531,6 +552,7 @@ static void parse_claude_response(AiNpc* ai, const char* body) {
     }
 
     ai->state = AI_SUCCESS;
+    ai_log_message("agent", "agent_msg", ai->dialogue);
 }
 
 static DWORD WINAPI ai_claude_thread_func(LPVOID param) {
@@ -700,14 +722,16 @@ void ai_npc_init(AiNpc* ai, const char* model_path, const char* grammar_path, in
 }
 
 void ai_npc_shutdown(AiNpc* ai) {
-    // Wait for any pending request
-    if (g_active_ai_http) {
-        if (g_active_ai_http->thread) {
-            WaitForSingleObject(g_active_ai_http->thread, 5000);
-            CloseHandle(g_active_ai_http->thread);
+    // Wait for per-instance pending request
+    if (ai->_http_data) {
+        HANDLE t = (HANDLE)ai->_http_thread;
+        if (t) {
+            WaitForSingleObject(t, 3000);
+            CloseHandle(t);
         }
-        free(g_active_ai_http);
-        g_active_ai_http = NULL;
+        free(ai->_http_data);
+        ai->_http_data = NULL;
+        ai->_http_thread = NULL;
     }
     kill_server(ai);
 }
@@ -727,7 +751,6 @@ void ai_npc_send(AiNpc* ai, const char* player_message) {
 
     // Add player message to history
     if (ai->history_count >= AI_MAX_HISTORY) {
-        // Shift history: drop oldest 2 messages (1 exchange)
         memmove(&ai->history[0], &ai->history[2],
                 (AI_MAX_HISTORY - 2) * sizeof(AiMessage));
         ai->history_count -= 2;
@@ -736,32 +759,33 @@ void ai_npc_send(AiNpc* ai, const char* player_message) {
     snprintf(msg->role, sizeof(msg->role), "user");
     snprintf(msg->content, sizeof(msg->content), "%s", player_message);
 
-    // Clean up previous HTTP thread (non-blocking check)
-    if (g_active_ai_http) {
-        if (g_active_ai_http->thread) {
-            DWORD result = WaitForSingleObject(g_active_ai_http->thread, 0);
+    // Clean up previous per-instance HTTP thread (non-blocking)
+    if (ai->_http_data) {
+        AiHttpThread* prev = (AiHttpThread*)ai->_http_data;
+        HANDLE prev_thread = (HANDLE)ai->_http_thread;
+        if (prev_thread) {
+            DWORD result = WaitForSingleObject(prev_thread, 0);
             if (result == WAIT_TIMEOUT) {
-                // Previous request still in flight — can't send yet
                 printf("[AI] Previous request still pending, please wait.\n");
                 fflush(stdout);
                 return;
             }
-            CloseHandle(g_active_ai_http->thread);
+            CloseHandle(prev_thread);
         }
-        free(g_active_ai_http);
-        g_active_ai_http = NULL;
+        free(prev);
+        ai->_http_data = NULL;
+        ai->_http_thread = NULL;
     }
 
-    g_active_ai_http = (AiHttpThread*)calloc(1, sizeof(AiHttpThread));
-    g_active_ai_http->ai = ai;
+    AiHttpThread* http = (AiHttpThread*)calloc(1, sizeof(AiHttpThread));
+    http->ai = ai;
+    ai->_http_data = http;
 
-    // Build request body for the appropriate provider
+    // Build request body
     if (ai->provider == AI_PROVIDER_CLAUDE) {
-        build_claude_request_body(ai, g_active_ai_http->post_body,
-                                  sizeof(g_active_ai_http->post_body));
+        build_claude_request_body(ai, http->post_body, sizeof(http->post_body));
     } else {
-        build_request_body(ai, g_active_ai_http->post_body,
-                           sizeof(g_active_ai_http->post_body));
+        build_request_body(ai, http->post_body, sizeof(http->post_body));
     }
 
     ai->state = AI_PENDING;
@@ -772,9 +796,13 @@ void ai_npc_send(AiNpc* ai, const char* player_message) {
            ai->provider == AI_PROVIDER_CLAUDE ? "Claude" : "local", player_message);
     fflush(stdout);
 
-    g_active_ai_http->thread = CreateThread(NULL, 0,
+    // Log player message
+    ai_log_message("agent", "player_msg", player_message);
+
+    HANDLE thread = CreateThread(NULL, 0,
         ai->provider == AI_PROVIDER_CLAUDE ? ai_claude_thread_func : ai_http_thread_func,
-        g_active_ai_http, 0, NULL);
+        http, 0, NULL);
+    ai->_http_thread = (void*)thread;
 }
 
 void ai_npc_poll(AiNpc* ai) {

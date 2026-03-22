@@ -68,6 +68,10 @@ typedef struct {
     int       server_port;
     char      claude_api_key[128];
     char      claude_model[64];
+
+    // Per-instance async HTTP (not shared global)
+    void*     _http_thread;   // HANDLE, managed internally
+    void*     _http_data;     // AiHttpThread*, managed internally
 } AiNpc;
 
 // Initialize AI system. Call once at startup.

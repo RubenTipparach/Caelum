@@ -1367,17 +1367,17 @@ static void frame(void) {
 
         app.renderer.hotbar_selected_slot = app.hotbar_slot;
 
-        // "Press E to talk" prompt when near an agent
+        // "Press E to talk" prompt — raycast from crosshair against agent bounding boxes
         if (!app.ai_chat_open && app.camera.mouse_locked) {
-            int nearest = ai_agent_nearest(&app.agent_system, app.camera.pos_d, 10.0f);
-            if (nearest >= 0) {
-                AiAgent* agent = &app.agent_system.agents[nearest];
+            int hit = ai_agent_raycast(&app.agent_system,
+                app.camera.position, app.camera.forward, 10.0f);
+            if (hit >= 0) {
+                AiAgent* agent = &app.agent_system.agents[hit];
                 float cw = sapp_widthf() * 0.5f;
                 float ch = sapp_heightf() * 0.5f;
                 float cpx = sapp_widthf() / (cw / 8.0f);
                 sdtx_canvas(cw, ch);
                 sdtx_font(0);
-                // Center of screen, slightly below crosshair
                 float tx = cw / 2.0f / cpx - 10.0f;
                 float ty = ch / 2.0f / cpx + 2.0f;
                 sdtx_pos(tx, ty);
@@ -1873,10 +1873,11 @@ static void event(const sapp_event* ev) {
         return;
     }
 
-    // AI Chat: press E to talk to nearest agent within 10m (on key UP to avoid 'e' in input)
+    // AI Chat: press E to talk — raycast against agent bounding box
     if (ev->type == SAPP_EVENTTYPE_KEY_UP && ev->key_code == SAPP_KEYCODE_E
         && !app.ai_chat_open && app.camera.mouse_locked) {
-        int nearest = ai_agent_nearest(&app.agent_system, app.camera.pos_d, 10.0f);
+        int nearest = ai_agent_raycast(&app.agent_system,
+            app.camera.position, app.camera.forward, 10.0f);
         if (nearest >= 0) {
             app.ai_chat_open = true;
             app.ai_input[0] = '\0';

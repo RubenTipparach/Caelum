@@ -65,9 +65,25 @@ typedef struct {
     float move_speed;          // meters per second
 
     // Rendering — CPU-side model-space verts (9 floats each: pos, normal, color)
-    float* mesh_verts;        // malloc'd array of all verts (primary + accent + eyes)
+    float* mesh_verts;
     int vert_count_total;
     bool mesh_valid;
+
+    // Body part vertex ranges (for animation)
+    int vr_torso_start, vr_torso_count;       // torso + shoulders + pelvis
+    int vr_left_leg_start, vr_left_leg_count;
+    int vr_right_leg_start, vr_right_leg_count;
+    int vr_head_start, vr_head_count;          // neck + head + eyes
+    int vr_left_arm_start, vr_left_arm_count;
+    int vr_right_arm_start, vr_right_arm_count;
+
+    // Pivot points (model-space Y)
+    float pivot_hip_y;     // leg rotation pivot
+    float pivot_shoulder_y; // arm rotation pivot
+    float pivot_neck_y;    // head rotation pivot
+
+    // Animation
+    float anim_time;
 
     // AI connection
     AiNpc ai;
@@ -113,6 +129,11 @@ void ai_agent_system_shutdown(AiAgentSystem* sys);
 // Find the nearest agent to a world position within max_dist.
 // Returns agent index or -1.
 int ai_agent_nearest(const AiAgentSystem* sys, const double pos[3], float max_dist);
+
+// Raycast against agent bounding boxes. Returns agent index or -1.
+// ray_origin/ray_dir in world space (float). max_dist in meters.
+int ai_agent_raycast(const AiAgentSystem* sys, HMM_Vec3 ray_origin,
+                     HMM_Vec3 ray_dir, float max_dist);
 
 // Save all agent positions to a file (e.g. cache/worlds/{id}/agents.dat)
 void ai_agent_save_positions(const AiAgentSystem* sys, const char* path);

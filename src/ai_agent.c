@@ -196,24 +196,42 @@ static void generate_agent_mesh(AiAgent* agent) {
     float* pc = agent->primary_color;
     float* ac = agent->accent_color;
 
-    // Generate all parts into g_verts (single pass)
+    // Generate all parts, tracking vertex ranges per body part
     g_vert_count = 0;
+    int mark;
 
-    // Primary: torso, shoulders, pelvis, legs
+    // Torso + shoulders + pelvis
+    mark = g_vert_count;
     hex_prism(0, torsoY, 0, torsoR, torsoH, stocky, 0.8f, pc[0], pc[1], pc[2]);
     hex_prism(-padSpacing, padY, 0, padR, padH, 0.8f, 0.8f, pc[0], pc[1], pc[2]);
     hex_prism(padSpacing, padY, 0, padR, padH, 0.8f, 0.8f, pc[0], pc[1], pc[2]);
     hex_prism(0, pelvisY, 0, pelvisR, pelvisH, stocky, 0.7f, pc[0], pc[1], pc[2]);
-    hex_prism(-legSpacing, legY, 0, legR, legH, stocky*0.65f, 0.65f, pc[0], pc[1], pc[2]);
-    hex_prism(legSpacing, legY, 0, legR, legH, stocky*0.65f, 0.65f, pc[0], pc[1], pc[2]);
+    agent->vr_torso_start = mark; agent->vr_torso_count = g_vert_count - mark;
 
-    // Accent: neck, head, arms
+    // Left leg
+    mark = g_vert_count;
+    hex_prism(-legSpacing, legY, 0, legR, legH, stocky*0.65f, 0.65f, pc[0], pc[1], pc[2]);
+    agent->vr_left_leg_start = mark; agent->vr_left_leg_count = g_vert_count - mark;
+
+    // Right leg
+    mark = g_vert_count;
+    hex_prism(legSpacing, legY, 0, legR, legH, stocky*0.65f, 0.65f, pc[0], pc[1], pc[2]);
+    agent->vr_right_leg_start = mark; agent->vr_right_leg_count = g_vert_count - mark;
+
+    // Left arm
+    mark = g_vert_count;
+    hex_prism(-armSpacing, armY, 0, armR, armH, 0.55f, 0.55f, ac[0], ac[1], ac[2]);
+    agent->vr_left_arm_start = mark; agent->vr_left_arm_count = g_vert_count - mark;
+
+    // Right arm
+    mark = g_vert_count;
+    hex_prism(armSpacing, armY, 0, armR, armH, 0.55f, 0.55f, ac[0], ac[1], ac[2]);
+    agent->vr_right_arm_start = mark; agent->vr_right_arm_count = g_vert_count - mark;
+
+    // Head (neck + head + eyes)
+    mark = g_vert_count;
     hex_prism(0, neckY, 0, neckR, neckH, 1.0f, 1.0f, ac[0], ac[1], ac[2]);
     hex_prism(0, headY, 0, headR, headH, 1.0f, 1.0f, ac[0], ac[1], ac[2]);
-    hex_prism(-armSpacing, armY, 0, armR, armH, 0.55f, 0.55f, ac[0], ac[1], ac[2]);
-    hex_prism(armSpacing, armY, 0, armR, armH, 0.55f, 0.55f, ac[0], ac[1], ac[2]);
-
-    // Eyes
     float eyeR = headR * 0.22f;
     float eyeDepth = headR * 0.3f;
     float eyeSpacing = headR * 0.45f;
@@ -221,6 +239,12 @@ static void generate_agent_mesh(AiAgent* agent) {
     float eyeZ = headR * 0.7f;
     hex_prism_z(-eyeSpacing, eyeY, eyeZ, eyeR, eyeDepth, 1,1,1);
     hex_prism_z(eyeSpacing, eyeY, eyeZ, eyeR, eyeDepth, 1,1,1);
+    agent->vr_head_start = mark; agent->vr_head_count = g_vert_count - mark;
+
+    // Store pivot points
+    agent->pivot_hip_y = pelvisY - pelvisH * 0.5f;
+    agent->pivot_shoulder_y = padY;
+    agent->pivot_neck_y = neckY - neckH * 0.5f;
 
     // Store on CPU
     agent->vert_count_total = g_vert_count;
@@ -416,6 +440,7 @@ void ai_agent_system_update(AiAgentSystem* sys, HexTerrain* ht,
         if (a->state == AGENT_STATE_SLEEPING) continue;
 
         a->state_timer += dt;
+        a->anim_time += dt;
 
         // Gravity: pull toward planet center
         a->position = HMM_V3((float)a->pos_d[0], (float)a->pos_d[1], (float)a->pos_d[2]);
@@ -599,6 +624,68 @@ void ai_agent_system_shutdown(AiAgentSystem* sys) {
         ai_npc_shutdown(&a->ai);
     }
     sys->count = 0;
+}
+
+// ---- Raycast against agent bounding boxes ----
+
+int ai_agent_raycast(const AiAgentSystem* sys, HMM_Vec3 ray_origin,
+                     HMM_Vec3 ray_dir, float max_dist) {
+    int best = -1;
+    float best_t = max_dist;
+
+    for (int i = 0; i < sys->count; i++) {
+        const AiAgent* a = &sys->agents[i];
+        if (!a->active || a->state == AGENT_STATE_SLEEPING) continue;
+
+        // Agent bounding box in local space: [-0.3, 0.3] x [0, 1.5] x [-0.3, 0.3]
+        // Transform ray into agent's local space
+        HMM_Vec3 aup = a->local_up;
+        HMM_Vec3 afwd = a->forward;
+        HMM_Vec3 art = HMM_NormV3(HMM_Cross(afwd, aup));
+        afwd = HMM_NormV3(HMM_Cross(aup, art));
+
+        // Agent position (with 0.5m lift to match rendering)
+        HMM_Vec3 apos = HMM_V3(
+            (float)a->pos_d[0] + aup.X * 0.5f,
+            (float)a->pos_d[1] + aup.Y * 0.5f,
+            (float)a->pos_d[2] + aup.Z * 0.5f);
+
+        // Ray origin relative to agent
+        HMM_Vec3 rel = HMM_SubV3(ray_origin, apos);
+
+        // Project into local space
+        float ox = HMM_DotV3(rel, art);
+        float oy = HMM_DotV3(rel, aup);
+        float oz = HMM_DotV3(rel, afwd);
+        float dx = HMM_DotV3(ray_dir, art);
+        float dy = HMM_DotV3(ray_dir, aup);
+        float dz = HMM_DotV3(ray_dir, afwd);
+
+        // AABB: x [-0.3, 0.3], y [0, 1.5], z [-0.3, 0.3]
+        float bmin[3] = {-0.3f, 0.0f, -0.3f};
+        float bmax[3] = { 0.3f, 1.5f,  0.3f};
+        float o[3] = {ox, oy, oz};
+        float d[3] = {dx, dy, dz};
+
+        float tmin = 0.0f, tmax = best_t;
+        for (int ax = 0; ax < 3; ax++) {
+            if (fabsf(d[ax]) < 1e-8f) {
+                if (o[ax] < bmin[ax] || o[ax] > bmax[ax]) { tmin = tmax + 1; break; }
+            } else {
+                float t1 = (bmin[ax] - o[ax]) / d[ax];
+                float t2 = (bmax[ax] - o[ax]) / d[ax];
+                if (t1 > t2) { float tmp = t1; t1 = t2; t2 = tmp; }
+                if (t1 > tmin) tmin = t1;
+                if (t2 < tmax) tmax = t2;
+            }
+        }
+
+        if (tmin <= tmax && tmin < best_t && tmin >= 0.0f) {
+            best_t = tmin;
+            best = i;
+        }
+    }
+    return best;
 }
 
 // ---- Position persistence ----

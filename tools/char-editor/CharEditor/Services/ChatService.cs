@@ -136,7 +136,7 @@ public class ChatService
         // Launch server
         // Launch with visible console window + log stderr to file
         var logFile = Path.Combine(aiDir, "server.log");
-        var serverArgs = $"-m \"{modelFile}\" --port {_port} -ngl 99 --ctx-size 16384 --flash-attn on --threads 8 --log-file \"{logFile}\"";
+        var serverArgs = $"-m \"{modelFile}\" --port {_port} -ngl 20 --ctx-size 16384 --flash-attn on --threads 8 --log-file \"{logFile}\"";
         var psi = new ProcessStartInfo
         {
             FileName = serverExe,
