@@ -18,6 +18,8 @@
 #include "stb_image.h"
 
 #include "terrain_noise.h"
+#include "ai_agent.h"
+#include "agent.glsl.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -311,6 +313,27 @@ void render_init(Renderer* r, Planet* planet, const Camera* cam, const char* edi
         .usage.stream_update = true,
         .label = "normal-debug-arrows",
     });
+
+    // ---- Agent solid mesh pipeline ----
+    {
+        sg_shader agent_shd = sg_make_shader(agent_shader_desc(sg_query_backend()));
+        r->agent_pip = sg_make_pipeline(&(sg_pipeline_desc){
+            .shader = agent_shd,
+            .layout = {
+                .attrs = {
+                    [ATTR_agent_a_position] = { .format = SG_VERTEXFORMAT_FLOAT3 },
+                    [ATTR_agent_a_normal]   = { .format = SG_VERTEXFORMAT_FLOAT3 },
+                    [ATTR_agent_a_color]    = { .format = SG_VERTEXFORMAT_FLOAT3 },
+                }
+            },
+            .depth = {
+                .compare = SG_COMPAREFUNC_LESS_EQUAL,
+                .write_enabled = true,
+            },
+            .cull_mode = SG_CULLMODE_NONE, // no backface cull for now
+            .label = "agent-pipeline",
+        });
+    }
 
     // ---- Hex terrain textured pipeline ----
     printf("[RENDER] render_init: loading hex terrain textures...\n"); fflush(stdout);
@@ -730,13 +753,13 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
             r->visual_config.dusk_sun_color.X,
             r->visual_config.dusk_sun_color.Y,
             r->visual_config.dusk_sun_color.Z,
-            0.0f,
+            r->visual_config.coltab_factor,
         }},
         .day_sun_color = (HMM_Vec4){{
             r->visual_config.day_sun_color.X,
             r->visual_config.day_sun_color.Y,
             r->visual_config.day_sun_color.Z,
-            0.0f,
+            r->visual_config.coltab_max_dist,
         }},
         .planet_tex_params = (HMM_Vec4){{
             (r->planet_tex_img.id != SG_INVALID_ID) ? 1.0f : 0.0f,  // enabled
@@ -1039,6 +1062,386 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
         sg_draw(6, 6, 1);
     }
 
+    // ---- Draw AI agent solid mesh (planet pipeline, TRIANGLES) ----
+    if (r->agent_system) {
+        AiAgentSystem* asys = (AiAgentSystem*)r->agent_system;
+
+        static sg_buffer s_mesh_buf = {0};
+        if (s_mesh_buf.id == SG_INVALID_ID) {
+            s_mesh_buf = sg_make_buffer(&(sg_buffer_desc){
+                .size = AI_AGENT_MAX * AI_AGENT_MESH_MAX_VERTS * 36,
+                .usage.vertex_buffer = true,
+                .usage.stream_update = true,
+                .label = "agent-mesh",
+            });
+        }
+
+        sg_apply_pipeline(r->agent_pip);
+        agent_vs_params_t agent_vsp = {
+            .mvp = vp_terrain,
+            .camera_offset = vs_params.camera_offset,
+            .camera_offset_low = vs_params.camera_offset_low,
+            .log_depth = vs_params.log_depth,
+        };
+        agent_fs_params_t agent_fsp = {
+            .sun_direction = (HMM_Vec4){{
+                r->sun_direction.X, r->sun_direction.Y, r->sun_direction.Z, 0}},
+        };
+        sg_apply_uniforms(UB_agent_vs_params, &SG_RANGE(agent_vsp));
+        sg_apply_uniforms(UB_agent_fs_params, &SG_RANGE(agent_fsp));
+
+        for (int ai = 0; ai < asys->count; ai++) {
+            AiAgent* agent = &asys->agents[ai];
+            if (!agent->active || !agent->mesh_valid || !agent->mesh_verts ||
+                agent->state == AGENT_STATE_SLEEPING) continue;
+
+            // Offset agent mesh 0.5m above ground along local up
+            // Subtract world_origin in double precision FIRST to avoid float cancellation
+            HMM_Vec3 aup = agent->local_up;
+            float lift = 0.5f;
+            float px = (float)(agent->pos_d[0] - r->lod_tree.world_origin[0]) + aup.X * lift;
+            float py = (float)(agent->pos_d[1] - r->lod_tree.world_origin[1]) + aup.Y * lift;
+            float pz = (float)(agent->pos_d[2] - r->lod_tree.world_origin[2]) + aup.Z * lift;
+            HMM_Vec3 afwd = agent->forward;
+            HMM_Vec3 art = HMM_NormV3(HMM_Cross(afwd, aup));
+            afwd = HMM_NormV3(HMM_Cross(aup, art));
+
+            int nv = agent->vert_count_total;
+            static float xf[AI_AGENT_MESH_MAX_VERTS * 9];
+            float* src = agent->mesh_verts;
+            float t = agent->anim_time;
+
+            // Evaluate animation pose based on agent state
+            // Angles in radians for sinf/cosf
+            float body_bob = 0, head_pitch = 0, head_yaw = 0;
+            float l_arm_pitch = 0, r_arm_pitch = 0;
+            float l_arm_raise = 0, r_arm_raise = 0; // sideways raise (roll around Z)
+            float l_leg_pitch = 0, r_leg_pitch = 0;
+            float deg2rad = 3.14159265f / 180.0f;
+
+            switch (agent->state) {
+                case AGENT_STATE_IDLE:
+                    body_bob = sinf(t * 2.0f) * 0.003f;
+                    l_arm_pitch = sinf(t * 1.5f) * 2.0f * deg2rad;
+                    r_arm_pitch = sinf(t * 1.5f + 0.5f) * 2.0f * deg2rad;
+                    break;
+                case AGENT_STATE_WALKING: {
+                    float stride = sinf(t * 6.0f);
+                    // Small hop every ~4 steps to mask ground-height jitter
+                    float hop = fabsf(sinf(t * 3.0f));
+                    hop = hop * hop * hop * 0.08f; // sharp peaks, flat valleys
+                    body_bob = hop + fabsf(sinf(t * 6.0f)) * 0.01f;
+                    l_leg_pitch = stride * 30.0f * deg2rad;
+                    r_leg_pitch = -stride * 30.0f * deg2rad;
+                    l_arm_pitch = -stride * 25.0f * deg2rad;
+                    r_arm_pitch = stride * 25.0f * deg2rad;
+                    head_pitch = sinf(t * 12.0f) * 2.0f * deg2rad;
+                } break;
+                case AGENT_STATE_TALKING:
+                    head_pitch = sinf(t * 4.0f) * 8.0f * deg2rad;
+                    head_yaw = sinf(t * 2.3f) * 10.0f * deg2rad;
+                    l_arm_pitch = (sinf(t * 3.5f) * 10.0f + 5.0f) * deg2rad;
+                    r_arm_pitch = sinf(t * 2.7f + 1.0f) * 12.0f * deg2rad;
+                    break;
+                case AGENT_STATE_WORKING: {
+                    float phase = fmodf(t * 1.5f, 2.0f);
+                    float reach = (phase < 1.0f) ? sinf(phase * 3.14159f) : 0;
+                    l_arm_pitch = -30.0f * reach * deg2rad;
+                    r_arm_pitch = -30.0f * reach * deg2rad;
+                    head_pitch = -10.0f * reach * deg2rad;
+                } break;
+                case AGENT_STATE_JUMPING: {
+                    float phase = fmodf(t * 1.5f, 2.0f);
+                    if (phase < 0.5f) {
+                        body_bob = -(phase / 0.5f) * 0.04f;
+                    } else if (phase < 1.0f) {
+                        float p = (phase - 0.5f) / 0.5f;
+                        body_bob = sinf(p * 3.14159f) * 0.12f;
+                        l_arm_pitch = -sinf(p * 3.14159f) * 40.0f * deg2rad;
+                        r_arm_pitch = -sinf(p * 3.14159f) * 40.0f * deg2rad;
+                    } else if (phase < 1.5f) {
+                        float p = (phase - 1.0f) / 0.5f;
+                        body_bob = -sinf(p * 3.14159f * 0.5f) * 0.02f;
+                    }
+                    l_leg_pitch = body_bob * 100.0f * deg2rad;
+                    r_leg_pitch = l_leg_pitch;
+                } break;
+                case AGENT_STATE_PICKUP: {
+                    float phase = fmodf(t * 0.8f, 3.0f);
+                    float amount = 0;
+                    if (phase < 1.0f) amount = sinf(phase * 3.14159f * 0.5f);
+                    else if (phase < 1.5f) amount = 1.0f;
+                    else if (phase < 2.5f) amount = 1.0f - (phase - 1.5f);
+                    body_bob = -amount * 0.04f;
+                    l_arm_pitch = -amount * 40.0f * deg2rad;
+                    r_arm_pitch = -amount * 40.0f * deg2rad;
+                    l_leg_pitch = -amount * 10.0f * deg2rad;
+                    r_leg_pitch = l_leg_pitch;
+                    head_pitch = amount * 10.0f * deg2rad;
+                } break;
+                case AGENT_STATE_PLACING: {
+                    float phase = fmodf(t * 1.5f, 2.0f);
+                    float reach = (phase < 1.0f) ? sinf(phase * 3.14159f) : 0;
+                    l_arm_pitch = -30.0f * reach * deg2rad;
+                    r_arm_pitch = -30.0f * reach * deg2rad;
+                    head_pitch = -10.0f * reach * deg2rad;
+                } break;
+                case AGENT_STATE_WAVING: {
+                    // Right arm raised sideways with wave oscillation (matches WPF RightArmRaise=140)
+                    float wave = sinf(t * 6.0f) * 25.0f * deg2rad;
+                    r_arm_raise = 140.0f * deg2rad + wave;
+                    head_yaw = 10.0f * deg2rad;
+                    head_pitch = sinf(t * 3.0f) * 5.0f * deg2rad;
+                    body_bob = sinf(t * 3.0f) * 0.005f;
+                } break;
+                case AGENT_STATE_CELEBRATING: {
+                    body_bob = fabsf(sinf(t * 5.0f)) * 0.03f;
+                    float wiggle = sinf(t * 8.0f) * 10.0f * deg2rad;
+                    l_arm_pitch = -75.0f * deg2rad + wiggle;
+                    r_arm_pitch = -75.0f * deg2rad - wiggle;
+                    head_pitch = sinf(t * 6.0f) * 8.0f * deg2rad;
+                    head_yaw = sinf(t * 4.0f) * 12.0f * deg2rad;
+                    l_leg_pitch = sinf(t * 5.0f) * 10.0f * deg2rad;
+                    r_leg_pitch = -sinf(t * 5.0f) * 10.0f * deg2rad;
+                } break;
+                default: break;
+            }
+
+            // Rotate a model-space point around a pivot on the X axis (pitch)
+            #define PIVOT_PITCH(mx, my, mz, pivot_y, angle) do { \
+                float _dy = (my) - (pivot_y); \
+                float _c = cosf(angle), _s = sinf(angle); \
+                (my) = (pivot_y) + _dy * _c - (mz) * _s; \
+                (mz) = _dy * _s + (mz) * _c; \
+            } while(0)
+
+            // Rotate around Y axis (yaw)
+            #define PIVOT_YAW(mx, my, mz, pivot_y, angle) do { \
+                (void)(pivot_y); \
+                float _c = cosf(angle), _s = sinf(angle); \
+                float _tx = (mx) * _c + (mz) * _s; \
+                (mz) = -(mx) * _s + (mz) * _c; \
+                (mx) = _tx; \
+            } while(0)
+
+            // Rotate around Z axis (roll — raises arm sideways)
+            #define PIVOT_ROLL(mx, my, mz, pivot_y, angle) do { \
+                float _dy = (my) - (pivot_y); \
+                float _c = cosf(angle), _s = sinf(angle); \
+                float _tx = (mx) * _c - _dy * _s; \
+                (my) = (pivot_y) + (mx) * _s + _dy * _c; \
+                (mx) = _tx; \
+            } while(0)
+
+            for (int v = 0; v < nv; v++) {
+                float mx = src[v*9], my = src[v*9+1], mz = src[v*9+2];
+                float mnx = src[v*9+3], mny = src[v*9+4], mnz = src[v*9+5];
+
+                // Apply body bob (vertical offset along Y)
+                my += body_bob;
+
+                // Per-body-part rotation
+                if (v >= agent->vr_left_leg_start && v < agent->vr_left_leg_start + agent->vr_left_leg_count) {
+                    PIVOT_PITCH(mx, my, mz, agent->pivot_hip_y, l_leg_pitch);
+                    PIVOT_PITCH(mnx, mny, mnz, 0, l_leg_pitch);
+                } else if (v >= agent->vr_right_leg_start && v < agent->vr_right_leg_start + agent->vr_right_leg_count) {
+                    PIVOT_PITCH(mx, my, mz, agent->pivot_hip_y, r_leg_pitch);
+                    PIVOT_PITCH(mnx, mny, mnz, 0, r_leg_pitch);
+                } else if (v >= agent->vr_left_arm_start && v < agent->vr_left_arm_start + agent->vr_left_arm_count) {
+                    PIVOT_PITCH(mx, my, mz, agent->pivot_shoulder_y, l_arm_pitch);
+                    PIVOT_PITCH(mnx, mny, mnz, 0, l_arm_pitch);
+                    if (l_arm_raise != 0.0f) {
+                        PIVOT_ROLL(mx, my, mz, agent->pivot_shoulder_y, l_arm_raise);
+                        PIVOT_ROLL(mnx, mny, mnz, 0, l_arm_raise);
+                    }
+                } else if (v >= agent->vr_right_arm_start && v < agent->vr_right_arm_start + agent->vr_right_arm_count) {
+                    PIVOT_PITCH(mx, my, mz, agent->pivot_shoulder_y, r_arm_pitch);
+                    PIVOT_PITCH(mnx, mny, mnz, 0, r_arm_pitch);
+                    if (r_arm_raise != 0.0f) {
+                        PIVOT_ROLL(mx, my, mz, agent->pivot_shoulder_y, r_arm_raise);
+                        PIVOT_ROLL(mnx, mny, mnz, 0, r_arm_raise);
+                    }
+                } else if (v >= agent->vr_head_start && v < agent->vr_head_start + agent->vr_head_count) {
+                    PIVOT_PITCH(mx, my, mz, agent->pivot_neck_y, head_pitch);
+                    PIVOT_PITCH(mnx, mny, mnz, 0, head_pitch);
+                    PIVOT_YAW(mx, my, mz, agent->pivot_neck_y, head_yaw);
+                    PIVOT_YAW(mnx, mny, mnz, 0, head_yaw);
+                }
+
+                // World transform: rotate by orientation + translate (already in floating-origin space)
+                xf[v*9+0] = px + art.X*mx + aup.X*my + afwd.X*mz;
+                xf[v*9+1] = py + art.Y*mx + aup.Y*my + afwd.Y*mz;
+                xf[v*9+2] = pz + art.Z*mx + aup.Z*my + afwd.Z*mz;
+                xf[v*9+3] = art.X*mnx + aup.X*mny + afwd.X*mnz;
+                xf[v*9+4] = art.Y*mnx + aup.Y*mny + afwd.Y*mnz;
+                xf[v*9+5] = art.Z*mnx + aup.Z*mny + afwd.Z*mnz;
+                xf[v*9+6] = src[v*9+6];
+                xf[v*9+7] = src[v*9+7];
+                xf[v*9+8] = src[v*9+8];
+            }
+
+            #undef PIVOT_PITCH
+            #undef PIVOT_YAW
+            #undef PIVOT_ROLL
+
+            int off = sg_append_buffer(s_mesh_buf, &(sg_range){xf, nv * 36});
+            if (!sg_query_buffer_overflow(s_mesh_buf)) {
+                sg_bindings mb = {0};
+                mb.vertex_buffers[0] = s_mesh_buf;
+                mb.vertex_buffer_offsets[0] = off;
+                sg_apply_bindings(&mb);
+                sg_draw(0, nv, 1);
+            }
+        }
+    }
+
+    // ---- Draw AI agents wireframe (disabled — solid mesh working) ----
+    #if 0
+    if (r->agent_system) {
+        AiAgentSystem* asys = (AiAgentSystem*)r->agent_system;
+
+        // Dedicated agent line buffer — 256 verts max (created once)
+        static sg_buffer s_abuf = {0};
+        if (s_abuf.id == SG_INVALID_ID) {
+            s_abuf = sg_make_buffer(&(sg_buffer_desc){
+                .size = 256 * 3 * sizeof(float),
+                .usage.vertex_buffer = true,
+                .usage.stream_update = true,
+                .label = "agent-lines",
+            });
+        }
+
+        highlight_vs_params_t avs = {
+            .mvp = vp_terrain,
+            .camera_offset = vs_params.camera_offset,
+            .camera_offset_low = vs_params.camera_offset_low,
+            .log_depth = vs_params.log_depth,
+        };
+
+        for (int ai = 0; ai < asys->count; ai++) {
+            AiAgent* agent = &asys->agents[ai];
+            if (!agent->active || agent->state == AGENT_STATE_SLEEPING) continue;
+
+            float px = (float)agent->pos_d[0];
+            float py = (float)agent->pos_d[1];
+            float pz = (float)agent->pos_d[2];
+            float wo0 = (float)r->lod_tree.world_origin[0];
+            float wo1 = (float)r->lod_tree.world_origin[1];
+            float wo2 = (float)r->lod_tree.world_origin[2];
+
+            HMM_Vec3 up = agent->local_up;
+            HMM_Vec3 fwd = agent->forward;
+            HMM_Vec3 rt = HMM_NormV3(HMM_Cross(fwd, up));
+            fwd = HMM_NormV3(HMM_Cross(up, rt));
+
+            // Vertex helper: local (sx,sy,sz) -> floating-origin space
+            #define V(buf,i, sx,sy,sz) do { \
+                (buf)[(i)*3  ] = px+rt.X*(sx)+up.X*(sy)+fwd.X*(sz)-wo0; \
+                (buf)[(i)*3+1] = py+rt.Y*(sx)+up.Y*(sy)+fwd.Y*(sz)-wo1; \
+                (buf)[(i)*3+2] = pz+rt.Z*(sx)+up.Z*(sy)+fwd.Z*(sz)-wo2; \
+            } while(0)
+
+            float verts[256*3];
+            int n = 0;
+            float h = 1.5f;
+
+            // ---- (1) Magenta up-arrow (20m tall) ----
+            V(verts,n, 0,0,0); n++; V(verts,n, 0,20,0); n++; // shaft
+            V(verts,n, 0,20,0); n++; V(verts,n, 2,15,0); n++; // head right
+            V(verts,n, 0,20,0); n++; V(verts,n, -2,15,0); n++; // head left
+            int arrow_count = n;
+
+            // ---- (2) Bounding box (orange) ----
+            float bw=0.3f, bd=0.3f;
+            #define BOX_EDGE(x1,y1,z1,x2,y2,z2) V(verts,n,x1,y1,z1);n++;V(verts,n,x2,y2,z2);n++
+            // bottom
+            BOX_EDGE(-bw,0,-bd, bw,0,-bd); BOX_EDGE(-bw,0,bd, bw,0,bd);
+            BOX_EDGE(-bw,0,-bd, -bw,0,bd); BOX_EDGE(bw,0,-bd, bw,0,bd);
+            // top
+            BOX_EDGE(-bw,h,-bd, bw,h,-bd); BOX_EDGE(-bw,h,bd, bw,h,bd);
+            BOX_EDGE(-bw,h,-bd, -bw,h,bd); BOX_EDGE(bw,h,-bd, bw,h,bd);
+            // verticals
+            BOX_EDGE(-bw,0,-bd, -bw,h,-bd); BOX_EDGE(bw,0,-bd, bw,h,-bd);
+            BOX_EDGE(-bw,0,bd, -bw,h,bd); BOX_EDGE(bw,0,bd, bw,h,bd);
+            #undef BOX_EDGE
+            int box_count = n - arrow_count;
+
+            // ---- (3) Wireframe body ----
+            float tw=0.18f, td2=0.12f;
+            float tb=h*0.3f, tt=h*0.7f;
+            float hb=h*0.78f;
+            float hdw=0.13f, hdd=0.1f;
+            float ls=0.07f, as=tw+0.04f;
+            int body_start = n;
+            // torso verticals
+            V(verts,n,-tw,tb,-td2);n++;V(verts,n,-tw,tt,-td2);n++;
+            V(verts,n, tw,tb,-td2);n++;V(verts,n, tw,tt,-td2);n++;
+            V(verts,n,-tw,tb, td2);n++;V(verts,n,-tw,tt, td2);n++;
+            V(verts,n, tw,tb, td2);n++;V(verts,n, tw,tt, td2);n++;
+            // torso top ring
+            V(verts,n,-tw,tt,-td2);n++;V(verts,n, tw,tt,-td2);n++;
+            V(verts,n,-tw,tt, td2);n++;V(verts,n, tw,tt, td2);n++;
+            V(verts,n,-tw,tt,-td2);n++;V(verts,n,-tw,tt, td2);n++;
+            V(verts,n, tw,tt,-td2);n++;V(verts,n, tw,tt, td2);n++;
+            // torso bottom ring
+            V(verts,n,-tw,tb,-td2);n++;V(verts,n, tw,tb,-td2);n++;
+            V(verts,n,-tw,tb, td2);n++;V(verts,n, tw,tb, td2);n++;
+            V(verts,n,-tw,tb,-td2);n++;V(verts,n,-tw,tb, td2);n++;
+            V(verts,n, tw,tb,-td2);n++;V(verts,n, tw,tb, td2);n++;
+            // head box
+            V(verts,n,-hdw,hb,-hdd);n++;V(verts,n, hdw,hb,-hdd);n++;
+            V(verts,n,-hdw,hb, hdd);n++;V(verts,n, hdw,hb, hdd);n++;
+            V(verts,n,-hdw,hb,-hdd);n++;V(verts,n,-hdw,hb, hdd);n++;
+            V(verts,n, hdw,hb,-hdd);n++;V(verts,n, hdw,hb, hdd);n++;
+            V(verts,n,-hdw,h,-hdd);n++;V(verts,n, hdw,h,-hdd);n++;
+            V(verts,n,-hdw,h, hdd);n++;V(verts,n, hdw,h, hdd);n++;
+            V(verts,n,-hdw,h,-hdd);n++;V(verts,n,-hdw,h, hdd);n++;
+            V(verts,n, hdw,h,-hdd);n++;V(verts,n, hdw,h, hdd);n++;
+            V(verts,n,-hdw,hb,-hdd);n++;V(verts,n,-hdw,h,-hdd);n++;
+            V(verts,n, hdw,hb,-hdd);n++;V(verts,n, hdw,h,-hdd);n++;
+            V(verts,n,-hdw,hb, hdd);n++;V(verts,n,-hdw,h, hdd);n++;
+            V(verts,n, hdw,hb, hdd);n++;V(verts,n, hdw,h, hdd);n++;
+            // legs
+            V(verts,n,-ls,0,0);n++;V(verts,n,-ls,tb,0);n++;
+            V(verts,n, ls,0,0);n++;V(verts,n, ls,tb,0);n++;
+            // arms
+            V(verts,n,-as,h*0.5f,0);n++;V(verts,n,-as,tt,0);n++;
+            V(verts,n, as,h*0.5f,0);n++;V(verts,n, as,tt,0);n++;
+            int body_count = n - body_start;
+
+            #undef V
+
+            // Upload all verts at once
+            sg_update_buffer(s_abuf, &(sg_range){ verts, n*3*sizeof(float) });
+
+            sg_apply_pipeline(r->highlight_face_pip);
+            sg_apply_uniforms(UB_highlight_vs_params, &SG_RANGE(avs));
+
+            sg_bindings ab = {0};
+            ab.vertex_buffers[0] = s_abuf;
+            sg_apply_bindings(&ab);
+
+            // Draw (1) arrow in magenta
+            highlight_fs_params_t c1 = {.color=(HMM_Vec4){{1,0,1,1}}};
+            sg_apply_uniforms(UB_highlight_fs_params, &SG_RANGE(c1));
+            sg_draw(0, arrow_count, 1);
+
+            // Draw (2) bounding box in orange
+            highlight_fs_params_t c2 = {.color=(HMM_Vec4){{1,0.5f,0,0.8f}}};
+            sg_apply_uniforms(UB_highlight_fs_params, &SG_RANGE(c2));
+            sg_draw(arrow_count, box_count, 1);
+
+            // Draw (3) body in white (or green if talking)
+            HMM_Vec4 bc = (agent->state==AGENT_STATE_TALKING)
+                ? (HMM_Vec4){{0,1,0,1}} : (HMM_Vec4){{1,1,1,1}};
+            highlight_fs_params_t c3 = {.color=bc};
+            sg_apply_uniforms(UB_highlight_fs_params, &SG_RANGE(c3));
+            sg_draw(body_start, body_count, 1);
+        }
+    }
+
+    #endif // disabled wireframe
+
     // ---- Profiler timing ----
     uint64_t render_end = stm_now();
     r->profile.accum_render_ms += (float)stm_ms(stm_diff(render_end, render_start));
@@ -1119,18 +1522,17 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
         sdtx_puts("JETPACK OFF\n");
     }
 
-    // Selected block type
-    {
-        static const char* block_names[] = {
-            "AIR", "WATER", "SAND", "DIRT", "GRASS", "STONE", "ICE", "BEDROCK", "TORCH"
-        };
-        // Hotbar types: STONE, DIRT, GRASS, SAND, WATER, ICE, TORCH
-        static const int hotbar_voxel[] = { 5, 3, 4, 2, 1, 6, 8 };
-        int vtype = hotbar_voxel[r->hotbar_selected_slot % 7];
-        const char* name = (vtype < 9) ? block_names[vtype] : "???";
-        sdtx_color3f(1.0f, 0.8f, 0.4f);
-        sdtx_printf("[%d] %s\n", r->hotbar_selected_slot + 1, name);
-    }
+    // Selected block type (commented out — hotbar icons are sufficient)
+    // {
+    //     static const char* block_names[] = {
+    //         "AIR", "WATER", "SAND", "DIRT", "GRASS", "STONE", "ICE", "BEDROCK", "TORCH"
+    //     };
+    //     static const int hotbar_voxel[] = { 5, 3, 4, 2, 1, 6, 8 };
+    //     int vtype = hotbar_voxel[r->hotbar_selected_slot % 7];
+    //     const char* name = (vtype < 9) ? block_names[vtype] : "???";
+    //     sdtx_color3f(1.0f, 0.8f, 0.4f);
+    //     sdtx_printf("[%d] %s\n", r->hotbar_selected_slot + 1, name);
+    // }
 
     // Reference frame indicator (top-right corner)
     {

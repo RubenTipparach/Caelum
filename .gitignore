@@ -30,8 +30,17 @@ node_modules/
 *.dylib
 *.dll
 
+# API keys
+config/ai_config.yaml
+tools/api-key.txt
+
 # Tools (downloaded binaries, not committed)
-tools/
+tools/sokol-shdc*
+tools/ai/
+
+# Char editor build output
+tools/char-editor/**/bin/
+tools/char-editor/**/obj/
 emsdk/
 
 # Logs
@@ -42,3 +51,4 @@ screenshots/
 cache/
 hex-planets-web.zip
 .history/
+config/ai_config.yaml

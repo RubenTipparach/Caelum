@@ -28,6 +28,10 @@ typedef struct VisualConfig {
     // LOD
     float lod_split_factor;     // split threshold multiplier (higher = more detail)
 
+    // Color table (Picotron-style distance darkening)
+    float coltab_factor;        // color preservation at max distance (0.8 = 20% darker)
+    float coltab_max_dist;      // distance at full effect (meters)
+
 } VisualConfig;
 
 // Returns hardcoded defaults (same values currently in the code)

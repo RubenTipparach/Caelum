@@ -33,6 +33,10 @@
 #include "lobby.h"
 #include "touch_controls.h"
 #include "solar_config.h"
+#include "ai_npc.h"
+#include "ai_actions.h"
+#include "ai_agent.h"
+#include "ai_orders.h"
 
 typedef enum {
     STATE_MENU,
@@ -100,6 +104,27 @@ static struct {
     // Solar system config (centralized, used at init and SOI transitions)
     SolarSystemConfig solar_cfg;
 
+    // AI NPC (legacy direct chat — being replaced by agent system)
+    AiNpc ai;
+    AiActionExecutor ai_exec;
+    bool ai_chat_open;          // Chat UI visible
+    char ai_input[256];         // Player text input buffer
+    int  ai_input_len;
+
+    // Chat message log (scrolls up and fades)
+    #define CHAT_LOG_MAX 16
+    #define CHAT_MSG_MAX 128
+    struct {
+        char text[CHAT_MSG_MAX];
+        float r, g, b;          // color
+        float age;              // seconds since posted
+    } chat_log[CHAT_LOG_MAX];
+    int chat_log_count;
+
+    // AI Agent system
+    AiAgentSystem agent_system;
+    bool agents_spawned;
+
     // Save restore state
     bool restore_moon_local;    // Skip world→moon transform on next SOI transition (loading from save)
 
@@ -143,6 +168,101 @@ static int room_code_len = 0;
 static int room_code_cursor_blink = 0;
 
 // Block interaction: use hex terrain selection from renderer
+// Replace common UTF-8 multi-byte sequences with ASCII equivalents
+static void sanitize_to_ascii(const char* src, char* dst, int dst_size) {
+    int si = 0, di = 0;
+    while (src[si] && di < dst_size - 1) {
+        unsigned char c = (unsigned char)src[si];
+        // 3-byte UTF-8 sequences (0xE2 ...)
+        if (c == 0xE2 && (unsigned char)src[si+1] && (unsigned char)src[si+2]) {
+            unsigned char b1 = (unsigned char)src[si+1];
+            unsigned char b2 = (unsigned char)src[si+2];
+            if (b1 == 0x80) {
+                if (b2 == 0x94) { dst[di++] = '-'; si += 3; continue; }  // em dash
+                if (b2 == 0x93) { dst[di++] = '-'; si += 3; continue; }  // en dash
+                if (b2 == 0x98 || b2 == 0x99) { dst[di++] = '\''; si += 3; continue; } // curly single quotes
+                if (b2 == 0x9C || b2 == 0x9D) { dst[di++] = '"'; si += 3; continue; }  // curly double quotes
+                if (b2 == 0xA6 && di < dst_size - 3) { dst[di++] = '.'; dst[di++] = '.'; dst[di++] = '.'; si += 3; continue; } // ellipsis
+                if (b2 == 0xA2) { dst[di++] = '*'; si += 3; continue; }  // bullet
+            }
+            // Skip unknown 3-byte sequence
+            si += 3; continue;
+        }
+        // 2-byte UTF-8 (0xC0-0xDF): skip
+        if (c >= 0xC0 && c <= 0xDF) {
+            // Common Latin-1 chars via UTF-8
+            if (c == 0xC2 && (unsigned char)src[si+1] == 0xA0) { dst[di++] = ' '; si += 2; continue; } // nbsp
+            si += 2; continue;
+        }
+        // 4-byte UTF-8 (0xF0-0xF7): skip (emoji etc)
+        if (c >= 0xF0 && c <= 0xF7) { si += 4; continue; }
+        // Regular ASCII
+        if (c >= 32 && c < 127) {
+            dst[di++] = (char)c;
+        } else if (c == '\n') {
+            dst[di++] = ' '; // flatten newlines
+        }
+        si++;
+    }
+    dst[di] = '\0';
+}
+
+static int chat_wrap_cols(void) {
+    // 50% of screen width in character columns
+    // Canvas is sapp_widthf()*0.5, each char is 8 canvas units
+    int cols = (int)(sapp_widthf() * 0.5f / 8.0f / 2.0f);
+    if (cols < 30) cols = 30;
+    if (cols > 120) cols = 120;
+    return cols;
+}
+
+static void chat_log_push(const char* text, float r, float g, float b) {
+    // Sanitize UTF-8 to ASCII
+    int wrap_cols = chat_wrap_cols();
+    char clean[512];
+    sanitize_to_ascii(text, clean, sizeof(clean));
+
+    // Word-wrap into multiple lines if needed
+    const char* src = clean;
+    while (*src) {
+        // Make room if log is full
+        if (app.chat_log_count >= CHAT_LOG_MAX) {
+            memmove(&app.chat_log[0], &app.chat_log[1],
+                    (CHAT_LOG_MAX - 1) * sizeof(app.chat_log[0]));
+            app.chat_log_count = CHAT_LOG_MAX - 1;
+        }
+
+        int len = (int)strlen(src);
+        if (len <= wrap_cols) {
+            // Fits on one line
+            int idx = app.chat_log_count++;
+            snprintf(app.chat_log[idx].text, CHAT_MSG_MAX, "%s", src);
+            app.chat_log[idx].r = r;
+            app.chat_log[idx].g = g;
+            app.chat_log[idx].b = b;
+            app.chat_log[idx].age = 0.0f;
+            break;
+        }
+
+        // Find last space before wrap_cols
+        int brk = wrap_cols;
+        while (brk > 0 && src[brk] != ' ') brk--;
+        if (brk == 0) brk = wrap_cols; // no space found, hard break
+
+        int idx = app.chat_log_count++;
+        int copy_len = brk < CHAT_MSG_MAX - 1 ? brk : CHAT_MSG_MAX - 1;
+        memcpy(app.chat_log[idx].text, src, copy_len);
+        app.chat_log[idx].text[copy_len] = '\0';
+        app.chat_log[idx].r = r;
+        app.chat_log[idx].g = g;
+        app.chat_log[idx].b = b;
+        app.chat_log[idx].age = 0.0f;
+
+        src += brk;
+        if (*src == ' ') src++; // skip the space at the break point
+    }
+}
+
 static void interact_break(void) {
     if (!app.renderer.hex_placement.valid) return;
     HexHitResult* hit = &app.renderer.hex_placement;
@@ -245,6 +365,11 @@ static void init(void) {
 
     // Lobby system
     lobby_init("https://hex-planets.vercel.app");
+
+    // AI NPC system
+    ai_npc_init(&app.ai, "tools/ai/Qwen3-8B-Q4_K_M.gguf",
+                "tools/ai/grammar.gbnf", 8080);
+    ai_actions_init(&app.ai_exec);
 
     // Touch controls
     touch_init(&app.touch);
@@ -476,6 +601,40 @@ static void frame(void) {
         sdtx_puts("L = toggle LOD debug colors\n");
         sdtx_puts("V = toggle verbose logs\n");
         sdtx_puts("R = reload config.yaml\n");
+        sdtx_puts("E = talk to nearby AI agent\n");
+
+        // AI status
+        sdtx_puts("\n");
+        if (app.ai.provider == AI_PROVIDER_CLAUDE && app.ai.claude_api_key[0]) {
+            sdtx_color3f(0.4f, 0.8f, 1.0f);
+            sdtx_printf("AI: Claude (%s)\n", app.ai.claude_model);
+        } else if (app.ai.server_running) {
+            sdtx_color3f(0.4f, 1.0f, 0.4f);
+            sdtx_puts("AI: llama-server running\n");
+        } else {
+            sdtx_color3f(0.6f, 0.4f, 0.4f);
+            sdtx_puts("AI: offline (run ai-install.bat)\n");
+        }
+
+        // Agent count
+        {
+            int agent_count = 0;
+            #ifdef _WIN32
+            WIN32_FIND_DATAA fd;
+            HANDLE hf = FindFirstFileA("cache/agents/*.json", &fd);
+            if (hf != INVALID_HANDLE_VALUE) {
+                do { agent_count++; } while (FindNextFileA(hf, &fd));
+                FindClose(hf);
+            }
+            #endif
+            if (agent_count > 0) {
+                sdtx_color3f(0.5f, 0.7f, 0.5f);
+                sdtx_printf("Agents: %d loaded\n", agent_count);
+            } else {
+                sdtx_color3f(0.5f, 0.5f, 0.5f);
+                sdtx_puts("Agents: none (use char editor)\n");
+            }
+        }
 
         sdtx_draw();
         sg_end_pass();
@@ -1081,6 +1240,45 @@ static void frame(void) {
                     active, total_verts, elapsed_ms, app.load_frame_count);
                 fflush(stdout);
                 app.state = STATE_PLAYING;
+
+                // Spawn AI agents near player
+                if (!app.agents_spawned) {
+                    ai_agent_system_init(&app.agent_system, app.planet.radius);
+
+                    // Try to load first agent from cache/agents/
+                    // Scan for any .json file
+                    #ifdef _WIN32
+                    {
+                        WIN32_FIND_DATAA fd;
+                        HANDLE hFind = FindFirstFileA("cache/agents/*.json", &fd);
+                        if (hFind != INVALID_HANDLE_VALUE) {
+                            do {
+                                char path[512];
+                                snprintf(path, sizeof(path), "cache/agents/%s", fd.cFileName);
+                                int idx = ai_agent_load(&app.agent_system, path);
+                                if (idx >= 0) {
+                                    // Spawn 5m to the right of player
+                                    HMM_Vec3 right = app.camera.right;
+                                    double sx = app.camera.pos_d[0] + right.X * 5.0;
+                                    double sy = app.camera.pos_d[1] + right.Y * 5.0;
+                                    double sz = app.camera.pos_d[2] + right.Z * 5.0;
+                                    ai_agent_spawn(&app.agent_system, idx,
+                                                   &app.renderer.hex_terrain, sx, sy, sz);
+                                }
+                            } while (FindNextFileA(hFind, &fd));
+                            FindClose(hFind);
+                        }
+                    }
+                    #endif
+                    // Try to restore saved positions
+                    {
+                        char agent_save[256];
+                        snprintf(agent_save, sizeof(agent_save), "%s/agents.dat", app.active_edits_dir);
+                        ai_agent_load_positions(&app.agent_system, agent_save);
+                    }
+                    app.agents_spawned = true;
+                    app.renderer.agent_system = &app.agent_system;
+                }
             }
             return;
         }
@@ -1101,6 +1299,145 @@ static void frame(void) {
         if (++autosave_counter >= 300) {
             autosave_counter = 0;
             player_save();
+            // Autosave agent positions
+            if (app.agents_spawned) {
+                char agent_save[256];
+                snprintf(agent_save, sizeof(agent_save), "%s/agents.dat", app.active_edits_dir);
+                ai_agent_save_positions(&app.agent_system, agent_save);
+            }
+        }
+
+        // AI NPC: poll for LLM response, execute queued actions
+        ai_npc_poll(&app.ai);
+        if (app.ai.state == AI_SUCCESS) {
+            chat_log_push(app.ai.dialogue, 0.3f, 0.8f, 1.0f);
+            ai_actions_enqueue(&app.ai_exec, app.ai.actions, app.ai.action_count);
+            app.ai.state = AI_IDLE;
+        } else if (app.ai.state == AI_ERROR) {
+            chat_log_push(app.ai.error, 1.0f, 0.3f, 0.3f);
+            app.ai.state = AI_IDLE;
+        }
+        ai_actions_update(&app.ai_exec, &app.renderer.hex_terrain, dt);
+
+        // Update AI agents (physics, state, AI polling)
+        ai_agent_system_update(&app.agent_system, &app.renderer.hex_terrain,
+                               app.camera.pos_d, dt);
+
+        // Keep conversation alive while chat window is open (60s timeout when typing)
+        if (app.ai_chat_open) {
+            int nearest = ai_agent_nearest(&app.agent_system, app.camera.pos_d, 20.0f);
+            if (nearest >= 0) {
+                AiAgent* agent = &app.agent_system.agents[nearest];
+                if (agent->in_conversation && agent->convo_timer > 0.0f) {
+                    // Reset to keep under 60s threshold while typing
+                    if (agent->convo_timer < 60.0f)
+                        agent->convo_timer = 0.0f;
+                }
+            }
+        }
+
+        // Poll agent AIs and push responses to chat log (AFTER update so poll has run)
+        for (int agi = 0; agi < app.agent_system.count; agi++) {
+            AiAgent* agent = &app.agent_system.agents[agi];
+            if (!agent->active) continue;
+            if (agent->ai.state == AI_SUCCESS) {
+                agent->convo_timer = 0.0f; // response keeps conversation alive
+                printf("[CHAT] Agent '%s' AI_SUCCESS: dialogue=%s, actions=%d\n",
+                       agent->name,
+                       agent->ai.dialogue[0] ? "yes" : "EMPTY",
+                       agent->ai.action_count);
+                fflush(stdout);
+                if (agent->ai.dialogue[0]) {
+                    // Extract [REMEMBER] tags before displaying
+                    int memories = ai_memory_extract_from_response(
+                        &agent->memory, agent->ai.dialogue);
+                    if (memories > 0) {
+                        printf("[MEMORY] Agent '%s' saved %d memories\n",
+                               agent->name, memories);
+                        fflush(stdout);
+                    }
+
+                    // Execute script if one was extracted from the response
+                    if (agent->ai.script_buf[0]) {
+                        AiScript script;
+                        if (ai_script_parse(agent->ai.script_buf, &script)) {
+                            ai_order_save(&(AiOrder){0}, &script, &agent->memory);
+                            ai_script_run(&agent->script_runner, &script);
+                            printf("[SCRIPT] Generated from LLM: '%s' (%d steps)\n",
+                                   script.name, script.step_count);
+                        } else {
+                            printf("[SCRIPT] Failed to parse LLM script:\n%s\n",
+                                   agent->ai.script_buf);
+                        }
+                        fflush(stdout);
+                        agent->ai.script_buf[0] = '\0';
+                    }
+                    agent->ai.script_mode = false;
+
+                    // Strip [REMEMBER], [SCRIPT], and raw JSON from display text
+                    char clean_dialogue[512];
+                    snprintf(clean_dialogue, sizeof(clean_dialogue), "%s", agent->ai.dialogue);
+                    // Strip ```json ... ``` blocks
+                    {
+                        char* jstart = strstr(clean_dialogue, "```");
+                        while (jstart) {
+                            char* jend = strstr(jstart + 3, "```");
+                            if (jend) {
+                                memmove(jstart, jend + 3, strlen(jend + 3) + 1);
+                            } else {
+                                *jstart = '\0';
+                            }
+                            jstart = strstr(clean_dialogue, "```");
+                        }
+                    }
+                    // Strip raw JSON objects that leaked into dialogue
+                    {
+                        char* jstart = strchr(clean_dialogue, '{');
+                        if (jstart) {
+                            char* jend = strrchr(clean_dialogue, '}');
+                            if (jend && jend > jstart) {
+                                memmove(jstart, jend + 1, strlen(jend + 1) + 1);
+                            }
+                        }
+                    }
+                    char* rem = strstr(clean_dialogue, "[REMEMBER]");
+                    while (rem) {
+                        char* end = strstr(rem, "[/REMEMBER]");
+                        if (end) {
+                            memmove(rem, end + 11, strlen(end + 11) + 1);
+                        } else {
+                            *rem = '\0';
+                        }
+                        rem = strstr(clean_dialogue, "[REMEMBER]");
+                    }
+                    // Trim
+                    char* trimmed = clean_dialogue;
+                    while (*trimmed == ' ' || *trimmed == '\n') trimmed++;
+                    int tlen = (int)strlen(trimmed);
+                    while (tlen > 0 && (trimmed[tlen-1] == ' ' || trimmed[tlen-1] == '\n'))
+                        trimmed[--tlen] = '\0';
+
+                    if (trimmed[0]) {
+                        char msg[512];
+                        snprintf(msg, sizeof(msg), "%s: %s", agent->name, trimmed);
+                        chat_log_push(msg, 0.3f, 0.8f, 1.0f);
+                    }
+
+                    // Journal the conversation
+                    ai_memory_journal(&agent->memory, agent->ai.dialogue);
+                } else {
+                    printf("[CHAT] WARNING: Agent '%s' replied with empty dialogue!\n", agent->name);
+                    fflush(stdout);
+                }
+                agent->ai.state = AI_IDLE;
+            } else if (agent->ai.state == AI_ERROR) {
+                printf("[CHAT] Agent '%s' AI_ERROR: %s\n", agent->name, agent->ai.error);
+                fflush(stdout);
+                if (agent->ai.error[0]) {
+                    chat_log_push(agent->ai.error, 1.0f, 0.3f, 0.3f);
+                }
+                agent->ai.state = AI_IDLE;
+            }
         }
 
         // ---- LOD retarget: switch body when gravity changes ----
@@ -1216,6 +1553,188 @@ static void frame(void) {
         }
 
         app.renderer.hotbar_selected_slot = app.hotbar_slot;
+
+        // "Press E to talk" prompt — raycast from crosshair against agent bounding boxes
+        if (!app.ai_chat_open && app.camera.mouse_locked) {
+            int hit = ai_agent_raycast(&app.agent_system,
+                app.camera.position, app.camera.forward, 10.0f);
+            if (hit >= 0) {
+                AiAgent* agent = &app.agent_system.agents[hit];
+                float cw = sapp_widthf() * 0.5f;
+                float ch = sapp_heightf() * 0.5f;
+                float cpx = sapp_widthf() / (cw / 8.0f);
+                sdtx_canvas(cw, ch);
+                sdtx_font(0);
+                // Position just above the hotbar (bottom-center)
+                int prompt_len = 17 + (int)strlen(agent->name); // "Press E to talk to <name>"
+                float tx = (cw / 2.0f) / 8.0f - (float)prompt_len * 0.5f;
+                float ty = ch / 8.0f - 5.5f; // above hotbar
+                sdtx_pos(tx, ty);
+                sdtx_color3f(1.0f, 1.0f, 0.6f);
+                sdtx_printf("Press E to talk to %s", agent->name);
+            }
+        }
+
+        // ---- Chat log: age messages, remove old ones ----
+        {
+            float max_age = 30.0f; // messages visible for 30 seconds
+            int write = 0;
+            for (int i = 0; i < app.chat_log_count; i++) {
+                app.chat_log[i].age += dt;
+                if (app.chat_log[i].age < max_age) {
+                    if (write != i) app.chat_log[write] = app.chat_log[i];
+                    write++;
+                }
+            }
+            app.chat_log_count = write;
+        }
+
+        // ---- Chat overlay ----
+        {
+            float cw = sapp_widthf() * 0.5f;
+            float ch = sapp_heightf() * 0.5f;
+            float cpx = sapp_widthf() / (cw / 8.0f);
+            sdtx_canvas(cw, ch);
+            sdtx_font(0);
+
+            // Emotion + active command stats (only when chat input is open)
+            if (app.ai_chat_open) {
+                int emo_nearest = ai_agent_nearest(&app.agent_system, app.camera.pos_d, 20.0f);
+                if (emo_nearest >= 0) {
+                    AiAgent* ea = &app.agent_system.agents[emo_nearest];
+                    float ey = 1.0f;
+                    float ex = cw / 8.0f - 28.0f;
+                    sdtx_pos(ex, ey);
+                    sdtx_color3f(0.5f, 0.5f, 0.6f);
+                    sdtx_printf("Joy:%.0f Bored:%.0f Annoy:%.0f Curious:%.0f",
+                               ea->emotions.joy * 100, ea->emotions.boredom * 100,
+                               ea->emotions.annoyance * 100, ea->emotions.curiosity * 100);
+                    // Active command/state
+                    sdtx_pos(ex, ey + 1.0f);
+                    if (!ai_script_idle(&ea->script_runner)) {
+                        sdtx_color3f(0.4f, 1.0f, 0.4f);
+                        sdtx_printf("Script: %s [%d/%d]",
+                                   ea->script_runner.script.name,
+                                   ea->script_runner.current_step + 1,
+                                   ea->script_runner.script.step_count);
+                    } else if (ea->has_target && ea->target_q == -9999) {
+                        sdtx_color3f(0.4f, 0.8f, 1.0f);
+                        sdtx_puts("Following you");
+                    } else if (ea->state == AGENT_STATE_WALKING) {
+                        sdtx_color3f(0.8f, 0.8f, 0.4f);
+                        sdtx_puts("Walking...");
+                    } else if (ea->ai.state == AI_PENDING) {
+                        sdtx_color3f(1.0f, 1.0f, 0.3f);
+                        sdtx_puts("Thinking...");
+                    } else {
+                        sdtx_color3f(0.5f, 0.5f, 0.5f);
+                        sdtx_puts("Idle");
+                    }
+                }
+            }
+
+            // "Thinking..." indicator with animated ellipsis
+            int nearest = ai_agent_nearest(&app.agent_system, app.camera.pos_d, 20.0f);
+            if (nearest >= 0 && app.agent_system.agents[nearest].ai.state == AI_PENDING) {
+                float ty = ch - 4.0f * cpx;
+                sdtx_pos(1.0f, ty / cpx);
+                sdtx_color3f(1.0f, 1.0f, 0.3f);
+                int dots = ((int)(stm_sec(stm_now()) * 2.0) % 3) + 1;
+                const char* ellipsis[] = {".", "..", "..."};
+                sdtx_printf("%s is thinking%s", app.agent_system.agents[nearest].name, ellipsis[dots - 1]);
+            }
+
+            // Chat input line (when open)
+            if (app.ai_chat_open) {
+                float ty = ch - 3.0f * cpx;
+                sdtx_pos(1.0f, ty / cpx);
+                sdtx_color3f(0.3f, 1.0f, 0.3f);
+                sdtx_puts("> ");
+                sdtx_color3f(1.0f, 1.0f, 1.0f);
+                sdtx_puts(app.ai_input);
+                sdtx_puts("_");
+            }
+
+            // Message log — render bottom-up from above the input line
+            float log_bottom = ch - 5.0f * cpx; // start above thinking/input
+            for (int i = app.chat_log_count - 1; i >= 0; i--) {
+                int lines_from_bottom = app.chat_log_count - 1 - i;
+                float ty = log_bottom - (float)lines_from_bottom * cpx;
+                if (ty < 0) break; // off screen
+
+                // Fade out in last 5 seconds
+                float alpha = 1.0f;
+                if (app.chat_log[i].age > 25.0f)
+                    alpha = 1.0f - (app.chat_log[i].age - 25.0f) / 5.0f;
+
+                sdtx_pos(1.0f, ty / cpx);
+                sdtx_color3f(app.chat_log[i].r * alpha,
+                             app.chat_log[i].g * alpha,
+                             app.chat_log[i].b * alpha);
+                sdtx_puts(app.chat_log[i].text);
+            }
+        }
+
+        // ---- Agent name labels above head (>20m away, fade >1km) ----
+        {
+            float cw = sapp_widthf() * 0.5f;
+            float ch = sapp_heightf() * 0.5f;
+            sdtx_canvas(cw, ch);
+            sdtx_font(0);
+
+            // Rotation-only VP (agent pos is already camera-relative)
+            HMM_Mat4 view_rot = app.camera.view;
+            view_rot.Elements[3][0] = 0.0f;
+            view_rot.Elements[3][1] = 0.0f;
+            view_rot.Elements[3][2] = 0.0f;
+            HMM_Mat4 vp_rot = HMM_MulM4(app.camera.proj, view_rot);
+
+            for (int agi = 0; agi < app.agent_system.count; agi++) {
+                AiAgent* agent = &app.agent_system.agents[agi];
+                if (!agent->active || agent->state == AGENT_STATE_SLEEPING) continue;
+
+                // Distance to agent (double precision)
+                double dx = agent->pos_d[0] - app.camera.pos_d[0];
+                double dy = agent->pos_d[1] - app.camera.pos_d[1];
+                double dz = agent->pos_d[2] - app.camera.pos_d[2];
+                float dist = (float)sqrt(dx*dx + dy*dy + dz*dz);
+
+                if (dist < 20.0f || dist > 1000.0f) continue;
+
+                // Fade: fully visible at 20-500m, fade out 500-1000m
+                float alpha = 1.0f;
+                if (dist > 500.0f)
+                    alpha = 1.0f - (dist - 500.0f) / 500.0f;
+
+                // Camera-relative head position (double subtraction first)
+                float head_lift = 2.2f;
+                float cx = (float)dx + agent->local_up.X * head_lift;
+                float cy = (float)dy + agent->local_up.Y * head_lift;
+                float cz = (float)dz + agent->local_up.Z * head_lift;
+
+                // Project with rotation-only VP
+                HMM_Vec4 clip = HMM_MulM4V4(vp_rot, (HMM_Vec4){{cx, cy, cz, 1.0f}});
+                if (clip.W <= 0.0f) continue; // behind camera
+
+                float ndcx = clip.X / clip.W;
+                float ndcy = clip.Y / clip.W;
+                if (ndcx < -1.0f || ndcx > 1.0f || ndcy < -1.0f || ndcy > 1.0f) continue;
+
+                // NDC to canvas coords
+                float sx = (ndcx * 0.5f + 0.5f) * cw;
+                float sy = (-ndcy * 0.5f + 0.5f) * ch;
+
+                // Center the name
+                int name_len = (int)strlen(agent->name);
+                float tx = sx / 8.0f - (float)name_len * 0.5f;
+                float ty = sy / 8.0f;
+
+                sdtx_pos(tx, ty);
+                sdtx_color3f(1.0f * alpha, 1.0f * alpha, 0.7f * alpha);
+                sdtx_puts(agent->name);
+            }
+        }
+
         render_frame(&app.renderer, &app.camera, dt);
     }
 
@@ -1595,6 +2114,37 @@ static void event(const sapp_event* ev) {
         return;
     }
 
+    // Block game debug/toggle keys while chat is open
+    // (chat input handlers are further below and must still work)
+    if (app.ai_chat_open) goto chat_input_handler;
+
+    // Alt+I: summon nearest agent to player
+    if (ev->type == SAPP_EVENTTYPE_KEY_DOWN && ev->key_code == SAPP_KEYCODE_I
+        && (ev->modifiers & SAPP_MODIFIER_ALT)) {
+        if (app.agent_system.count > 0) {
+            // Find first active agent (or nearest)
+            int best = -1;
+            for (int agi = 0; agi < app.agent_system.count; agi++) {
+                if (app.agent_system.agents[agi].active) { best = agi; break; }
+            }
+            if (best >= 0) {
+                AiAgent* agent = &app.agent_system.agents[best];
+                // Teleport 3m in front of player
+                HMM_Vec3 fwd = app.camera.forward;
+                agent->pos_d[0] = app.camera.pos_d[0] + fwd.X * 3.0;
+                agent->pos_d[1] = app.camera.pos_d[1] + fwd.Y * 3.0;
+                agent->pos_d[2] = app.camera.pos_d[2] + fwd.Z * 3.0;
+                agent->state = AGENT_STATE_IDLE;
+                agent->state_timer = 0.0f;
+                agent->path.valid = false;
+                agent->velocity = HMM_V3(0, 0, 0);
+                printf("[AGENT] Summoned '%s' to player\n", agent->name);
+                fflush(stdout);
+            }
+        }
+        return;
+    }
+
     // Toggle LOD debug view with 'L' key
     if (ev->type == SAPP_EVENTTYPE_KEY_DOWN && ev->key_code == SAPP_KEYCODE_L) {
         app.renderer.show_lod_debug = !app.renderer.show_lod_debug;
@@ -1639,6 +2189,362 @@ static void event(const sapp_event* ev) {
             app.renderer.lod_tree.split_factor = new_cfg.lod_split_factor;
         }
         return;
+    }
+
+    // AI Chat: press E to talk — raycast against agent bounding box
+    if (ev->type == SAPP_EVENTTYPE_KEY_UP && ev->key_code == SAPP_KEYCODE_E
+        && !app.ai_chat_open && app.camera.mouse_locked) {
+        int nearest = ai_agent_raycast(&app.agent_system,
+            app.camera.position, app.camera.forward, 10.0f);
+        if (nearest >= 0) {
+            app.ai_chat_open = true;
+            app.ai_input[0] = '\0';
+            app.ai_input_len = 0;
+            sapp_lock_mouse(false);
+            sapp_show_mouse(true);
+            app.camera.mouse_locked = false;
+            AiAgent* agent = &app.agent_system.agents[nearest];
+            agent->state = AGENT_STATE_TALKING;
+            agent->state_timer = 0.0f;
+            agent->in_conversation = true;
+            agent->convo_timer = 0.0f;
+            agent->path.valid = false; // stop walking
+            // Face the agent toward the player
+            HMM_Vec3 to_player = HMM_NormV3(HMM_SubV3(app.camera.position, agent->position));
+            HMM_Vec3 proj = HMM_SubV3(to_player, HMM_MulV3F(agent->local_up, HMM_DotV3(to_player, agent->local_up)));
+            float plen = HMM_LenV3(proj);
+            if (plen > 0.001f) agent->forward = HMM_MulV3F(proj, 1.0f / plen);
+            printf("[AI] Chatting with '%s'\n", agent->name);
+            fflush(stdout);
+        }
+        return;
+    }
+
+chat_input_handler:
+    // AI Chat: handle text input when chat is open
+    if (app.ai_chat_open) {
+        if (ev->type == SAPP_EVENTTYPE_KEY_DOWN) {
+            if (ev->key_code == SAPP_KEYCODE_ESCAPE) {
+                // Close chat
+                app.ai_chat_open = false;
+                app.ai_input[0] = '\0';
+                app.ai_input_len = 0;
+                return;
+            }
+            if (ev->key_code == SAPP_KEYCODE_ENTER && app.ai_input_len > 0) {
+                // "remember <text>" — save directly to agent memory
+                {
+                    char lower[256];
+                    int li = 0;
+                    for (int ci = 0; app.ai_input[ci] && li < 254; ci++)
+                        lower[li++] = (app.ai_input[ci] >= 'A' && app.ai_input[ci] <= 'Z')
+                            ? app.ai_input[ci] + 32 : app.ai_input[ci];
+                    lower[li] = '\0';
+                    char* rem_pos = strstr(lower, "remember ");
+                    if (rem_pos) {
+                        int nearest_m = ai_agent_nearest(&app.agent_system, app.camera.pos_d, 20.0f);
+                        if (nearest_m >= 0) {
+                            AiAgent* agent = &app.agent_system.agents[nearest_m];
+                            // Extract what comes after "remember "
+                            int rem_offset = (int)(rem_pos - lower) + 9;
+                            const char* what = app.ai_input + rem_offset;
+                            ai_memory_remember(&agent->memory, what);
+                            char msg[256];
+                            snprintf(msg, sizeof(msg), "You: %s", app.ai_input);
+                            chat_log_push(msg, 0.5f, 1.0f, 0.5f);
+                            snprintf(msg, sizeof(msg), "%s: Got it, I'll remember that.", agent->name);
+                            chat_log_push(msg, 0.3f, 0.8f, 1.0f);
+                            printf("[MEMORY] Player asked to remember: %s\n", what);
+                            fflush(stdout);
+                        }
+                        app.ai_input[0] = '\0';
+                        app.ai_input_len = 0;
+                        app.ai_chat_open = false;
+                        return;
+                    }
+                }
+
+                // Check for /script command — loads and runs a script file
+                if (strncmp(app.ai_input, "/script ", 8) == 0) {
+                    const char* script_name = app.ai_input + 8;
+                    int nearest_s = ai_agent_nearest(&app.agent_system, app.camera.pos_d, 20.0f);
+                    if (nearest_s >= 0) {
+                        AiAgent* agent = &app.agent_system.agents[nearest_s];
+                        char script_path[256];
+                        snprintf(script_path, sizeof(script_path),
+                                 "cache/scripts/%s.json", script_name);
+                        AiScript script;
+                        if (ai_script_load(script_path, &script)) {
+                            ai_script_run(&agent->script_runner, &script);
+                            char msg[256];
+                            snprintf(msg, sizeof(msg), "Running script: %s (%d steps)",
+                                     script.name, script.step_count);
+                            chat_log_push(msg, 0.4f, 1.0f, 0.4f);
+                        } else {
+                            chat_log_push("Script not found!", 1.0f, 0.3f, 0.3f);
+                        }
+                    }
+                    app.ai_input[0] = '\0';
+                    app.ai_input_len = 0;
+                    app.ai_chat_open = false;
+                    return;
+                }
+                // Check for /scan command — show sensor report
+                if (strcmp(app.ai_input, "/scan") == 0) {
+                    int nearest_s = ai_agent_nearest(&app.agent_system, app.camera.pos_d, 20.0f);
+                    if (nearest_s >= 0) {
+                        AiAgent* agent = &app.agent_system.agents[nearest_s];
+                        int gcol_s, grow_s, layer_s;
+                        hex_terrain_world_to_hex(&app.renderer.hex_terrain,
+                            agent->position, &gcol_s, &grow_s, &layer_s);
+                        ai_sensors_scan(&app.renderer.hex_terrain, gcol_s, grow_s, 5,
+                                       &agent->last_scan);
+                        ai_sensors_report(&agent->last_scan, agent->sensor_report,
+                                         sizeof(agent->sensor_report));
+                        printf("[SCAN] %s\n", agent->sensor_report);
+                        fflush(stdout);
+                        chat_log_push("Scan complete! (see console)", 0.4f, 1.0f, 0.4f);
+                    }
+                    app.ai_input[0] = '\0';
+                    app.ai_input_len = 0;
+                    app.ai_chat_open = false;
+                    return;
+                }
+
+                // Try to parse as an order (follow, go, build, clear, stay)
+                {
+                    AiOrder order;
+                    if (ai_order_parse(app.ai_input, &order)) {
+                        int nearest_o = ai_agent_nearest(&app.agent_system, app.camera.pos_d, 20.0f);
+                        if (nearest_o >= 0) {
+                            AiAgent* agent = &app.agent_system.agents[nearest_o];
+
+                            if (order.type == ORDER_FOLLOW) {
+                                // Follow mode: set a flag, handled in agent update
+                                agent->has_target = true;
+                                agent->in_conversation = true;
+                                agent->convo_timer = 0.0f;
+                                char msg[128];
+                                snprintf(msg, sizeof(msg), "You: %s", app.ai_input);
+                                chat_log_push(msg, 0.5f, 1.0f, 0.5f);
+                                chat_log_push("Following you!", 0.3f, 0.8f, 1.0f);
+                                // Set follow target_q/r to invalid — agent update will track player
+                                agent->target_q = -9999;
+                                agent->target_r = -9999;
+                                printf("[ORDER] '%s' following player\n", agent->name);
+                                fflush(stdout);
+                            } else if (order.type == ORDER_STAY) {
+                                agent->has_target = false;
+                                agent->path.valid = false;
+                                agent->state = AGENT_STATE_IDLE;
+                                agent->in_conversation = false;
+                                ai_script_stop(&agent->script_runner);
+                                char msg[128];
+                                snprintf(msg, sizeof(msg), "You: %s", app.ai_input);
+                                chat_log_push(msg, 0.5f, 1.0f, 0.5f);
+                                chat_log_push("Staying put.", 0.3f, 0.8f, 1.0f);
+                                printf("[ORDER] '%s' staying\n", agent->name);
+                                fflush(stdout);
+                            } else {
+                                // Generate script from order
+                                int gq, gr, gl;
+                                hex_terrain_world_to_hex(&app.renderer.hex_terrain,
+                                    agent->position, &gq, &gr, &gl);
+                                float gr_h = hex_terrain_ground_height(&app.renderer.hex_terrain, gq, gr);
+                                float base = hex_terrain_col_base_r(&app.renderer.hex_terrain, gq, gr);
+                                int ground_layer = (base > 0) ? (int)((gr_h - base) / HEX_HEIGHT) : 0;
+
+                                // Resolve "forward" direction to nearest hex direction
+                                if (order.direction == -1) {
+                                    // Use agent's forward vector projected onto hex grid
+                                    // Simple: pick closest hex direction to agent forward
+                                    order.direction = 0; // default E
+                                }
+
+                                AiScript script;
+                                if (ai_order_to_script(&order, &app.renderer.hex_terrain,
+                                                       gq, gr, ground_layer, &script)) {
+                                    // Save to learning folder
+                                    ai_order_save(&order, &script, &agent->memory);
+
+                                    // Run it
+                                    ai_script_run(&agent->script_runner, &script);
+
+                                    char msg[128];
+                                    snprintf(msg, sizeof(msg), "You: %s", app.ai_input);
+                                    chat_log_push(msg, 0.5f, 1.0f, 0.5f);
+                                    char status[256];
+                                    snprintf(status, sizeof(status), "%s: On it! %s (%d steps)",
+                                             agent->name, script.description, script.step_count);
+                                    chat_log_push(status, 0.3f, 0.8f, 1.0f);
+
+                                    printf("[ORDER] '%s' executing: %s (%d steps)\n",
+                                           agent->name, script.description, script.step_count);
+                                    fflush(stdout);
+                                } else {
+                                    chat_log_push("Can't do that from here.", 1.0f, 0.5f, 0.3f);
+                                }
+                            }
+                        }
+                        app.ai_input[0] = '\0';
+                        app.ai_input_len = 0;
+                        app.ai_chat_open = false;
+                        return;
+                    }
+                }
+
+                // Detect build/construct requests → script generation mode
+                bool is_build_request = false;
+                {
+                    char lower[256];
+                    int li = 0;
+                    for (int ci = 0; app.ai_input[ci] && li < 254; ci++)
+                        lower[li++] = (app.ai_input[ci] >= 'A' && app.ai_input[ci] <= 'Z')
+                            ? app.ai_input[ci] + 32 : app.ai_input[ci];
+                    lower[li] = '\0';
+                    if (strstr(lower, "build") || strstr(lower, "construct") ||
+                        strstr(lower, "make me") || strstr(lower, "create") ||
+                        strstr(lower, "dig") || strstr(lower, "mine") ||
+                        strstr(lower, "demolish") || strstr(lower, "flatten")) {
+                        is_build_request = true;
+                    }
+                }
+
+                // Send message to nearest agent (normal chat or script mode)
+                {
+                    char msg[CHAT_MSG_MAX];
+                    snprintf(msg, sizeof(msg), "You: %s", app.ai_input);
+                    chat_log_push(msg, 0.5f, 1.0f, 0.5f);
+                }
+                int nearest = ai_agent_nearest(&app.agent_system, app.camera.pos_d, 20.0f);
+                if (nearest >= 0) {
+                    AiAgent* agent = &app.agent_system.agents[nearest];
+
+                    // Auto-scan surroundings and inject into context
+                    {
+                        int sq, sr, sl;
+                        hex_terrain_world_to_hex(&app.renderer.hex_terrain,
+                            agent->position, &sq, &sr, &sl);
+                        ai_sensors_scan(&app.renderer.hex_terrain, sq, sr, 4,
+                                       &agent->last_scan);
+                        ai_sensors_report(&agent->last_scan, agent->sensor_report,
+                                         sizeof(agent->sensor_report));
+                    }
+
+                    // Set script mode for build requests
+                    if (is_build_request) {
+                        agent->ai.script_mode = true;
+                        agent->state = AGENT_STATE_WORKING;
+                        agent->state_timer = 0.0f;
+                    }
+
+                    printf("[CHAT] Sending to agent '%s' (idx=%d, ai_state=%d): \"%s\"\n",
+                           agent->name, nearest, agent->ai.state, app.ai_input);
+                    fflush(stdout);
+
+                    // Detect greeting → wave animation immediately
+                    {
+                        char lower[128];
+                        int li = 0;
+                        for (int ci = 0; app.ai_input[ci] && li < 126; ci++)
+                            lower[li++] = (app.ai_input[ci] >= 'A' && app.ai_input[ci] <= 'Z')
+                                ? app.ai_input[ci] + 32 : app.ai_input[ci];
+                        lower[li] = '\0';
+                        if (strstr(lower, "hi") == lower || strstr(lower, "hey") == lower ||
+                            strstr(lower, "hello") == lower || strstr(lower, "yo") == lower ||
+                            strstr(lower, "sup") == lower || strstr(lower, "what's up") ||
+                            strstr(lower, "whats up") || strstr(lower, "how are you") ||
+                            strstr(lower, "howdy") == lower || strstr(lower, "greetings") == lower ||
+                            strstr(lower, "hola") == lower || strstr(lower, "heyy") == lower) {
+                            agent->state = AGENT_STATE_WAVING;
+                            agent->state_timer = 0.0f;
+                            agent->anim_time = 0.0f;
+                        }
+                    }
+
+                    agent->convo_timer = 0.0f; // reset conversation timeout
+                    agent->in_conversation = true;
+                    // Set transient context (mood + surroundings) — injected into
+                    // request body only, NOT saved to conversation history
+                    {
+                        char mood[256];
+                        ai_emotions_describe(&agent->emotions, mood, sizeof(mood));
+                        ai_emotions_on_message_received(&agent->emotions);
+
+                        if (agent->ai.script_mode) {
+                            // Script generation mode — tell LLM to output JSON script
+                            int gq, gr, gl;
+                            hex_terrain_world_to_hex(&app.renderer.hex_terrain,
+                                agent->position, &gq, &gr, &gl);
+                            float gr_h = hex_terrain_ground_height(&app.renderer.hex_terrain, gq, gr);
+                            float base = hex_terrain_col_base_r(&app.renderer.hex_terrain, gq, gr);
+                            int ground_layer = (base > 0) ? (int)((gr_h - base) / HEX_HEIGHT) : 0;
+
+                            snprintf(agent->ai.context_prefix, sizeof(agent->ai.context_prefix),
+                                "%s\n%s%s\n"
+                                "[BUILD INSTRUCTIONS]\n"
+                                "You are at hex grid position q=%d, r=%d, ground_layer=%d.\n"
+                                "Output a JSON build script. Start with a SHORT 1-sentence acknowledgment, then output the script.\n"
+                                "Format your script between [SCRIPT] and [/SCRIPT] tags like this:\n"
+                                "[SCRIPT]\n"
+                                "{\"name\":\"example\",\"description\":\"what it builds\",\"steps\":[\n"
+                                "  {\"action\":\"place\",\"q\":10,\"r\":5,\"layer\":5450,\"block\":\"stone\"},\n"
+                                "  {\"action\":\"move_to\",\"q\":11,\"r\":5},\n"
+                                "  {\"action\":\"say\",\"text\":\"Done!\"}\n"
+                                "]}\n"
+                                "[/SCRIPT]\n"
+                                "Available actions: place, break, move_to, say, wait, jump, scan\n"
+                                "Available blocks: stone, dirt, grass, sand, ice, torch\n"
+                                "Your position: q=%d r=%d. Ground layer is %d (this is the surface you stand on).\n"
+                                "IMPORTANT: layer %d = ground level. Start walls/structures AT layer %d, not above it.\n"
+                                "The first row of blocks goes at layer=%d. Second row at layer=%d. And so on.\n",
+                                mood,
+                                agent->sensor_report[0] ? "[SURROUNDINGS]\n" : "",
+                                agent->sensor_report[0] ? agent->sensor_report : "",
+                                gq, gr, ground_layer,
+                                gq, gr, ground_layer,
+                                ground_layer, ground_layer,
+                                ground_layer, ground_layer + 1);
+                        } else {
+                            snprintf(agent->ai.context_prefix, sizeof(agent->ai.context_prefix),
+                                "%s%s%s",
+                                mood,
+                                agent->sensor_report[0] ? "\n[SURROUNDINGS]\n" : "",
+                                agent->sensor_report[0] ? agent->sensor_report : "");
+                        }
+                    }
+                    ai_npc_send(&agent->ai, app.ai_input);
+                    if (agent->ai.send_blocked) {
+                        chat_log_push("(Still thinking... please wait)", 1.0f, 1.0f, 0.3f);
+                        agent->ai.send_blocked = false;
+                    }
+                } else {
+                    printf("[CHAT] No agent nearby, sending to global AI: \"%s\"\n", app.ai_input);
+                    fflush(stdout);
+                    ai_npc_send(&app.ai, app.ai_input);
+                    if (app.ai.send_blocked) {
+                        chat_log_push("(Still thinking... please wait)", 1.0f, 1.0f, 0.3f);
+                        app.ai.send_blocked = false;
+                    }
+                }
+                app.ai_input[0] = '\0';
+                app.ai_input_len = 0;
+                app.ai_chat_open = false;
+                return;
+            }
+            if (ev->key_code == SAPP_KEYCODE_BACKSPACE && app.ai_input_len > 0) {
+                app.ai_input[--app.ai_input_len] = '\0';
+                return;
+            }
+        }
+        if (ev->type == SAPP_EVENTTYPE_CHAR) {
+            uint32_t ch = ev->char_code;
+            if (ch >= 32 && ch < 127 && app.ai_input_len < (int)sizeof(app.ai_input) - 1) {
+                app.ai_input[app.ai_input_len++] = (char)ch;
+                app.ai_input[app.ai_input_len] = '\0';
+            }
+        }
+        return; // consume all input while chat is open
     }
 
     // Track ctrl state for inverted placement mode
@@ -1838,9 +2744,9 @@ static void player_save(void) {
     fclose(f);
     double r = sqrt(save.pos_d[0]*save.pos_d[0] + save.pos_d[1]*save.pos_d[1] + save.pos_d[2]*save.pos_d[2]);
     const char* loc_names[] = {"planet", "moon", "space"};
-    printf("[SAVE] Player saved to %s: loc=%s body=%d r=%.0f yaw=%.2f pitch=%.2f slot=%d\n",
-           path, loc_names[loc], body_idx, r, save.yaw, save.pitch, save.hotbar_slot);
-    fflush(stdout);
+    // printf("[SAVE] Player saved to %s: loc=%s body=%d r=%.0f yaw=%.2f pitch=%.2f slot=%d\n",
+    //        path, loc_names[loc], body_idx, r, save.yaw, save.pitch, save.hotbar_slot);
+    (void)r; (void)loc_names;
 }
 
 static bool player_load(void) {
@@ -1943,6 +2849,13 @@ static void cleanup(void) {
         render_shutdown(&app.renderer);
         planet_destroy(&app.planet);
     }
+    if (app.agents_spawned) {
+        char agent_save[256];
+        snprintf(agent_save, sizeof(agent_save), "%s/agents.dat", app.active_edits_dir);
+        ai_agent_save_positions(&app.agent_system, agent_save);
+    }
+    ai_agent_system_shutdown(&app.agent_system);
+    ai_npc_shutdown(&app.ai);
     lobby_shutdown();
     sgl_shutdown();
     sdtx_shutdown();

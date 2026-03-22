@@ -227,6 +227,16 @@ void main() {
     // Aerial perspective blend: attenuate terrain + add inscattered light
     terrain_color = terrain_color * transmittance + fogEquilibrium * (vec3(1.0) - transmittance);
 
+    // Color table: Picotron-style distance darkening
+    // dusk_sun_color.w = factor (0.8 = 20% darker at max), day_sun_color.w = max distance
+    float ct_factor = dusk_sun_color.w;
+    float ct_max = day_sun_color.w;
+    if (ct_max > 0.0) {
+        float ct_dist = length(fs_cam_rel_pos);
+        float ct_t = clamp(ct_dist / ct_max, 0.0, 1.0);
+        terrain_color *= mix(1.0, ct_factor, ct_t);
+    }
+
     frag_color = vec4(terrain_color, 1.0);
 }
 @end
