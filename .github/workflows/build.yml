@@ -48,13 +48,14 @@ jobs:
         run: cmake --build build --config Release
 
       - name: Generate AI config
-        if: ${{ secrets.AI_API_KEY != '' }}
         shell: bash
         run: |
-          mkdir -p config
-          echo 'provider: claude' > config/ai_config.yaml
-          echo "api_key: \"$AI_API_KEY\"" >> config/ai_config.yaml
-          echo "model: \"$AI_MODEL\"" >> config/ai_config.yaml
+          if [ -n "$AI_API_KEY" ]; then
+            mkdir -p config
+            echo 'provider: claude' > config/ai_config.yaml
+            echo "api_key: \"$AI_API_KEY\"" >> config/ai_config.yaml
+            echo "model: \"$AI_MODEL\"" >> config/ai_config.yaml
+          fi
         env:
           AI_API_KEY: ${{ secrets.AI_API_KEY }}
           AI_MODEL: ${{ secrets.AI_MODEL || 'claude-sonnet-4-6' }}
@@ -90,11 +91,12 @@ jobs:
           version: 3.1.51
 
       - name: Generate AI config
-        if: ${{ secrets.AI_API_KEY != '' }}
         run: |
-          echo 'provider: claude' > config/ai_config.yaml
-          echo "api_key: \"$AI_API_KEY\"" >> config/ai_config.yaml
-          echo "model: \"$AI_MODEL\"" >> config/ai_config.yaml
+          if [ -n "$AI_API_KEY" ]; then
+            echo 'provider: claude' > config/ai_config.yaml
+            echo "api_key: \"$AI_API_KEY\"" >> config/ai_config.yaml
+            echo "model: \"$AI_MODEL\"" >> config/ai_config.yaml
+          fi
         env:
           AI_API_KEY: ${{ secrets.AI_API_KEY }}
           AI_MODEL: ${{ secrets.AI_MODEL || 'claude-sonnet-4-6' }}
