@@ -30,9 +30,10 @@ node_modules/
 *.dylib
 *.dll
 
-# API keys
+# API keys / secrets
 config/ai_config.yaml
 tools/api-key.txt
+.env
 
 # Tools (downloaded binaries, not committed)
 tools/sokol-shdc*

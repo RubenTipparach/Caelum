@@ -132,6 +132,7 @@ if(EMSCRIPTEN)
         -sTOTAL_STACK=8388608
         --shell-file=${CMAKE_SOURCE_DIR}/web/shell.html
         --preload-file=${CMAKE_SOURCE_DIR}/assets/textures@/assets/textures
+        --preload-file=${CMAKE_SOURCE_DIR}/config@/config
     )
     if(EXISTS ${CMAKE_SOURCE_DIR}/tenebris/dist/textures)
         list(APPEND EMCC_LINK_OPTS

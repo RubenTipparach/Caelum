@@ -47,13 +47,28 @@ jobs:
       - name: Build
         run: cmake --build build --config Release
 
+      - name: Generate AI config
+        shell: bash
+        run: |
+          if [ -n "$AI_API_KEY" ]; then
+            mkdir -p config
+            echo 'provider: claude' > config/ai_config.yaml
+            echo "api_key: \"$AI_API_KEY\"" >> config/ai_config.yaml
+            echo "model: \"$AI_MODEL\"" >> config/ai_config.yaml
+          fi
+        env:
+          AI_API_KEY: ${{ secrets.AI_API_KEY }}
+          AI_MODEL: ${{ secrets.AI_MODEL || 'claude-sonnet-4-6' }}
+
       - name: Package Windows build
         shell: bash
         run: |
-          mkdir -p package/assets/textures
+          mkdir -p package/assets/textures package/config
           cp build/Release/hex-planets.exe package/
           cp assets/textures/*.png package/assets/textures/
           if [ -f config.yaml ]; then cp config.yaml package/; fi
+          if [ -f config/ai_config.yaml ]; then cp config/ai_config.yaml package/config/; fi
+          cp config/ai_directives.txt package/config/ 2>/dev/null || true
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
@@ -74,6 +89,17 @@ jobs:
         uses: mymindstorm/setup-emsdk@v14
         with:
           version: 3.1.51
+
+      - name: Generate AI config
+        run: |
+          if [ -n "$AI_API_KEY" ]; then
+            echo 'provider: claude' > config/ai_config.yaml
+            echo "api_key: \"$AI_API_KEY\"" >> config/ai_config.yaml
+            echo "model: \"$AI_MODEL\"" >> config/ai_config.yaml
+          fi
+        env:
+          AI_API_KEY: ${{ secrets.AI_API_KEY }}
+          AI_MODEL: ${{ secrets.AI_MODEL || 'claude-sonnet-4-6' }}
 
       - name: Configure CMake (Emscripten)
         run: emcmake cmake -B build-web -DCMAKE_BUILD_TYPE=Release
