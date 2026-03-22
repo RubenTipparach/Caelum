@@ -1,0 +1,359 @@
+<Window x:Class="CharEditor.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:helix="http://helix-toolkit.org/wpf"
+        Title="Hex Planets — Agent Character Editor" Height="720" Width="1100"
+        Background="#1a1a2e" WindowStartupLocation="CenterScreen">
+    <Window.Resources>
+        <Style TargetType="TextBlock" x:Key="Label">
+            <Setter Property="Foreground" Value="#cccccc"/>
+            <Setter Property="FontSize" Value="12"/>
+            <Setter Property="Margin" Value="0,2"/>
+        </Style>
+        <Style TargetType="TextBlock" x:Key="Header">
+            <Setter Property="Foreground" Value="#88bbff"/>
+            <Setter Property="FontSize" Value="14"/>
+            <Setter Property="FontWeight" Value="Bold"/>
+            <Setter Property="Margin" Value="0,8,0,4"/>
+        </Style>
+        <Style TargetType="Slider">
+            <Setter Property="Margin" Value="0,2"/>
+            <Setter Property="Width" Value="180"/>
+            <Setter Property="HorizontalAlignment" Value="Left"/>
+        </Style>
+        <Style TargetType="TextBox">
+            <Setter Property="Background" Value="#2a2a3e"/>
+            <Setter Property="Foreground" Value="#eeeeee"/>
+            <Setter Property="BorderBrush" Value="#444466"/>
+            <Setter Property="Padding" Value="4,2"/>
+        </Style>
+        <Style TargetType="Button">
+            <Setter Property="Background" Value="#334"/>
+            <Setter Property="Foreground" Value="#ddd"/>
+            <Setter Property="Padding" Value="12,6"/>
+            <Setter Property="Margin" Value="4,4"/>
+            <Setter Property="BorderBrush" Value="#556"/>
+            <Setter Property="FontSize" Value="12"/>
+        </Style>
+        <!-- ComboBox dark theme: full ControlTemplate override -->
+        <ControlTemplate x:Key="DarkComboBoxToggle" TargetType="ToggleButton">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition/>
+                    <ColumnDefinition Width="20"/>
+                </Grid.ColumnDefinitions>
+                <Border x:Name="Border" Grid.ColumnSpan="2" Background="#2a2a3e"
+                        BorderBrush="#444466" BorderThickness="1" CornerRadius="2"/>
+                <Border Grid.Column="0" Background="Transparent" Margin="1"/>
+                <Path x:Name="Arrow" Grid.Column="1" Fill="#aaaaaa"
+                      HorizontalAlignment="Center" VerticalAlignment="Center"
+                      Data="M 0 0 L 4 4 L 8 0 Z"/>
+            </Grid>
+        </ControlTemplate>
+
+        <Style TargetType="ComboBox">
+            <Setter Property="Foreground" Value="#eeeeee"/>
+            <Setter Property="Margin" Value="0,2"/>
+            <Setter Property="SnapsToDevicePixels" Value="True"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ComboBox">
+                        <Grid>
+                            <ToggleButton Template="{StaticResource DarkComboBoxToggle}"
+                                          IsChecked="{Binding IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}"
+                                          Focusable="False" ClickMode="Press"/>
+                            <ContentPresenter IsHitTestVisible="False"
+                                              Content="{TemplateBinding SelectionBoxItem}"
+                                              ContentTemplate="{TemplateBinding SelectionBoxItemTemplate}"
+                                              Margin="6,3,24,3" VerticalAlignment="Center"
+                                              HorizontalAlignment="Left"
+                                              TextBlock.Foreground="#eeeeee"/>
+                            <Popup IsOpen="{TemplateBinding IsDropDownOpen}" Placement="Bottom"
+                                   Focusable="False" AllowsTransparency="True">
+                                <Border Background="#2a2a3e" BorderBrush="#444466"
+                                        BorderThickness="1" CornerRadius="2"
+                                        MaxHeight="{TemplateBinding MaxDropDownHeight}"
+                                        MinWidth="{TemplateBinding ActualWidth}">
+                                    <ScrollViewer CanContentScroll="True">
+                                        <StackPanel IsItemsHost="True"
+                                                    KeyboardNavigation.DirectionalNavigation="Contained"/>
+                                    </ScrollViewer>
+                                </Border>
+                            </Popup>
+                        </Grid>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+        <Style TargetType="ComboBoxItem">
+            <Setter Property="Foreground" Value="#eeeeee"/>
+            <Setter Property="Background" Value="#2a2a3e"/>
+            <Setter Property="Padding" Value="6,3"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ComboBoxItem">
+                        <Border x:Name="Bd" Background="{TemplateBinding Background}"
+                                Padding="{TemplateBinding Padding}">
+                            <ContentPresenter TextBlock.Foreground="{TemplateBinding Foreground}"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsHighlighted" Value="True">
+                                <Setter TargetName="Bd" Property="Background" Value="#445588"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+    </Window.Resources>
+
+    <Grid>
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="320"/>
+            <ColumnDefinition Width="*"/>
+            <ColumnDefinition Width="280"/>
+        </Grid.ColumnDefinitions>
+
+        <!-- LEFT PANEL: Appearance -->
+        <ScrollViewer Grid.Column="0" VerticalScrollBarVisibility="Auto" Padding="12">
+            <StackPanel>
+                <TextBlock Text="AGENT CHARACTER EDITOR" FontSize="16" FontWeight="Bold"
+                           Foreground="#66aaff" Margin="0,0,0,12"/>
+
+                <!-- Identity -->
+                <TextBlock Text="Identity" Style="{StaticResource Header}"/>
+                <TextBlock Text="Name" Style="{StaticResource Label}"/>
+                <TextBox x:Name="NameBox" Text="Worker" TextChanged="OnAnyChanged"/>
+
+                <TextBlock Text="Class" Style="{StaticResource Label}"/>
+                <ComboBox x:Name="ClassCombo" SelectionChanged="OnAnyChanged"/>
+
+                <!-- Appearance -->
+                <TextBlock Text="Appearance" Style="{StaticResource Header}"/>
+
+                <TextBlock Text="Height" Style="{StaticResource Label}"/>
+                <DockPanel><TextBlock x:Name="HeightVal" DockPanel.Dock="Right" Foreground="#aaa" Width="30"/>
+                <Slider x:Name="HeightSlider" Minimum="0.7" Maximum="1.3" Value="1.0"
+                        ValueChanged="OnAppearanceChanged"/></DockPanel>
+
+                <TextBlock Text="Stockiness" Style="{StaticResource Label}"/>
+                <DockPanel><TextBlock x:Name="StockyVal" DockPanel.Dock="Right" Foreground="#aaa" Width="30"/>
+                <Slider x:Name="StockySlider" Minimum="0" Maximum="1" Value="0.5"
+                        ValueChanged="OnAppearanceChanged"/></DockPanel>
+
+                <TextBlock Text="Head Scale" Style="{StaticResource Label}"/>
+                <DockPanel><TextBlock x:Name="HeadVal" DockPanel.Dock="Right" Foreground="#aaa" Width="30"/>
+                <Slider x:Name="HeadSlider" Minimum="0.6" Maximum="1.5" Value="1.0"
+                        ValueChanged="OnAppearanceChanged"/></DockPanel>
+
+                <TextBlock Text="Arm Length" Style="{StaticResource Label}"/>
+                <DockPanel><TextBlock x:Name="ArmVal" DockPanel.Dock="Right" Foreground="#aaa" Width="30"/>
+                <Slider x:Name="ArmSlider" Minimum="0.6" Maximum="1.4" Value="1.0"
+                        ValueChanged="OnAppearanceChanged"/></DockPanel>
+
+                <TextBlock Text="Torso Width" Style="{StaticResource Label}"/>
+                <DockPanel><TextBlock x:Name="TorsoVal" DockPanel.Dock="Right" Foreground="#aaa" Width="30"/>
+                <Slider x:Name="TorsoSlider" Minimum="0.6" Maximum="1.4" Value="1.0"
+                        ValueChanged="OnAppearanceChanged"/></DockPanel>
+
+                <TextBlock Text="Leg Length" Style="{StaticResource Label}"/>
+                <DockPanel><TextBlock x:Name="LegVal" DockPanel.Dock="Right" Foreground="#aaa" Width="30"/>
+                <Slider x:Name="LegSlider" Minimum="0.6" Maximum="1.4" Value="1.0"
+                        ValueChanged="OnAppearanceChanged"/></DockPanel>
+
+                <!-- Colors -->
+                <TextBlock Text="Primary Color (Body)" Style="{StaticResource Header}"/>
+                <StackPanel Orientation="Horizontal">
+                    <TextBlock Text="R" Foreground="#ff6666" Margin="0,0,4,0" VerticalAlignment="Center"/>
+                    <Slider x:Name="PrimR" Minimum="0" Maximum="1" Value="0.5" Width="80" ValueChanged="OnAppearanceChanged"/>
+                    <TextBlock Text="G" Foreground="#66ff66" Margin="8,0,4,0" VerticalAlignment="Center"/>
+                    <Slider x:Name="PrimG" Minimum="0" Maximum="1" Value="0.5" Width="80" ValueChanged="OnAppearanceChanged"/>
+                </StackPanel>
+                <StackPanel Orientation="Horizontal">
+                    <TextBlock Text="B" Foreground="#6666ff" Margin="0,0,4,0" VerticalAlignment="Center"/>
+                    <Slider x:Name="PrimB" Minimum="0" Maximum="1" Value="0.6" Width="80" ValueChanged="OnAppearanceChanged"/>
+                    <Rectangle x:Name="PrimPreview" Width="24" Height="24" Margin="12,0,0,0"
+                               Stroke="#666" StrokeThickness="1"/>
+                </StackPanel>
+
+                <TextBlock Text="Accent Color (Head/Arms)" Style="{StaticResource Header}"/>
+                <StackPanel Orientation="Horizontal">
+                    <TextBlock Text="R" Foreground="#ff6666" Margin="0,0,4,0" VerticalAlignment="Center"/>
+                    <Slider x:Name="AccR" Minimum="0" Maximum="1" Value="0.8" Width="80" ValueChanged="OnAppearanceChanged"/>
+                    <TextBlock Text="G" Foreground="#66ff66" Margin="8,0,4,0" VerticalAlignment="Center"/>
+                    <Slider x:Name="AccG" Minimum="0" Maximum="1" Value="0.7" Width="80" ValueChanged="OnAppearanceChanged"/>
+                </StackPanel>
+                <StackPanel Orientation="Horizontal">
+                    <TextBlock Text="B" Foreground="#6666ff" Margin="0,0,4,0" VerticalAlignment="Center"/>
+                    <Slider x:Name="AccB" Minimum="0" Maximum="1" Value="0.2" Width="80" ValueChanged="OnAppearanceChanged"/>
+                    <Rectangle x:Name="AccPreview" Width="24" Height="24" Margin="12,0,0,0"
+                               Stroke="#666" StrokeThickness="1"/>
+                </StackPanel>
+
+                <Button Content="Randomize" Click="OnRandomize" Margin="0,12,0,0"/>
+            </StackPanel>
+        </ScrollViewer>
+
+        <!-- CENTER: 3D Viewport + Chat -->
+        <Grid Grid.Column="1">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="*"/>
+                <RowDefinition Height="220"/>
+            </Grid.RowDefinitions>
+
+            <!-- 3D Viewport -->
+            <Border Grid.Row="0" Background="#0d0d1a" Margin="4" CornerRadius="4">
+                <helix:HelixViewport3D x:Name="Viewport" Background="#0d0d1a"
+                                       ShowCoordinateSystem="False"
+                                       ShowViewCube="False"
+                                       ZoomExtentsWhenLoaded="True"
+                                       CameraRotationMode="Turntable"
+                                       ModelUpDirection="0,1,0">
+                    <helix:HelixViewport3D.Camera>
+                        <PerspectiveCamera Position="0,0.3,1.5" LookDirection="0,0,-1"
+                                           UpDirection="0,1,0" FieldOfView="45"/>
+                    </helix:HelixViewport3D.Camera>
+                    <helix:DefaultLights/>
+                    <ModelVisual3D x:Name="CharacterModel"/>
+                    <helix:GridLinesVisual3D Width="2" Length="2" Thickness="0.005"
+                                             MinorDistance="0.1" MajorDistance="0.5"
+                                             Fill="#22334455" Normal="0,1,0" Center="0,0,0"/>
+                </helix:HelixViewport3D>
+            </Border>
+
+            <!-- Animation Controls -->
+            <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="8,2"
+                        Height="28" VerticalAlignment="Top">
+                <TextBlock Text="Anim:" Foreground="#88bbff" FontSize="11"
+                           VerticalAlignment="Center" Margin="0,0,6,0"/>
+                <Button Content="Idle" Click="OnAnimSelect" Tag="Idle" Padding="6,2" Margin="1,0" FontSize="10"/>
+                <Button Content="Walk" Click="OnAnimSelect" Tag="Walk" Padding="6,2" Margin="1,0" FontSize="10"/>
+                <Button Content="Jump" Click="OnAnimSelect" Tag="Jump" Padding="6,2" Margin="1,0" FontSize="10"/>
+                <Button Content="Talk" Click="OnAnimSelect" Tag="Talk" Padding="6,2" Margin="1,0" FontSize="10"/>
+                <Button Content="Pick Up" Click="OnAnimSelect" Tag="PickUp" Padding="6,2" Margin="1,0" FontSize="10"/>
+                <Button Content="Place" Click="OnAnimSelect" Tag="Place" Padding="6,2" Margin="1,0" FontSize="10"/>
+                <Button Content="Wave" Click="OnAnimSelect" Tag="Wave" Padding="6,2" Margin="1,0" FontSize="10"/>
+                <Button Content="Celebrate" Click="OnAnimSelect" Tag="Celebrate" Padding="6,2" Margin="1,0" FontSize="10"/>
+            </StackPanel>
+
+            <!-- Chat Panel -->
+            <Border Grid.Row="1" Background="#111122" Margin="4,30,4,4" CornerRadius="4"
+                    BorderBrush="#333355" BorderThickness="1">
+                <Grid Margin="8">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="*"/>
+                        <RowDefinition Height="Auto"/>
+                    </Grid.RowDefinitions>
+
+                    <!-- Header -->
+                    <DockPanel Grid.Row="0" Margin="0,0,0,4">
+                        <TextBlock Text="Chat — Personality Test" Foreground="#88bbff"
+                                   FontWeight="Bold" FontSize="12" DockPanel.Dock="Left"
+                                   VerticalAlignment="Center"/>
+                        <TextBlock x:Name="ChatStatus" Foreground="#666" FontSize="10"
+                                   DockPanel.Dock="Right" HorizontalAlignment="Right"
+                                   VerticalAlignment="Center"/>
+                        <Button Content="Clear" Click="OnChatClear" DockPanel.Dock="Right"
+                                Padding="6,2" Margin="4,0" FontSize="10"/>
+                    </DockPanel>
+
+                    <!-- Message history -->
+                    <RichTextBox x:Name="ChatHistory" Grid.Row="1"
+                                 IsReadOnly="True" Background="#0a0a18"
+                                 Foreground="#cccccc" FontSize="11"
+                                 FontFamily="Consolas" BorderThickness="0"
+                                 VerticalScrollBarVisibility="Auto"
+                                 Padding="6">
+                        <RichTextBox.Document>
+                            <FlowDocument>
+                                <Paragraph x:Name="ChatParagraph"/>
+                            </FlowDocument>
+                        </RichTextBox.Document>
+                    </RichTextBox>
+
+                    <!-- Input -->
+                    <DockPanel Grid.Row="2" Margin="0,4,0,0">
+                        <Button Content="Send" Click="OnChatSend" DockPanel.Dock="Right"
+                                Padding="12,4"/>
+                        <TextBox x:Name="ChatInput" DockPanel.Dock="Left"
+                                 KeyDown="OnChatKeyDown" FontSize="11"
+                                 FontFamily="Consolas"/>
+                    </DockPanel>
+                </Grid>
+            </Border>
+        </Grid>
+
+        <!-- RIGHT PANEL: Personality + Directives -->
+        <ScrollViewer Grid.Column="2" VerticalScrollBarVisibility="Auto" Padding="12">
+            <StackPanel>
+                <TextBlock Text="Personality" Style="{StaticResource Header}"/>
+
+                <TextBlock Text="Creativity" Style="{StaticResource Label}"/>
+                <DockPanel>
+                    <TextBlock Text="Pragmatic" Foreground="#888" FontSize="10" DockPanel.Dock="Left"/>
+                    <TextBlock Text="Creative" Foreground="#888" FontSize="10" DockPanel.Dock="Right" HorizontalAlignment="Right"/>
+                    <Slider x:Name="CreativitySlider" Minimum="0" Maximum="1" Value="0.5"
+                            ValueChanged="OnPersonalityChanged"/>
+                </DockPanel>
+
+                <TextBlock Text="Chattiness" Style="{StaticResource Label}"/>
+                <DockPanel>
+                    <TextBlock Text="Silent" Foreground="#888" FontSize="10" DockPanel.Dock="Left"/>
+                    <TextBlock Text="Talkative" Foreground="#888" FontSize="10" DockPanel.Dock="Right" HorizontalAlignment="Right"/>
+                    <Slider x:Name="ChattinessSlider" Minimum="0" Maximum="1" Value="0.5"
+                            ValueChanged="OnPersonalityChanged"/>
+                </DockPanel>
+
+                <TextBlock Text="Diligence" Style="{StaticResource Label}"/>
+                <DockPanel>
+                    <TextBlock Text="Relaxed" Foreground="#888" FontSize="10" DockPanel.Dock="Left"/>
+                    <TextBlock Text="Tireless" Foreground="#888" FontSize="10" DockPanel.Dock="Right" HorizontalAlignment="Right"/>
+                    <Slider x:Name="DiligenceSlider" Minimum="0" Maximum="1" Value="0.7"
+                            ValueChanged="OnPersonalityChanged"/>
+                </DockPanel>
+
+                <!-- Attributes -->
+                <TextBlock Text="Attributes" Style="{StaticResource Header}"/>
+
+                <TextBlock Text="Strength" Style="{StaticResource Label}"/>
+                <DockPanel><TextBlock x:Name="StrVal" DockPanel.Dock="Right" Foreground="#aaa" Width="20"/>
+                <Slider x:Name="StrSlider" Minimum="1" Maximum="10" Value="5"
+                        IsSnapToTickEnabled="True" TickFrequency="1"
+                        ValueChanged="OnAttributeChanged"/></DockPanel>
+
+                <TextBlock Text="Perception" Style="{StaticResource Label}"/>
+                <DockPanel><TextBlock x:Name="PerVal" DockPanel.Dock="Right" Foreground="#aaa" Width="20"/>
+                <Slider x:Name="PerSlider" Minimum="1" Maximum="10" Value="5"
+                        IsSnapToTickEnabled="True" TickFrequency="1"
+                        ValueChanged="OnAttributeChanged"/></DockPanel>
+
+                <TextBlock Text="Endurance" Style="{StaticResource Label}"/>
+                <DockPanel><TextBlock x:Name="EndVal" DockPanel.Dock="Right" Foreground="#aaa" Width="20"/>
+                <Slider x:Name="EndSlider" Minimum="1" Maximum="10" Value="5"
+                        IsSnapToTickEnabled="True" TickFrequency="1"
+                        ValueChanged="OnAttributeChanged"/></DockPanel>
+
+                <!-- Directives -->
+                <TextBlock Text="Directive Template" Style="{StaticResource Header}"/>
+                <ComboBox x:Name="TemplateCombo" SelectionChanged="OnTemplateChanged"/>
+
+                <TextBlock Text="Custom Directive" Style="{StaticResource Label}"/>
+                <TextBox x:Name="DirectiveBox" AcceptsReturn="True" TextWrapping="Wrap"
+                         Height="120" VerticalScrollBarVisibility="Auto"
+                         TextChanged="OnAnyChanged"/>
+
+                <!-- Actions -->
+                <TextBlock Text="Actions" Style="{StaticResource Header}"/>
+                <StackPanel Orientation="Horizontal">
+                    <Button Content="Save" Click="OnExport"/>
+                    <Button Content="Load" Click="OnImport"/>
+                    <Button Content="Advanced..." Click="OnShowAdvanced"/>
+                </StackPanel>
+
+                <TextBlock x:Name="StatusText" Foreground="#66ff66" FontSize="11"
+                           Margin="0,8,0,0" TextWrapping="Wrap"/>
+            </StackPanel>
+        </ScrollViewer>
+    </Grid>
+</Window>

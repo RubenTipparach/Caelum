@@ -31,7 +31,12 @@ node_modules/
 *.dll
 
 # Tools (downloaded binaries, not committed)
-tools/
+tools/sokol-shdc*
+tools/ai/
+
+# Char editor build output
+tools/char-editor/**/bin/
+tools/char-editor/**/obj/
 emsdk/
 
 # Logs

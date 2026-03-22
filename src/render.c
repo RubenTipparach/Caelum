@@ -730,13 +730,13 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
             r->visual_config.dusk_sun_color.X,
             r->visual_config.dusk_sun_color.Y,
             r->visual_config.dusk_sun_color.Z,
-            0.0f,
+            r->visual_config.coltab_factor,
         }},
         .day_sun_color = (HMM_Vec4){{
             r->visual_config.day_sun_color.X,
             r->visual_config.day_sun_color.Y,
             r->visual_config.day_sun_color.Z,
-            0.0f,
+            r->visual_config.coltab_max_dist,
         }},
         .planet_tex_params = (HMM_Vec4){{
             (r->planet_tex_img.id != SG_INVALID_ID) ? 1.0f : 0.0f,  // enabled

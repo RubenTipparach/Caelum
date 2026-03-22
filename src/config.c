@@ -30,6 +30,8 @@ static const ParamEntry param_table[] = {
     { "hex_fade_start",    offsetof(VisualConfig, hex_fade_start),    PARAM_FLOAT },
     { "hex_fade_end",      offsetof(VisualConfig, hex_fade_end),      PARAM_FLOAT },
     { "lod_split_factor",  offsetof(VisualConfig, lod_split_factor),  PARAM_FLOAT },
+    { "coltab_factor",     offsetof(VisualConfig, coltab_factor),     PARAM_FLOAT },
+    { "coltab_max_dist",   offsetof(VisualConfig, coltab_max_dist),   PARAM_FLOAT },
 };
 
 #define PARAM_COUNT (sizeof(param_table) / sizeof(param_table[0]))
@@ -49,6 +51,8 @@ VisualConfig config_defaults(void) {
         .hex_fade_start    = 600.0f,
         .hex_fade_end      = 1200.0f,
         .lod_split_factor  = 8.0f,
+        .coltab_factor     = 0.8f,
+        .coltab_max_dist   = 400.0f,
     };
 }
 
@@ -170,6 +174,10 @@ bool config_save(const VisualConfig* cfg, const char* path) {
 
     fprintf(f, "\n# === LOD ===\n");
     fprintf(f, "lod_split_factor: %.1f\n", cfg->lod_split_factor);
+
+    fprintf(f, "\n# === Color table (Picotron-style distance darkening) ===\n");
+    fprintf(f, "coltab_factor: %.2f\n", cfg->coltab_factor);
+    fprintf(f, "coltab_max_dist: %.0f\n", cfg->coltab_max_dist);
 
     fclose(f);
     printf("[CONFIG] Saved config to '%s'\n", path);

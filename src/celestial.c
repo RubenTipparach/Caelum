@@ -795,8 +795,10 @@ void solar_system_render(const SolarSystem* ss,
             .camera_pos = (HMM_Vec4){{hi_x, hi_y, hi_z, 0.0f}},  /* cam - moon (moon-local) */
             .atmos_params = (HMM_Vec4){{1.0f, 2.0f, 0.0f, 0.0f}},  /* pR=1, aR=2 (safe aThick=1), rScale=0 (no fog) */
             .lod_debug = (HMM_Vec4){{0.0f, 0.0f, 0.0f, 0.0f}},
-            .dusk_sun_color = (HMM_Vec4){{1.0f, 0.85f, 0.7f, 0.0f}},
-            .day_sun_color = (HMM_Vec4){{1.0f, 0.98f, 0.95f, 0.0f}},
+            .dusk_sun_color = (HMM_Vec4){{1.0f, 0.85f, 0.7f,
+                ((const planet_fs_params_t*)planet_fallback_fs)->dusk_sun_color.W}},
+            .day_sun_color = (HMM_Vec4){{1.0f, 0.98f, 0.95f,
+                ((const planet_fs_params_t*)planet_fallback_fs)->day_sun_color.W}},
             .planet_tex_params = (HMM_Vec4){{0.0f, 0.0f, 0.0f, 0.0f}},  /* disabled for moons */
         };
 

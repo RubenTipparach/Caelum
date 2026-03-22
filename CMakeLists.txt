@@ -61,6 +61,8 @@ add_executable(hex-planets
     src/lobby.c
     src/celestial.c
     src/solar_config.c
+    src/ai_npc.c
+    src/ai_actions.c
 )
 if(APPLE)
     target_sources(hex-planets PRIVATE src/screenshot_metal.m src/platform_macos.m)

@@ -33,6 +33,8 @@
 #include "lobby.h"
 #include "touch_controls.h"
 #include "solar_config.h"
+#include "ai_npc.h"
+#include "ai_actions.h"
 
 typedef enum {
     STATE_MENU,
@@ -99,6 +101,13 @@ static struct {
 
     // Solar system config (centralized, used at init and SOI transitions)
     SolarSystemConfig solar_cfg;
+
+    // AI NPC
+    AiNpc ai;
+    AiActionExecutor ai_exec;
+    bool ai_chat_open;          // Chat UI visible
+    char ai_input[256];         // Player text input buffer
+    int  ai_input_len;
 
     // Save restore state
     bool restore_moon_local;    // Skip world→moon transform on next SOI transition (loading from save)
@@ -245,6 +254,11 @@ static void init(void) {
 
     // Lobby system
     lobby_init("https://hex-planets.vercel.app");
+
+    // AI NPC system
+    ai_npc_init(&app.ai, "tools/ai/Qwen3-4B-Q4_K_M.gguf",
+                "tools/ai/grammar.gbnf", 8080);
+    ai_actions_init(&app.ai_exec);
 
     // Touch controls
     touch_init(&app.touch);
@@ -1103,6 +1117,20 @@ static void frame(void) {
             player_save();
         }
 
+        // AI NPC: poll for LLM response, execute queued actions
+        ai_npc_poll(&app.ai);
+        if (app.ai.state == AI_SUCCESS) {
+            printf("[AI] NPC says: \"%s\"\n", app.ai.dialogue);
+            fflush(stdout);
+            ai_actions_enqueue(&app.ai_exec, app.ai.actions, app.ai.action_count);
+            app.ai.state = AI_IDLE;
+        } else if (app.ai.state == AI_ERROR) {
+            printf("[AI] Error: %s\n", app.ai.error);
+            fflush(stdout);
+            app.ai.state = AI_IDLE;
+        }
+        ai_actions_update(&app.ai_exec, &app.renderer.hex_terrain, dt);
+
         // ---- LOD retarget: switch body when gravity changes ----
         if (app.camera.gravity_body != app.renderer.lod_current_body) {
             SolarSystem* ss = &app.renderer.solar_system;
@@ -1216,6 +1244,49 @@ static void frame(void) {
         }
 
         app.renderer.hotbar_selected_slot = app.hotbar_slot;
+
+        // AI Chat overlay: write to sdtx before render_frame (sdtx_draw happens inside)
+        if (app.ai_chat_open) {
+            float cw = sapp_widthf() * 0.5f;
+            float ch = sapp_heightf() * 0.5f;
+            float cpx = sapp_widthf() / (cw / 8.0f);
+            float chat_y = ch - 3.0f * cpx;
+            sdtx_canvas(cw, ch);
+            sdtx_font(0);
+            sdtx_pos(1.0f, chat_y / cpx);
+            sdtx_color3f(0.3f, 1.0f, 0.3f);
+            sdtx_puts("[AI Chat] ");
+            sdtx_color3f(1.0f, 1.0f, 1.0f);
+            sdtx_puts(app.ai_input);
+            sdtx_puts("_");
+        } else if (app.ai.state == AI_PENDING) {
+            float cw = sapp_widthf() * 0.5f;
+            float ch = sapp_heightf() * 0.5f;
+            float cpx = sapp_widthf() / (cw / 8.0f);
+            float chat_y = ch - 3.0f * cpx;
+            sdtx_canvas(cw, ch);
+            sdtx_font(0);
+            sdtx_pos(1.0f, chat_y / cpx);
+            sdtx_color3f(1.0f, 1.0f, 0.3f);
+            sdtx_puts("[AI] Thinking...");
+        } else if (app.ai.dialogue[0] && !ai_actions_busy(&app.ai_exec)) {
+            // Show last response briefly
+            float cw = sapp_widthf() * 0.5f;
+            float ch = sapp_heightf() * 0.5f;
+            float cpx = sapp_widthf() / (cw / 8.0f);
+            float chat_y = ch - 3.0f * cpx;
+            sdtx_canvas(cw, ch);
+            sdtx_font(0);
+            sdtx_pos(1.0f, chat_y / cpx);
+            sdtx_color3f(0.3f, 0.8f, 1.0f);
+            sdtx_puts("[NPC] ");
+            sdtx_color3f(1.0f, 1.0f, 1.0f);
+            // Truncate long messages for display
+            char display[80];
+            snprintf(display, sizeof(display), "%.76s", app.ai.dialogue);
+            sdtx_puts(display);
+        }
+
         render_frame(&app.renderer, &app.camera, dt);
     }
 
@@ -1641,6 +1712,53 @@ static void event(const sapp_event* ev) {
         return;
     }
 
+    // AI Chat: toggle with T key (when mouse is locked = playing)
+    if (ev->type == SAPP_EVENTTYPE_KEY_DOWN && ev->key_code == SAPP_KEYCODE_T
+        && !app.ai_chat_open && app.camera.mouse_locked) {
+        app.ai_chat_open = true;
+        app.ai_input[0] = '\0';
+        app.ai_input_len = 0;
+        sapp_lock_mouse(false);
+        sapp_show_mouse(true);
+        app.camera.mouse_locked = false;
+        printf("[AI] Chat opened. Type message and press Enter.\n");
+        fflush(stdout);
+        return;
+    }
+
+    // AI Chat: handle text input when chat is open
+    if (app.ai_chat_open) {
+        if (ev->type == SAPP_EVENTTYPE_KEY_DOWN) {
+            if (ev->key_code == SAPP_KEYCODE_ESCAPE) {
+                // Close chat
+                app.ai_chat_open = false;
+                app.ai_input[0] = '\0';
+                app.ai_input_len = 0;
+                return;
+            }
+            if (ev->key_code == SAPP_KEYCODE_ENTER && app.ai_input_len > 0) {
+                // Send message to AI
+                ai_npc_send(&app.ai, app.ai_input);
+                app.ai_input[0] = '\0';
+                app.ai_input_len = 0;
+                app.ai_chat_open = false;
+                return;
+            }
+            if (ev->key_code == SAPP_KEYCODE_BACKSPACE && app.ai_input_len > 0) {
+                app.ai_input[--app.ai_input_len] = '\0';
+                return;
+            }
+        }
+        if (ev->type == SAPP_EVENTTYPE_CHAR) {
+            uint32_t ch = ev->char_code;
+            if (ch >= 32 && ch < 127 && app.ai_input_len < (int)sizeof(app.ai_input) - 1) {
+                app.ai_input[app.ai_input_len++] = (char)ch;
+                app.ai_input[app.ai_input_len] = '\0';
+            }
+        }
+        return; // consume all input while chat is open
+    }
+
     // Track ctrl state for inverted placement mode
     app.renderer.ctrl_mode = (ev->modifiers & SAPP_MODIFIER_CTRL) != 0 || app.camera.key_ctrl;
 
@@ -1943,6 +2061,7 @@ static void cleanup(void) {
         render_shutdown(&app.renderer);
         planet_destroy(&app.planet);
     }
+    ai_npc_shutdown(&app.ai);
     lobby_shutdown();
     sgl_shutdown();
     sdtx_shutdown();

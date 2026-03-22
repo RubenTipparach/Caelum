@@ -1,0 +1,26 @@
+# GBNF grammar for hex-planets AI NPC responses.
+# Constrains LLM output to valid JSON with known action types.
+# See: https://github.com/ggml-org/llama.cpp/blob/master/grammars/README.md
+
+root ::= "{" ws "\"dialogue\"" ws ":" ws string "," ws "\"actions\"" ws ":" ws actions ws "}"
+
+actions ::= "[" ws "]" | "[" ws action ("," ws action)* ws "]"
+
+action ::= place-block | break-block | say | move-to | look-at
+
+place-block ::= "{" ws "\"type\"" ws ":" ws "\"place_block\"" "," ws "\"q\"" ws ":" ws integer "," ws "\"r\"" ws ":" ws integer "," ws "\"layer\"" ws ":" ws integer "," ws "\"block\"" ws ":" ws block-type ws "}"
+
+break-block ::= "{" ws "\"type\"" ws ":" ws "\"break_block\"" "," ws "\"q\"" ws ":" ws integer "," ws "\"r\"" ws ":" ws integer "," ws "\"layer\"" ws ":" ws integer ws "}"
+
+say ::= "{" ws "\"type\"" ws ":" ws "\"say\"" "," ws "\"text\"" ws ":" ws string ws "}"
+
+move-to ::= "{" ws "\"type\"" ws ":" ws "\"move_to\"" "," ws "\"q\"" ws ":" ws integer "," ws "\"r\"" ws ":" ws integer ws "}"
+
+look-at ::= "{" ws "\"type\"" ws ":" ws "\"look_at\"" "," ws "\"q\"" ws ":" ws integer "," ws "\"r\"" ws ":" ws integer ws "}"
+
+block-type ::= "\"stone\"" | "\"dirt\"" | "\"grass\"" | "\"sand\"" | "\"water\"" | "\"ice\"" | "\"snow\"" | "\"torch\""
+
+# Primitives
+string ::= "\"" ([^"\\] | "\\" .)* "\""
+integer ::= "-"? [0-9]+
+ws ::= [ \t\n\r]*

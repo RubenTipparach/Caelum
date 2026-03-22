@@ -23,3 +23,7 @@ hex_fade_end: 400                # distance where fully flat color (meters)
 
 # === LOD ===
 lod_split_factor: 4.0 # 8.0             # split threshold multiplier (higher = more detail)
+
+# === Color table (Picotron-style distance darkening) ===
+coltab_factor: 0.80               # color preservation at max distance (1.0 = no effect, 0.8 = 20% darker)
+coltab_max_dist: 400              # distance at full effect (meters)
