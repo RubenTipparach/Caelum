@@ -91,37 +91,51 @@ void ai_load_config(AiNpc* ai) {
     snprintf(ai->claude_model, sizeof(ai->claude_model), "claude-sonnet-4-6");
 
     FILE* f = fopen("config/ai_config.yaml", "r");
-    if (!f) {
-        printf("[AI] config/ai_config.yaml not found, using local provider.\n");
-        return;
-    }
+    if (f) {
+        char line[512];
+        while (fgets(line, sizeof(line), f)) {
+            // Skip comments and empty lines
+            char* p = line;
+            while (*p == ' ' || *p == '\t') p++;
+            if (*p == '#' || *p == '\n' || *p == '\0') continue;
 
-    char line[512];
-    while (fgets(line, sizeof(line), f)) {
-        // Skip comments and empty lines
-        char* p = line;
-        while (*p == ' ' || *p == '\t') p++;
-        if (*p == '#' || *p == '\n' || *p == '\0') continue;
+            char key[64], val[256];
+            if (sscanf(p, "%63[^:]: %255[^\n]", key, val) == 2) {
+                // Strip quotes from value
+                char* v = val;
+                while (*v == ' ' || *v == '"') v++;
+                int vlen = (int)strlen(v);
+                while (vlen > 0 && (v[vlen-1] == '"' || v[vlen-1] == '\n' || v[vlen-1] == '\r')) vlen--;
+                v[vlen] = '\0';
 
-        char key[64], val[256];
-        if (sscanf(p, "%63[^:]: %255[^\n]", key, val) == 2) {
-            // Strip quotes from value
-            char* v = val;
-            while (*v == ' ' || *v == '"') v++;
-            int vlen = (int)strlen(v);
-            while (vlen > 0 && (v[vlen-1] == '"' || v[vlen-1] == '\n' || v[vlen-1] == '\r')) vlen--;
-            v[vlen] = '\0';
-
-            if (strcmp(key, "provider") == 0) {
-                if (strcmp(v, "claude") == 0) ai->provider = AI_PROVIDER_CLAUDE;
-            } else if (strcmp(key, "api_key") == 0) {
-                snprintf(ai->claude_api_key, sizeof(ai->claude_api_key), "%s", v);
-            } else if (strcmp(key, "model") == 0 && ai->provider == AI_PROVIDER_CLAUDE) {
-                snprintf(ai->claude_model, sizeof(ai->claude_model), "%s", v);
+                if (strcmp(key, "provider") == 0) {
+                    if (strcmp(v, "claude") == 0) ai->provider = AI_PROVIDER_CLAUDE;
+                } else if (strcmp(key, "api_key") == 0) {
+                    snprintf(ai->claude_api_key, sizeof(ai->claude_api_key), "%s", v);
+                } else if (strcmp(key, "model") == 0) {
+                    snprintf(ai->claude_model, sizeof(ai->claude_model), "%s", v);
+                }
             }
         }
+        fclose(f);
+    } else {
+        printf("[AI] config/ai_config.yaml not found, checking environment variables.\n");
     }
-    fclose(f);
+
+    // Environment variables override file config (or provide fallback)
+    const char* env_provider = getenv("AI_PROVIDER");
+    const char* env_api_key = getenv("AI_API_KEY");
+    const char* env_model = getenv("AI_MODEL");
+
+    if (env_provider && strcmp(env_provider, "claude") == 0) {
+        ai->provider = AI_PROVIDER_CLAUDE;
+    }
+    if (env_api_key && env_api_key[0]) {
+        snprintf(ai->claude_api_key, sizeof(ai->claude_api_key), "%s", env_api_key);
+    }
+    if (env_model && env_model[0]) {
+        snprintf(ai->claude_model, sizeof(ai->claude_model), "%s", env_model);
+    }
 
     printf("[AI] Provider: %s\n", ai->provider == AI_PROVIDER_CLAUDE ? "Claude API" : "Local");
     if (ai->provider == AI_PROVIDER_CLAUDE) {

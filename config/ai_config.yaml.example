@@ -1,0 +1,8 @@
+# AI NPC Configuration
+# Copy this file to ai_config.yaml and fill in your values.
+# Alternatively, set environment variables: AI_PROVIDER, AI_API_KEY, AI_MODEL
+# Or use a .env file in the project root.
+
+provider: claude        # "claude" for Claude API, "local" for local llama-server
+api_key: "your-api-key-here"
+model: "claude-sonnet-4-6"
