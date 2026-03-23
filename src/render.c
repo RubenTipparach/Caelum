@@ -1224,13 +1224,13 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
                 (mx) = _tx; \
             } while(0)
 
-            // Rotate around Z axis (roll — raises arm sideways)
-            #define PIVOT_ROLL(mx, my, mz, pivot_y, angle) do { \
+            // Rotate around Z axis at (pivot_x, pivot_y) — raises arm sideways from shoulder
+            #define PIVOT_ROLL(mx, my, mz, pivot_x, pivot_y, angle) do { \
+                float _dx = (mx) - (pivot_x); \
                 float _dy = (my) - (pivot_y); \
                 float _c = cosf(angle), _s = sinf(angle); \
-                float _tx = (mx) * _c - _dy * _s; \
-                (my) = (pivot_y) + (mx) * _s + _dy * _c; \
-                (mx) = _tx; \
+                (mx) = (pivot_x) + _dx * _c - _dy * _s; \
+                (my) = (pivot_y) + _dx * _s + _dy * _c; \
             } while(0)
 
             for (int v = 0; v < nv; v++) {
@@ -1251,15 +1251,15 @@ void render_frame(Renderer* r, const Camera* cam, float dt) {
                     PIVOT_PITCH(mx, my, mz, agent->pivot_shoulder_y, l_arm_pitch);
                     PIVOT_PITCH(mnx, mny, mnz, 0, l_arm_pitch);
                     if (l_arm_raise != 0.0f) {
-                        PIVOT_ROLL(mx, my, mz, agent->pivot_shoulder_y, l_arm_raise);
-                        PIVOT_ROLL(mnx, mny, mnz, 0, l_arm_raise);
+                        PIVOT_ROLL(mx, my, mz, -agent->pivot_arm_x, agent->pivot_shoulder_y, l_arm_raise);
+                        PIVOT_ROLL(mnx, mny, mnz, 0, 0, l_arm_raise);
                     }
                 } else if (v >= agent->vr_right_arm_start && v < agent->vr_right_arm_start + agent->vr_right_arm_count) {
                     PIVOT_PITCH(mx, my, mz, agent->pivot_shoulder_y, r_arm_pitch);
                     PIVOT_PITCH(mnx, mny, mnz, 0, r_arm_pitch);
                     if (r_arm_raise != 0.0f) {
-                        PIVOT_ROLL(mx, my, mz, agent->pivot_shoulder_y, r_arm_raise);
-                        PIVOT_ROLL(mnx, mny, mnz, 0, r_arm_raise);
+                        PIVOT_ROLL(mx, my, mz, agent->pivot_arm_x, agent->pivot_shoulder_y, r_arm_raise);
+                        PIVOT_ROLL(mnx, mny, mnz, 0, 0, r_arm_raise);
                     }
                 } else if (v >= agent->vr_head_start && v < agent->vr_head_start + agent->vr_head_count) {
                     PIVOT_PITCH(mx, my, mz, agent->pivot_neck_y, head_pitch);

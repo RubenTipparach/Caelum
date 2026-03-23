@@ -157,10 +157,30 @@ static int build_claude_request_body(const AiNpc* ai, char* buf, int buf_size) {
         }
         char escaped[3072];
         json_escape(content_buf, escaped, sizeof(escaped));
-        pos += snprintf(buf + pos, buf_size - pos,
-            "{\"role\":\"%s\",\"content\":\"%s\"}%s",
-            ai->history[i].role, escaped,
-            (i < ai->history_count - 1) ? "," : "");
+
+        // Last user message with vision: use multi-part content (image + text)
+        if (is_last_user && ai->vision_base64 && ai->vision_base64_len > 0) {
+            pos += snprintf(buf + pos, buf_size - pos,
+                "{\"role\":\"user\",\"content\":["
+                "{\"type\":\"image\",\"source\":{\"type\":\"base64\","
+                "\"media_type\":\"image/jpeg\",\"data\":\"");
+            // Copy base64 directly (no escaping needed)
+            int b64_copy = ai->vision_base64_len;
+            if (pos + b64_copy < buf_size - 200) {
+                memcpy(buf + pos, ai->vision_base64, b64_copy);
+                pos += b64_copy;
+            }
+            pos += snprintf(buf + pos, buf_size - pos,
+                "\"}},"
+                "{\"type\":\"text\",\"text\":\"%s\"}"
+                "]}%s", escaped,
+                (i < ai->history_count - 1) ? "," : "");
+        } else {
+            pos += snprintf(buf + pos, buf_size - pos,
+                "{\"role\":\"%s\",\"content\":\"%s\"}%s",
+                ai->history[i].role, escaped,
+                (i < ai->history_count - 1) ? "," : "");
+        }
     }
 
     pos += snprintf(buf + pos, buf_size - pos, "]}");
@@ -452,7 +472,7 @@ static void kill_server(AiNpc* ai) {
 
 typedef struct {
     AiNpc* ai;
-    char   post_body[16384]; // large enough for conversation history
+    char   post_body[300000]; // large enough for conversation history + base64 images
     HANDLE thread;
 } AiHttpThread;
 

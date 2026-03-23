@@ -1332,13 +1332,7 @@ void camera_handle_event(Camera* cam, const sapp_event* ev) {
             if (ev->key_code == SAPP_KEYCODE_E) cam->key_e = true;
             if (ev->key_code == SAPP_KEYCODE_LEFT_SHIFT) cam->key_shift = true;
             if (ev->key_code == SAPP_KEYCODE_LEFT_CONTROL || ev->key_code == SAPP_KEYCODE_C) cam->key_ctrl = true;
-            if (ev->key_code == SAPP_KEYCODE_ESCAPE) {
-                cam->mouse_locked = false;
-                sapp_lock_mouse(false);
-                #ifdef __APPLE__
-                platform_macos_set_mouse_tap(false);
-                #endif
-            }
+            // ESC handled by main.c pause menu — not here
             break;
 
         case SAPP_EVENTTYPE_KEY_UP:

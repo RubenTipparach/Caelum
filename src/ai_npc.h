@@ -39,7 +39,7 @@ typedef struct {
 #define AI_MAX_ACTIONS 32
 #define AI_MAX_DIALOGUE 512
 #define AI_MAX_SCRIPT_BUF 8192
-#define AI_MAX_HISTORY 16
+#define AI_MAX_HISTORY 32
 
 typedef struct {
     char role[16];          // "user" or "assistant"
@@ -77,6 +77,10 @@ typedef struct {
 
     // Script generation mode — when true, response is parsed as a JSON script
     bool      script_mode;
+
+    // Vision: base64 JPEG to send with next message (set before ai_npc_send)
+    const char* vision_base64;   // pointer to base64 data (not owned)
+    int         vision_base64_len;
 
     // Per-instance async HTTP (not shared global)
     void*     _http_thread;   // HANDLE, managed internally

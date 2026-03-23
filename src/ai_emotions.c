@@ -34,13 +34,13 @@ void ai_emotions_update(AiEmotions* emo, float dt, int agent_state) {
     emo->curiosity = clampf(emo->curiosity - emo->curiosity_decay * dt, 0.0f, 1.0f);
     emo->satisfaction = clampf(emo->satisfaction - emo->satisfaction_decay * dt, 0.0f, 1.0f);
 
-    // Boredom: grows when idle, shrinks when active
-    if (agent_state == AGENT_STATE_IDLE || agent_state == AGENT_STATE_SLEEPING) {
+    // Boredom: grows when idle or just wandering, only real work reduces it
+    if (agent_state == AGENT_STATE_IDLE || agent_state == AGENT_STATE_SLEEPING ||
+        agent_state == AGENT_STATE_WALKING) {
         emo->idle_time += dt;
         emo->boredom = clampf(emo->boredom + emo->boredom_rate * dt, 0.0f, 1.0f);
-    } else {
+    } else if (agent_state == AGENT_STATE_WORKING || agent_state == AGENT_STATE_PLACING) {
         emo->idle_time = 0.0f;
-        // Active states reduce boredom
         emo->boredom = clampf(emo->boredom - 0.05f * dt, 0.0f, 1.0f);
     }
 

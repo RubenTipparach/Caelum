@@ -47,6 +47,7 @@ typedef enum {
     STATE_MULTI_JOIN,
     STATE_LOADING,
     STATE_PLAYING,
+    STATE_PAUSED,
 } GameState;
 
 // ---- Background thread for planet_init ----
@@ -108,6 +109,7 @@ static struct {
     AiNpc ai;
     AiActionExecutor ai_exec;
     bool ai_chat_open;          // Chat UI visible
+    bool ai_chat_just_closed;   // Guard: prevent ESC KEY_UP opening pause after chat close
     char ai_input[256];         // Player text input buffer
     int  ai_input_len;
 
@@ -124,6 +126,10 @@ static struct {
     // AI Agent system
     AiAgentSystem agent_system;
     bool agents_spawned;
+
+    // Pause menu
+    int pause_scroll;          // chat log scroll offset
+    int pause_tab;             // 0=pause, 1=chat log
 
     // Save restore state
     bool restore_moon_local;    // Skip world→moon transform on next SOI transition (loading from save)
@@ -473,9 +479,9 @@ static void draw_buttons(int count, float btn_w, float btn_h, float btn_gap,
         float x1 = x0 + btn_w, y1 = y0 + btn_h;
 
         float fr, fg, fb, fa;
-        if (is_pressed)      { fr = 0.25f; fg = 0.25f; fb = 0.3f; fa = 0.9f; }
-        else if (is_hovered) { fr = 0.12f; fg = 0.14f; fb = 0.2f; fa = 0.8f; }
-        else                 { fr = 0.08f; fg = 0.08f; fb = 0.12f; fa = 0.6f; }
+        if (is_pressed)      { fr = 0.25f; fg = 0.25f; fb = 0.3f; fa = 0.3f; }
+        else if (is_hovered) { fr = 0.12f; fg = 0.14f; fb = 0.2f; fa = 0.2f; }
+        else                 { fr = 0.08f; fg = 0.08f; fb = 0.12f; fa = 0.15f; }
         sgl_begin_quads();
         sgl_c4f(fr, fg, fb, fa);
         sgl_v2f(x0, y0); sgl_v2f(x1, y0); sgl_v2f(x1, y1); sgl_v2f(x0, y1);
@@ -494,7 +500,7 @@ static void draw_buttons(int count, float btn_w, float btn_h, float btn_gap,
         sgl_v2f(x1 - bw, y0); sgl_v2f(x1, y0); sgl_v2f(x1, y1); sgl_v2f(x1 - bw, y1);
         sgl_end();
     }
-    sgl_draw();
+    // NOTE: caller must call sgl_draw() when ready
 }
 
 // Hit-test helper: returns button index or -1
@@ -514,6 +520,7 @@ static int frame_count = 0;
 
 static void frame(void) {
     frame_count++;
+    app.ai_chat_just_closed = false; // clear per-frame guard
 
     uint64_t now = stm_now();
     float dt = (float)stm_sec(stm_diff(now, app.last_time));
@@ -636,6 +643,7 @@ static void frame(void) {
             }
         }
 
+        sgl_draw();
         sdtx_draw();
         sg_end_pass();
         sg_commit();
@@ -774,6 +782,7 @@ static void frame(void) {
             }
         }
 
+        sgl_draw();
         sdtx_draw();
         sg_end_pass();
         sg_commit();
@@ -861,6 +870,7 @@ static void frame(void) {
             sdtx_puts(sp_labels[i]);
         }
 
+        sgl_draw();
         sdtx_draw();
         sg_end_pass();
         sg_commit();
@@ -908,6 +918,7 @@ static void frame(void) {
             sdtx_puts(btn_labels[i]);
         }
 
+        sgl_draw();
         sdtx_draw();
         sg_end_pass();
         sg_commit();
@@ -957,6 +968,7 @@ static void frame(void) {
             sdtx_printf("Error: %s", app.lobby_req.error);
         }
 
+        sgl_draw();
         sdtx_draw();
         sg_end_pass();
         sg_commit();
@@ -1051,6 +1063,7 @@ static void frame(void) {
             sdtx_puts("Type 6-character code, Enter to join");
         }
 
+        sgl_draw();
         sdtx_draw();
         sg_end_pass();
         sg_commit();
@@ -1323,16 +1336,11 @@ static void frame(void) {
         ai_agent_system_update(&app.agent_system, &app.renderer.hex_terrain,
                                app.camera.pos_d, dt);
 
-        // Keep conversation alive while chat window is open (60s timeout when typing)
+        // Keep conversation active while chat is open
         if (app.ai_chat_open) {
             int nearest = ai_agent_nearest(&app.agent_system, app.camera.pos_d, 20.0f);
             if (nearest >= 0) {
-                AiAgent* agent = &app.agent_system.agents[nearest];
-                if (agent->in_conversation && agent->convo_timer > 0.0f) {
-                    // Reset to keep under 60s threshold while typing
-                    if (agent->convo_timer < 60.0f)
-                        agent->convo_timer = 0.0f;
-                }
+                app.agent_system.agents[nearest].in_conversation = true;
             }
         }
 
@@ -1437,6 +1445,13 @@ static void frame(void) {
                     chat_log_push(agent->ai.error, 1.0f, 0.3f, 0.3f);
                 }
                 agent->ai.state = AI_IDLE;
+            }
+            // Display build errors as red chat messages
+            if (agent->script_runner.error[0]) {
+                char errmsg[256];
+                snprintf(errmsg, sizeof(errmsg), "%s: %s", agent->name, agent->script_runner.error);
+                chat_log_push(errmsg, 1.0f, 0.3f, 0.3f);
+                agent->script_runner.error[0] = '\0';
             }
         }
 
@@ -1566,12 +1581,19 @@ static void frame(void) {
                 sdtx_canvas(cw, ch);
                 sdtx_font(0);
                 // Position just above the hotbar (bottom-center)
-                int prompt_len = 17 + (int)strlen(agent->name); // "Press E to talk to <name>"
+                char prompt_buf[64];
+                snprintf(prompt_buf, sizeof(prompt_buf), "Press E to talk to %s", agent->name);
+                int prompt_len = (int)strlen(prompt_buf);
                 float tx = (cw / 2.0f) / 8.0f - (float)prompt_len * 0.5f;
                 float ty = ch / 8.0f - 5.5f; // above hotbar
+                // Shadow
+                sdtx_pos(tx + 0.125f, ty + 0.125f);
+                sdtx_color3f(0, 0, 0);
+                sdtx_puts(prompt_buf);
+                // Text
                 sdtx_pos(tx, ty);
                 sdtx_color3f(1.0f, 1.0f, 0.6f);
-                sdtx_printf("Press E to talk to %s", agent->name);
+                sdtx_puts(prompt_buf);
             }
         }
 
@@ -1589,7 +1611,7 @@ static void frame(void) {
             app.chat_log_count = write;
         }
 
-        // ---- Chat overlay ----
+        // ---- Chat overlay (bottom-left justified, with drop shadows) ----
         {
             float cw = sapp_widthf() * 0.5f;
             float ch = sapp_heightf() * 0.5f;
@@ -1597,82 +1619,94 @@ static void frame(void) {
             sdtx_canvas(cw, ch);
             sdtx_font(0);
 
-            // Emotion + active command stats (only when chat input is open)
-            if (app.ai_chat_open) {
-                int emo_nearest = ai_agent_nearest(&app.agent_system, app.camera.pos_d, 20.0f);
-                if (emo_nearest >= 0) {
-                    AiAgent* ea = &app.agent_system.agents[emo_nearest];
-                    float ey = 1.0f;
-                    float ex = cw / 8.0f - 28.0f;
-                    sdtx_pos(ex, ey);
-                    sdtx_color3f(0.5f, 0.5f, 0.6f);
-                    sdtx_printf("Joy:%.0f Bored:%.0f Annoy:%.0f Curious:%.0f",
-                               ea->emotions.joy * 100, ea->emotions.boredom * 100,
-                               ea->emotions.annoyance * 100, ea->emotions.curiosity * 100);
-                    // Active command/state
-                    sdtx_pos(ex, ey + 1.0f);
-                    if (!ai_script_idle(&ea->script_runner)) {
-                        sdtx_color3f(0.4f, 1.0f, 0.4f);
-                        sdtx_printf("Script: %s [%d/%d]",
-                                   ea->script_runner.script.name,
-                                   ea->script_runner.current_step + 1,
-                                   ea->script_runner.script.step_count);
-                    } else if (ea->has_target && ea->target_q == -9999) {
-                        sdtx_color3f(0.4f, 0.8f, 1.0f);
-                        sdtx_puts("Following you");
-                    } else if (ea->state == AGENT_STATE_WALKING) {
-                        sdtx_color3f(0.8f, 0.8f, 0.4f);
-                        sdtx_puts("Walking...");
-                    } else if (ea->ai.state == AI_PENDING) {
-                        sdtx_color3f(1.0f, 1.0f, 0.3f);
-                        sdtx_puts("Thinking...");
-                    } else {
-                        sdtx_color3f(0.5f, 0.5f, 0.5f);
-                        sdtx_puts("Idle");
-                    }
-                }
-            }
+            // Shadow offset in character cells (~1-2 pixels)
+            #define SH 0.125f
+
+            // Shadow text helpers: render black offset, then colored on top
+            #define SHADOW_PUTS(x, y, r, g, b, text) do { \
+                sdtx_pos((x) + SH, (y) + SH); sdtx_color3f(0,0,0); sdtx_puts(text); \
+                sdtx_pos((x), (y)); sdtx_color3f(r, g, b); sdtx_puts(text); \
+            } while(0)
+
+            // Bottom anchor: input line sits above the hotbar
+            float input_row = ch / 8.0f - 5.0f;
 
             // "Thinking..." indicator with animated ellipsis
             int nearest = ai_agent_nearest(&app.agent_system, app.camera.pos_d, 20.0f);
             if (nearest >= 0 && app.agent_system.agents[nearest].ai.state == AI_PENDING) {
-                float ty = ch - 4.0f * cpx;
-                sdtx_pos(1.0f, ty / cpx);
-                sdtx_color3f(1.0f, 1.0f, 0.3f);
                 int dots = ((int)(stm_sec(stm_now()) * 2.0) % 3) + 1;
-                const char* ellipsis[] = {".", "..", "..."};
-                sdtx_printf("%s is thinking%s", app.agent_system.agents[nearest].name, ellipsis[dots - 1]);
+                const char* el[] = {".", "..", "..."};
+                char think_buf[64];
+                snprintf(think_buf, sizeof(think_buf), "%s is thinking%s",
+                         app.agent_system.agents[nearest].name, el[dots - 1]);
+                SHADOW_PUTS(1.0f, input_row - 1.0f, 1.0f, 1.0f, 0.3f, think_buf);
             }
 
-            // Chat input line (when open)
+            // Chat input line (bottom-left)
             if (app.ai_chat_open) {
-                float ty = ch - 3.0f * cpx;
-                sdtx_pos(1.0f, ty / cpx);
-                sdtx_color3f(0.3f, 1.0f, 0.3f);
-                sdtx_puts("> ");
-                sdtx_color3f(1.0f, 1.0f, 1.0f);
-                sdtx_puts(app.ai_input);
-                sdtx_puts("_");
+                SHADOW_PUTS(1.0f, input_row, 0.3f, 1.0f, 0.3f, "> ");
+                char input_display[256];
+                snprintf(input_display, sizeof(input_display), "%s_", app.ai_input);
+                SHADOW_PUTS(3.0f, input_row, 1.0f, 1.0f, 1.0f, input_display);
+
+                // Emotion + status (right side, one per line, with shadows)
+                int emo_nearest = ai_agent_nearest(&app.agent_system, app.camera.pos_d, 20.0f);
+                if (emo_nearest >= 0) {
+                    AiAgent* ea = &app.agent_system.agents[emo_nearest];
+                    int wrap = chat_wrap_cols();
+                    float sx = (float)(wrap + 3);
+                    char stat[64];
+                    snprintf(stat, sizeof(stat), "Joy: %.0f", ea->emotions.joy * 100);
+                    SHADOW_PUTS(sx, input_row - 4.0f, 0.4f, 0.4f, 0.5f, stat);
+                    snprintf(stat, sizeof(stat), "Bored: %.0f", ea->emotions.boredom * 100);
+                    SHADOW_PUTS(sx, input_row - 3.0f, 0.4f, 0.4f, 0.5f, stat);
+                    snprintf(stat, sizeof(stat), "Annoy: %.0f", ea->emotions.annoyance * 100);
+                    SHADOW_PUTS(sx, input_row - 2.0f, 0.4f, 0.4f, 0.5f, stat);
+                    snprintf(stat, sizeof(stat), "Curious: %.0f", ea->emotions.curiosity * 100);
+                    SHADOW_PUTS(sx, input_row - 1.0f, 0.4f, 0.4f, 0.5f, stat);
+
+                    // Status line
+                    if (!ai_script_idle(&ea->script_runner)) {
+                        snprintf(stat, sizeof(stat), "Script: %s [%d/%d]",
+                                ea->script_runner.script.name,
+                                ea->script_runner.current_step + 1,
+                                ea->script_runner.script.step_count);
+                        SHADOW_PUTS(sx, input_row, 0.4f, 1.0f, 0.4f, stat);
+                    } else if (ea->has_target && ea->target_q == -9999) {
+                        SHADOW_PUTS(sx, input_row, 0.4f, 0.8f, 1.0f, "Following you");
+                    } else if (ea->ai.state == AI_PENDING) {
+                        SHADOW_PUTS(sx, input_row, 1.0f, 1.0f, 0.3f, "Thinking...");
+                    } else {
+                        SHADOW_PUTS(sx, input_row, 0.4f, 0.4f, 0.5f, "Idle");
+                    }
+                }
             }
 
-            // Message log — render bottom-up from above the input line
-            float log_bottom = ch - 5.0f * cpx; // start above thinking/input
+            // Message log — render bottom-up from above the input (with shadows)
+            float log_bottom_row = input_row - 2.0f;
             for (int i = app.chat_log_count - 1; i >= 0; i--) {
                 int lines_from_bottom = app.chat_log_count - 1 - i;
-                float ty = log_bottom - (float)lines_from_bottom * cpx;
-                if (ty < 0) break; // off screen
+                float ty = log_bottom_row - (float)lines_from_bottom;
+                if (ty < 0) break;
 
-                // Fade out in last 5 seconds
                 float alpha = 1.0f;
                 if (app.chat_log[i].age > 25.0f)
                     alpha = 1.0f - (app.chat_log[i].age - 25.0f) / 5.0f;
 
-                sdtx_pos(1.0f, ty / cpx);
+                // Shadow
+                sdtx_pos(1.0f + SH, ty + SH);
+                sdtx_color3f(0, 0, 0);
+                sdtx_puts(app.chat_log[i].text);
+                // Text
+                sdtx_pos(1.0f, ty);
                 sdtx_color3f(app.chat_log[i].r * alpha,
                              app.chat_log[i].g * alpha,
                              app.chat_log[i].b * alpha);
                 sdtx_puts(app.chat_log[i].text);
             }
+
+            #undef SH
+            #undef SHADOW_PUTS
         }
 
         // ---- Agent name labels above head (>20m away, fade >1km) ----
@@ -1738,6 +1772,210 @@ static void frame(void) {
         render_frame(&app.renderer, &app.camera, dt);
     }
 
+    // ---- STATE_PAUSED: Pause menu overlay ----
+    if (app.state == STATE_PAUSED) {
+        // Pause menu — dark background, own render pass
+        sg_begin_pass(&(sg_pass){
+            .action = { .colors[0] = { .load_action = SG_LOADACTION_CLEAR,
+                .clear_value = {0.02f, 0.02f, 0.06f, 1.0f} } },
+            .swapchain = sglue_swapchain()
+        });
+
+        if (app.pause_tab == 0) {
+            // Clickable pause menu buttons
+            #define PAUSE_BTN_COUNT 3
+            const char* pause_labels[PAUSE_BTN_COUNT] = {
+                "Resume", "Chat Log", "Quit to Menu"
+            };
+            int max_len = 0;
+            for (int i = 0; i < PAUSE_BTN_COUNT; i++) {
+                int l = (int)strlen(pause_labels[i]);
+                if (l > max_len) max_len = l;
+            }
+            float pbtn_w = (max_len + 6) * char_px;
+            float pbtn_h = 3.0f * char_px;
+            float pbtn_gap = 10.0f;
+            float pbtn_x = (win_w - pbtn_w) * 0.5f;
+            float pbtn_y0 = win_h * 0.35f;
+
+            menu_hover = hit_test_buttons(PAUSE_BTN_COUNT, pbtn_w, pbtn_h, pbtn_gap,
+                                           pbtn_x, pbtn_y0, menu_mouse_x, menu_mouse_y);
+
+            // Buttons first (sgl), then text (sdtx) — sdtx_draw after sgl_draw
+            draw_buttons(PAUSE_BTN_COUNT, pbtn_w, pbtn_h, pbtn_gap, pbtn_x, pbtn_y0,
+                         win_w, win_h, menu_hover, menu_pressed);
+
+            // Text AFTER draw_buttons (which already called sgl_draw)
+            sdtx_canvas(canvas_w, canvas_h);
+            sdtx_origin(0.0f, 0.0f);
+            sdtx_font(0);
+
+            float cx_cells = canvas_w / 8.0f;
+
+            // Title — centered
+            {
+                const char* title = "=== PAUSED ===";
+                int tlen = (int)strlen(title);
+                float tx = cx_cells * 0.5f - (float)tlen * 0.5f;
+                float ty = (pbtn_y0 - 2.5f * char_px) / char_px;
+                sdtx_pos(tx, ty);
+                sdtx_color3f(1.0f, 1.0f, 1.0f);
+                sdtx_puts(title);
+            }
+
+            // Button labels
+            for (int i = 0; i < PAUSE_BTN_COUNT; i++) {
+                bool pressed = (menu_pressed == i && menu_hover == i);
+                bool hovered = (menu_hover == i);
+                if (pressed)      sdtx_color3f(1.0f, 1.0f, 1.0f);
+                else if (hovered) sdtx_color3f(1.0f, 1.0f, 0.3f);
+                else              sdtx_color3f(0.8f, 0.8f, 0.9f);
+                int llen = (int)strlen(pause_labels[i]);
+                float by = pbtn_y0 + (float)i * (pbtn_h + pbtn_gap);
+                float cell_x = (pbtn_x + (pbtn_w - (float)llen * char_px) * 0.5f) / char_px;
+                float cell_y = (by + (pbtn_h - char_px) * 0.5f) / char_px;
+                sdtx_pos(cell_x, cell_y);
+                sdtx_puts(pause_labels[i]);
+            }
+            // Text flushed by sdtx_draw() at the end of STATE_PAUSED block
+
+        } else if (app.pause_tab == 1) {
+            // Chat log viewer with Back button
+            {
+                float back_w = 10.0f * char_px;
+                float back_h = 2.5f * char_px;
+                float back_x = win_w - back_w - 10.0f;
+                float back_y = 5.0f;
+                int back_hover = (menu_mouse_x >= back_x && menu_mouse_x < back_x + back_w &&
+                                  menu_mouse_y >= back_y && menu_mouse_y < back_y + back_h) ? 0 : -1;
+                draw_buttons(1, back_w, back_h, 0, back_x, back_y, win_w, win_h,
+                             back_hover, (back_hover == 0 && menu_pressed == 99) ? 0 : -1);
+                sdtx_canvas(canvas_w, canvas_h);
+                sdtx_font(0);
+                float bx = back_x + (back_w - 4.0f * char_px) * 0.5f;
+                float by = back_y + (back_h - char_px) * 0.5f;
+                sdtx_pos(bx / char_px, by / char_px);
+                sdtx_color3f(back_hover == 0 ? 1.0f : 0.7f,
+                             back_hover == 0 ? 1.0f : 0.7f,
+                             back_hover == 0 ? 0.3f : 0.8f);
+                sdtx_puts("Back");
+                // Store back_hover for click detection
+                app.pause_scroll = app.pause_scroll; // dummy to keep compiler happy
+            }
+
+            sdtx_pos(1.0f, 1.0f);
+            sdtx_color3f(1.0f, 1.0f, 1.0f);
+            sdtx_puts("=== CHAT LOG ===  Scroll: Up/Down/MouseWheel");
+
+            int agent_idx = -1;
+            for (int i = 0; i < app.agent_system.count; i++) {
+                if (app.agent_system.agents[i].active) { agent_idx = i; break; }
+            }
+
+            if (agent_idx >= 0) {
+                AiAgent* agent = &app.agent_system.agents[agent_idx];
+                char log_path[512];
+                snprintf(log_path, sizeof(log_path), "%s/chat_log.jsonl",
+                         agent->memory.agent_dir);
+                FILE* f = fopen(log_path, "r");
+                if (f) {
+                    // Parse messages and word-wrap into display lines
+                    #define LOG_MAX_DISPLAY 500
+                    char dlines[LOG_MAX_DISPLAY][128];
+                    bool dline_player[LOG_MAX_DISPLAY];
+                    int dline_count = 0;
+                    int wrap_cols = (int)(canvas_w / 8.0f * 0.9f); // 90% of screen width
+                    if (wrap_cols > 126) wrap_cols = 126;
+
+                    char lbuf[512];
+                    while (fgets(lbuf, sizeof(lbuf), f) && dline_count < LOG_MAX_DISPLAY - 5) {
+                        const char* type_p = strstr(lbuf, "\"type\":\"");
+                        const char* text_p = strstr(lbuf, "\"text\":\"");
+                        if (!type_p || !text_p) continue;
+                        type_p += 8;
+                        text_p += 8;
+                        bool is_player = (strncmp(type_p, "player_msg", 10) == 0);
+
+                        // Unescape text
+                        char full[512];
+                        int fi = 0;
+                        const char* p = text_p;
+                        while (*p && *p != '"' && fi < 510) {
+                            if (*p == '\\' && *(p+1) == 'n') { p += 2; continue; }
+                            if (*p == '\\' && *(p+1)) p++;
+                            full[fi++] = *p++;
+                        }
+                        full[fi] = '\0';
+
+                        // Prepend name
+                        char msg[512];
+                        snprintf(msg, sizeof(msg), "%s: %s",
+                                 is_player ? "You" : agent->name, full);
+
+                        // Sanitize UTF-8
+                        char clean[512];
+                        sanitize_to_ascii(msg, clean, sizeof(clean));
+
+                        // Word-wrap into display lines
+                        const char* src = clean;
+                        while (*src && dline_count < LOG_MAX_DISPLAY) {
+                            int len = (int)strlen(src);
+                            if (len <= wrap_cols) {
+                                snprintf(dlines[dline_count], sizeof(dlines[0]), "%s", src);
+                                dline_player[dline_count] = is_player;
+                                dline_count++;
+                                break;
+                            }
+                            int brk = wrap_cols;
+                            while (brk > 0 && src[brk] != ' ') brk--;
+                            if (brk == 0) brk = wrap_cols;
+                            memcpy(dlines[dline_count], src, brk);
+                            dlines[dline_count][brk] = '\0';
+                            dline_player[dline_count] = is_player;
+                            dline_count++;
+                            src += brk;
+                            if (*src == ' ') src++;
+                        }
+                    }
+                    fclose(f);
+
+                    int visible_lines = (int)(canvas_h / 8.0f) - 4;
+                    int max_scroll = dline_count - visible_lines;
+                    if (max_scroll < 0) max_scroll = 0;
+                    if (app.pause_scroll > max_scroll) app.pause_scroll = max_scroll;
+                    if (app.pause_scroll < 0) app.pause_scroll = 0;
+
+                    int start = app.pause_scroll;
+                    int end = start + visible_lines;
+                    if (end > dline_count) end = dline_count;
+
+                    for (int i = start; i < end; i++) {
+                        float ty = 3.0f + (float)(i - start);
+                        sdtx_pos(1.0f, ty);
+                        if (dline_player[i])
+                            sdtx_color3f(0.6f, 0.6f, 0.6f);
+                        else
+                            sdtx_color3f(0.3f, 0.7f, 1.0f);
+                        sdtx_puts(dlines[i]);
+                    }
+
+                    sdtx_pos(1.0f, canvas_h / 8.0f - 1.0f);
+                    sdtx_color3f(0.5f, 0.5f, 0.5f);
+                    sdtx_printf("(%d/%d lines)", end, dline_count);
+                } else {
+                    sdtx_pos(3.0f, 5.0f);
+                    sdtx_color3f(0.6f, 0.4f, 0.4f);
+                    sdtx_puts("No chat log found");
+                }
+            }
+        }
+
+        sgl_draw();   // buttons first (behind)
+        sdtx_draw();  // text on top
+        sg_end_pass();
+        sg_commit();
+    }
+
     // Screenshot: capture after render_frame (which calls sg_commit)
     if (app.screenshot_requested) {
         app.screenshot_requested = false;
@@ -1794,6 +2032,40 @@ static void spawn_select_activate(int slot) {
 }
 
 static void event(const sapp_event* ev) {
+    // ---- UNIVERSAL ESC HANDLER ----
+    // ESC does ONE thing: toggle pause menu. Nothing else. Ever.
+    if (ev->type == SAPP_EVENTTYPE_KEY_DOWN && ev->key_code == SAPP_KEYCODE_ESCAPE) {
+        printf("[ESC] KEY_DOWN: state=%d, chat_open=%d, mouse_locked=%d\n",
+               app.state, app.ai_chat_open, app.camera.mouse_locked);
+        fflush(stdout);
+        if (app.state == STATE_PLAYING) {
+            // Close chat if open, otherwise open pause
+            if (app.ai_chat_open) {
+                app.ai_chat_open = false;
+                app.ai_input[0] = '\0';
+                app.ai_input_len = 0;
+                int cn = ai_agent_nearest(&app.agent_system, app.camera.pos_d, 20.0f);
+                if (cn >= 0) app.agent_system.agents[cn].in_conversation = false;
+                printf("[ESC] Closed chat\n"); fflush(stdout);
+            } else {
+                app.state = STATE_PAUSED;
+                app.pause_tab = 0;
+                app.pause_scroll = 0;
+                menu_pressed = -1;
+                menu_hover = -1;
+                app.camera.mouse_locked = false;
+                sapp_lock_mouse(false);
+                sapp_show_mouse(true);
+                printf("[ESC] Opened pause menu, mouse unlocked\n"); fflush(stdout);
+            }
+        } else {
+            printf("[ESC] Ignored, state=%d (not STATE_PLAYING=%d)\n", app.state, STATE_PLAYING);
+            fflush(stdout);
+        }
+        // ESC does nothing in any other state
+        return;
+    }
+
     // Track mouse/touch position for all menu states
     if (ev->type == SAPP_EVENTTYPE_MOUSE_MOVE) {
         menu_mouse_x = ev->mouse_x;
@@ -1817,6 +2089,76 @@ static void event(const sapp_event* ev) {
     if (ev->type == SAPP_EVENTTYPE_TOUCHES_BEGAN) touch_began = true;
     if (ev->type == SAPP_EVENTTYPE_TOUCHES_ENDED ||
         ev->type == SAPP_EVENTTYPE_TOUCHES_CANCELLED) touch_ended = true;
+
+    // ---- STATE_PAUSED ----
+    if (app.state == STATE_PAUSED) {
+        #define PAUSE_ACTIVATE(slot) do { \
+            if ((slot) == 0) { \
+                app.state = STATE_PLAYING; \
+                sapp_lock_mouse(true); \
+                app.camera.mouse_locked = true; \
+            } \
+            else if ((slot) == 1) { app.pause_tab = 1; app.pause_scroll = 0; } \
+            else if ((slot) == 2) { \
+                player_save(); \
+                if (app.agents_spawned) { \
+                    char asave[256]; \
+                    snprintf(asave, sizeof(asave), "%s/agents.dat", app.active_edits_dir); \
+                    ai_agent_save_positions(&app.agent_system, asave); \
+                } \
+                app.state = STATE_MENU; \
+            } \
+        } while(0)
+
+        if (ev->type == SAPP_EVENTTYPE_MOUSE_MOVE) {
+            menu_mouse_x = ev->mouse_x;
+            menu_mouse_y = ev->mouse_y;
+            return;
+        }
+        if (app.pause_tab == 0) {
+            if ((ev->type == SAPP_EVENTTYPE_MOUSE_DOWN &&
+                 ev->mouse_button == SAPP_MOUSEBUTTON_LEFT) || touch_began) {
+                menu_pressed = menu_hover;
+                return;
+            }
+            if ((ev->type == SAPP_EVENTTYPE_MOUSE_UP &&
+                 ev->mouse_button == SAPP_MOUSEBUTTON_LEFT) || touch_ended) {
+                if (menu_pressed >= 0 && menu_pressed == menu_hover) {
+                    PAUSE_ACTIVATE(menu_pressed);
+                }
+                menu_pressed = -1;
+                return;
+            }
+        }
+        if (app.pause_tab == 1) {
+            // Back button click in chat log view (top-right area)
+            if ((ev->type == SAPP_EVENTTYPE_MOUSE_UP &&
+                 ev->mouse_button == SAPP_MOUSEBUTTON_LEFT) || touch_ended) {
+                float cpx_e = sapp_widthf() / (sapp_widthf() * 0.5f / 8.0f);
+                float back_w = 10.0f * cpx_e;
+                float back_h = 2.5f * cpx_e;
+                float back_x = sapp_widthf() - back_w - 10.0f;
+                float back_y = 5.0f;
+                if (menu_mouse_x >= back_x && menu_mouse_x < back_x + back_w &&
+                    menu_mouse_y >= back_y && menu_mouse_y < back_y + back_h) {
+                    app.pause_tab = 0;
+                    return;
+                }
+            }
+        }
+        // No ESC handling — use Resume button to exit pause
+        if (ev->type == SAPP_EVENTTYPE_KEY_DOWN) {
+            if (app.pause_tab == 1) {
+                if (ev->key_code == SAPP_KEYCODE_UP) { app.pause_scroll--; return; }
+                if (ev->key_code == SAPP_KEYCODE_DOWN) { app.pause_scroll++; return; }
+            }
+        }
+        if (ev->type == SAPP_EVENTTYPE_MOUSE_SCROLL && app.pause_tab == 1) {
+            app.pause_scroll -= (int)(ev->scroll_y);
+            return;
+        }
+        return;
+    }
 
     // ---- STATE_MENU ----
     if (app.state == STATE_MENU) {
@@ -1877,7 +2219,9 @@ static void event(const sapp_event* ev) {
         }
 
         if (ev->type == SAPP_EVENTTYPE_KEY_DOWN && ev->key_code == SAPP_KEYCODE_ESCAPE) {
-            app.state = app.is_multiplayer ? STATE_MULTI_MENU : STATE_MENU;
+            // ESC in world select → pause menu (not main menu)
+            app.state = STATE_PAUSED;
+            app.pause_tab = 0; menu_pressed = -1; menu_hover = -1;
             return;
         }
         if ((ev->type == SAPP_EVENTTYPE_MOUSE_DOWN &&
@@ -2114,6 +2458,8 @@ static void event(const sapp_event* ev) {
         return;
     }
 
+    // ESC handling is in the universal handler at the top of event()
+
     // Block game debug/toggle keys while chat is open
     // (chat input handlers are further below and must still work)
     if (app.ai_chat_open) goto chat_input_handler;
@@ -2225,10 +2571,15 @@ chat_input_handler:
     if (app.ai_chat_open) {
         if (ev->type == SAPP_EVENTTYPE_KEY_DOWN) {
             if (ev->key_code == SAPP_KEYCODE_ESCAPE) {
-                // Close chat
+                // Close chat and end conversation
                 app.ai_chat_open = false;
+                app.ai_chat_just_closed = true;
                 app.ai_input[0] = '\0';
                 app.ai_input_len = 0;
+                int esc_nearest = ai_agent_nearest(&app.agent_system, app.camera.pos_d, 20.0f);
+                if (esc_nearest >= 0) {
+                    app.agent_system.agents[esc_nearest].in_conversation = false;
+                }
                 return;
             }
             if (ev->key_code == SAPP_KEYCODE_ENTER && app.ai_input_len > 0) {
@@ -2431,6 +2782,26 @@ chat_input_handler:
                                          sizeof(agent->sensor_report));
                     }
 
+                    // Detect vision requests — capture screenshot for Claude
+                    {
+                        char lower_v[256];
+                        int lvi = 0;
+                        for (int ci = 0; app.ai_input[ci] && lvi < 254; ci++)
+                            lower_v[lvi++] = (app.ai_input[ci] >= 'A' && app.ai_input[ci] <= 'Z')
+                                ? app.ai_input[ci] + 32 : app.ai_input[ci];
+                        lower_v[lvi] = '\0';
+                        if (strstr(lower_v, "look") || strstr(lower_v, "see") ||
+                            strstr(lower_v, "view") || strstr(lower_v, "what do you") ||
+                            strstr(lower_v, "check out") || strstr(lower_v, "critique") ||
+                            strstr(lower_v, "inspect") || strstr(lower_v, "survey") ||
+                            strstr(lower_v, "how does") || strstr(lower_v, "show me")) {
+                            // Request a vision capture
+                            ai_vision_request_capture(&agent->vision);
+                            printf("[VISION] Capture requested for '%s'\n", agent->name);
+                            fflush(stdout);
+                        }
+                    }
+
                     // Set script mode for build requests
                     if (is_build_request) {
                         agent->ai.script_mode = true;
@@ -2464,12 +2835,19 @@ chat_input_handler:
 
                     agent->convo_timer = 0.0f; // reset conversation timeout
                     agent->in_conversation = true;
-                    // Set transient context (mood + surroundings) — injected into
+                    // Reload memory before each message so LLM sees latest
+                    ai_memory_load(&agent->memory);
+
+                    // Set transient context (mood + surroundings + memory) — injected into
                     // request body only, NOT saved to conversation history
                     {
                         char mood[256];
                         ai_emotions_describe(&agent->emotions, mood, sizeof(mood));
                         ai_emotions_on_message_received(&agent->emotions);
+
+                        // Build memory context
+                        char mem_ctx[AI_MEMORY_MAX + AI_JOURNAL_MAX + 256];
+                        ai_memory_build_context(&agent->memory, mem_ctx, sizeof(mem_ctx));
 
                         if (agent->ai.script_mode) {
                             // Script generation mode — tell LLM to output JSON script
@@ -2507,13 +2885,27 @@ chat_input_handler:
                                 ground_layer, ground_layer + 1);
                         } else {
                             snprintf(agent->ai.context_prefix, sizeof(agent->ai.context_prefix),
-                                "%s%s%s",
+                                "%s\n%s%s%s",
                                 mood,
+                                mem_ctx,
                                 agent->sensor_report[0] ? "\n[SURROUNDINGS]\n" : "",
                                 agent->sensor_report[0] ? agent->sensor_report : "");
                         }
                     }
+                    // Capture vision if requested (screenshot of current frame)
+                    if (agent->vision.capture_requested) {
+                        ai_vision_capture(&agent->vision);
+                        if (ai_vision_ready(&agent->vision)) {
+                            agent->ai.vision_base64 = agent->vision.base64_buf;
+                            agent->ai.vision_base64_len = agent->vision.base64_len;
+                        }
+                    }
                     ai_npc_send(&agent->ai, app.ai_input);
+                    // Clear vision after send
+                    agent->ai.vision_base64 = NULL;
+                    agent->ai.vision_base64_len = 0;
+                    if (ai_vision_ready(&agent->vision)) ai_vision_clear(&agent->vision);
+
                     if (agent->ai.send_blocked) {
                         chat_log_push("(Still thinking... please wait)", 1.0f, 1.0f, 0.3f);
                         agent->ai.send_blocked = false;

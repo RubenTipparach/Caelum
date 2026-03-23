@@ -181,6 +181,7 @@ static void generate_agent_mesh(AiAgent* agent) {
     float armH = 0.38f * s * agent->arm_length;
     float armSpacing = padSpacing + padR * 0.3f;
     float armY = padY - padH/2 - armH/2;
+    agent->pivot_arm_x = armSpacing;
 
     float legR = hexR * 0.55f;
     float legH = 0.4f * s * agent->leg_length;
@@ -337,6 +338,7 @@ int ai_agent_load(AiAgentSystem* sys, const char* json_path) {
         snprintf(agent_dir, sizeof(agent_dir), "cache/agents/%s", safe_name);
         ai_memory_init(&a->memory, agent_dir);
         ai_memory_load(&a->memory);
+        ai_vision_init(&a->vision, agent_dir);
         ai_memory_load_chat_history(&a->memory, &a->ai);
     }
 
@@ -632,6 +634,15 @@ void ai_agent_system_update(AiAgentSystem* sys, HexTerrain* ht,
                     a->pos_d[1] += move_dir.Y * step;
                     a->pos_d[2] += move_dir.Z * step;
 
+                    // Step off edge: if next hex is lower, jump off fearlessly
+                    if (height_diff < -0.3f && a->on_ground) {
+                        HMM_Vec3 jump_dir = HMM_AddV3(
+                            HMM_MulV3F(a->local_up, 2.0f),
+                            HMM_MulV3F(move_dir, 1.0f));
+                        a->velocity = jump_dir;
+                        a->on_ground = false;
+                    }
+
                     // Tiny hop every ~8 steps to break out of ground-snap oscillation
                     if (a->on_ground && fmodf(a->anim_time, 2.5f) < dt) {
                         a->velocity = HMM_MulV3F(a->local_up, 1.5f);
@@ -722,18 +733,9 @@ void ai_agent_system_update(AiAgentSystem* sys, HexTerrain* ht,
 
         // ---- Conversation timeout ----
         // Stay put while in conversation; expire after 15s idle or 60s typing
+        // Conversation stays active until player closes chat (ESC) or gives a stop command.
+        // No auto-timeout.
         if (a->in_conversation) {
-            a->convo_timer += dt;
-            // If AI is pending (waiting for response), don't time out
-            if (a->ai.state == AI_PENDING) {
-                a->convo_timer = 0.0f;
-            }
-            // 60s if chat window is open (player typing), 15s otherwise
-            float timeout = 15.0f; // will be overridden by main.c if chat is open
-            if (a->convo_timer > timeout) {
-                a->in_conversation = false;
-                a->convo_timer = 0.0f;
-            }
 
             // Smoothly face the player while in conversation
             if (a->state == AGENT_STATE_IDLE || a->state == AGENT_STATE_TALKING ||
@@ -748,6 +750,29 @@ void ai_agent_system_update(AiAgentSystem* sys, HexTerrain* ht,
                     a->forward = HMM_NormV3(HMM_LerpV3(a->forward, 5.0f * dt, target_fwd));
                 }
             }
+        }
+
+        // ---- Script completed: return to ground level ----
+        if (a->script_runner.state == SCRIPT_DONE) {
+            // Pathfind back to anchor point (where building started = ground level)
+            int anchor_q = a->script_runner.anchor_q;
+            int anchor_r = a->script_runner.anchor_r;
+            if (anchor_q != gcol || anchor_r != grow) {
+                if (ai_pathfind(&a->path, ht, gcol, grow, anchor_q, anchor_r)) {
+                    a->state = AGENT_STATE_WALKING;
+                    a->state_timer = 0.0f;
+                    printf("[AGENT] '%s' script done, returning to ground (q=%d r=%d)\n",
+                           a->name, anchor_q, anchor_r);
+                    fflush(stdout);
+                }
+            }
+            // If can't pathfind or already there, just hop off
+            if (a->state != AGENT_STATE_WALKING) {
+                a->velocity = HMM_MulV3F(a->local_up, 1.0f);
+                a->on_ground = false;
+            }
+            a->script_runner.state = SCRIPT_IDLE;
+            ai_emotions_on_task_complete(&a->emotions);
         }
 
         // ---- Script execution ----
@@ -839,11 +864,26 @@ void ai_agent_system_update(AiAgentSystem* sys, HexTerrain* ht,
                     }
                 }
             }
-            // If script was MOVING and we've arrived (path done), advance
+            // If script was MOVING and we've arrived (path done)
             if (a->script_runner.state == SCRIPT_MOVING &&
                 a->state == AGENT_STATE_IDLE) {
-                a->script_runner.state = SCRIPT_RUNNING;
-                ai_script_advance(&a->script_runner);
+                const AiScriptStep* arrived_step = ai_script_current_step(&a->script_runner);
+                if (arrived_step && (arrived_step->action == SCRIPT_ACT_PLACE ||
+                    arrived_step->action == SCRIPT_ACT_PLACE_REL ||
+                    arrived_step->action == SCRIPT_ACT_BREAK ||
+                    arrived_step->action == SCRIPT_ACT_BREAK_REL)) {
+                    // Arrived at build site — go to BUILDING state to place/break
+                    a->script_runner.state = SCRIPT_BUILDING;
+                    a->script_runner.wait_timer = 0.5f;
+                    a->state = (arrived_step->action == SCRIPT_ACT_PLACE ||
+                                arrived_step->action == SCRIPT_ACT_PLACE_REL)
+                               ? AGENT_STATE_PLACING : AGENT_STATE_WORKING;
+                    a->state_timer = 0.0f;
+                } else {
+                    // Normal move_to — advance to next step
+                    a->script_runner.state = SCRIPT_RUNNING;
+                    ai_script_advance(&a->script_runner);
+                }
             }
 
             // BUILDING state: cooldown timer, then execute place/break
@@ -876,6 +916,57 @@ void ai_agent_system_update(AiAgentSystem* sys, HexTerrain* ht,
                         br = a->script_runner.anchor_r + bstep->dr;
                         bl = a->script_runner.anchor_layer + bstep->dlayer;
                     }
+
+                    // Check distance to target block
+                    float bwx2, bwy2, bwz2, bux2, buy2, buz2;
+                    int layer_offset = bl - a->script_runner.anchor_layer;
+                    int check_layer = a->hex_ground_layer + layer_offset;
+                    hex_terrain_hex_to_world(ht, bq, br, check_layer,
+                        &bwx2, &bwy2, &bwz2, &bux2, &buy2, &buz2);
+                    float block_dist = HMM_LenV3(HMM_SubV3(HMM_V3(bwx2, bwy2, bwz2), a->position));
+                    float block_height = (float)layer_offset * HEX_HEIGHT;
+
+                    if (block_dist > 3.0f) {
+                        // Too far — walk closer first, then retry this step
+                        if (ai_pathfind(&a->path, ht, gcol, grow, bq, br)) {
+                            a->state = AGENT_STATE_WALKING;
+                            a->state_timer = 0.0f;
+                            a->script_runner.state = SCRIPT_MOVING;
+                            // Don't advance — will retry this build step after arriving
+                            printf("[BUILD] %s walking to q=%d r=%d (%.1fm away)\n",
+                                   a->name, bq, br, block_dist);
+                            fflush(stdout);
+                        } else {
+                            // Can't pathfind — skip
+                            printf("\033[31m[BUILD-ERR] %s: can't reach q=%d r=%d\033[0m\n",
+                                   a->name, bq, br);
+                            fflush(stdout);
+                            snprintf(a->script_runner.error, sizeof(a->script_runner.error),
+                                     "Can't reach q=%d r=%d", bq, br);
+                            a->script_runner.state = SCRIPT_RUNNING;
+                            ai_script_advance(&a->script_runner);
+                        }
+                    } else if (block_height > 4.0f) {
+                        // Too high — try jumping first
+                        if (a->on_ground && block_height <= 2.0f * HEX_HEIGHT) {
+                            float jump_v = sqrtf(2.0f * 10.0f * (block_height + 0.5f));
+                            a->velocity = HMM_MulV3F(a->local_up, jump_v);
+                            a->on_ground = false;
+                            a->state = AGENT_STATE_JUMPING;
+                            a->state_timer = 0.0f;
+                            // Don't advance — retry after landing
+                            a->script_runner.state = SCRIPT_RUNNING;
+                            a->script_runner.wait_timer = 1.0f;
+                        } else {
+                            printf("\033[31m[BUILD-ERR] %s: block at +%.1fm too high\033[0m\n",
+                                   a->name, block_height);
+                            fflush(stdout);
+                            snprintf(a->script_runner.error, sizeof(a->script_runner.error),
+                                     "Can't place at +%.0fm height", block_height);
+                            a->script_runner.state = SCRIPT_RUNNING;
+                            ai_script_advance(&a->script_runner);
+                        }
+                    } else
 
                     if (bstep->action == SCRIPT_ACT_PLACE || bstep->action == SCRIPT_ACT_PLACE_REL) {
                         // Remap layer relative to actual ground at anchor

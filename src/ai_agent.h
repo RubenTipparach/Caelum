@@ -13,6 +13,7 @@
 #include "ai_script.h"
 #include "ai_memory.h"
 #include "ai_emotions.h"
+#include "ai_vision.h"
 
 // --- AI Agent ---
 // A physical NPC entity that exists in the game world.
@@ -104,6 +105,7 @@ typedef struct {
     float pivot_hip_y;     // leg rotation pivot
     float pivot_shoulder_y; // arm rotation pivot
     float pivot_neck_y;    // head rotation pivot
+    float pivot_arm_x;     // shoulder X offset from center
 
     // Animation
     float anim_time;
@@ -118,6 +120,7 @@ typedef struct {
     char sensor_report[AI_SENSOR_REPORT_MAX];
     AiMemory memory;
     AiEmotions emotions;
+    AiVision vision;
 
     // Sleep range
     float sleep_range;         // distance from player to sleep (default 200m)
